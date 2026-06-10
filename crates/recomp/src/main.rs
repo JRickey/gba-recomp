@@ -7,6 +7,9 @@
 use std::path::Path;
 use std::process::ExitCode;
 
+mod analyze;
+mod emit;
+
 use armv4t::{decode_arm, decode_thumb, Op};
 use gba_core::{is_self_loop, Machine, StepEvent};
 
@@ -20,6 +23,8 @@ fn main() -> ExitCode {
         Some("run") => cmd_run(&args[1..]),
         Some("frames") => cmd_frames(&args[1..]),
         Some("play") => cmd_play(&args[1..]),
+        Some("build") => cmd_build(&args[1..]),
+        Some("runc") => cmd_runc(&args[1..]),
         _ => {
             eprintln!("usage: recomp dis <rom> [--addr HEX] [--count N] [--thumb]");
             eprintln!("       recomp entry-scan <dir>");
@@ -352,5 +357,122 @@ fn cmd_play(args: &[String]) -> Result<(), String> {
         std::fs::write(&sav_path, data).map_err(|e| format!("{sav_path}: {e}"))?;
         eprintln!("saved {sav_path}");
     }
+    Ok(())
+}
+
+/// Statically recompile a ROM: analyze, emit C, compile to a shared
+/// library with the system C compiler.
+fn cmd_build(args: &[String]) -> Result<(), String> {
+    let rom_path = args.first().ok_or("missing ROM path")?;
+    let rom = std::fs::read(rom_path).map_err(|e| format!("{rom_path}: {e}"))?;
+
+    let analysis = analyze::analyze(&rom);
+    let n_instrs: usize = analysis.blocks.iter().map(|b| b.instrs.len()).sum();
+    println!("blocks: {} instructions: {n_instrs}", analysis.blocks.len());
+
+    let c = emit::emit_c(&analysis);
+    std::fs::create_dir_all("out").map_err(|e| e.to_string())?;
+    let stem = Path::new(rom_path)
+        .file_stem().and_then(|s| s.to_str()).unwrap_or("game").to_string();
+    let c_path = format!("out/{stem}.c");
+    let lib_path = format!("out/{stem}.dylib");
+    std::fs::write(&c_path, c).map_err(|e| e.to_string())?;
+    println!("wrote {c_path}");
+
+    let status = std::process::Command::new("cc")
+        .args(["-O1", "-shared", "-o", &lib_path, &c_path])
+        .status()
+        .map_err(|e| format!("cc: {e}"))?;
+    if !status.success() {
+        return Err("cc failed".into());
+    }
+    println!("wrote {lib_path}");
+    Ok(())
+}
+
+/// Run a recompiled image: translated blocks where available, interpreter
+/// fallback elsewhere, interrupt machinery at block boundaries.
+fn cmd_runc(args: &[String]) -> Result<(), String> {
+    use gba_core::capi::{RcgBlock, RtApi, RT_API};
+
+    let mut rom_path = None;
+    let mut frames = 600u64;
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "--frames" => {
+                frames = it.next().ok_or("--frames needs a value")?
+                    .parse().map_err(|e| format!("bad frames: {e}"))?
+            }
+            other if rom_path.is_none() => rom_path = Some(other.to_string()),
+            other => return Err(format!("unexpected argument {other:?}")),
+        }
+    }
+    let rom_path = rom_path.ok_or("missing ROM path")?;
+    let rom = std::fs::read(&rom_path).map_err(|e| format!("{rom_path}: {e}"))?;
+    let stem = Path::new(&rom_path)
+        .file_stem().and_then(|s| s.to_str()).unwrap_or("game").to_string();
+    let lib_path = format!("out/{stem}.dylib");
+
+    let lib = unsafe { libloading::Library::new(&lib_path) }
+        .map_err(|e| format!("{lib_path}: {e}"))?;
+    let table: std::collections::HashMap<u32, extern "C" fn(*const RtApi, *mut std::ffi::c_void) -> u32> = unsafe {
+        let blocks: libloading::Symbol<*const RcgBlock> =
+            lib.get(b"rcg_blocks").map_err(|e| e.to_string())?;
+        let count: libloading::Symbol<*const u64> =
+            lib.get(b"rcg_block_count").map_err(|e| e.to_string())?;
+        let n = **count as usize;
+        std::slice::from_raw_parts(*blocks, n)
+            .iter()
+            .map(|b| (b.key, b.func))
+            .collect()
+    };
+    println!("loaded {} translated blocks", table.len());
+
+    let mut m = Machine::new(rom);
+    let mptr = &mut m as *mut Machine as *mut std::ffi::c_void;
+
+    let mut native_blocks = 0u64;
+    let mut fallback_steps = 0u64;
+    let mut guard = 0u64;
+    while m.bus.frames < frames {
+        guard += 1;
+        if guard > 4_000_000_000 {
+            return Err("step guard exceeded".into());
+        }
+        // Interrupt machinery and sleep states go through Machine::step.
+        if m.bus.halted
+            || (m.cpu.regs[15] == gba_core::machine::IRQ_RETURN_ADDR
+                && m.cpu.mode() == gba_core::Mode::Irq)
+            || (m.bus.irq_pending() && !m.cpu.flag(gba_core::cpu::FLAG_I))
+        {
+            m.step();
+            continue;
+        }
+        let key = m.cpu.regs[15] | m.cpu.thumb() as u32;
+        match table.get(&key) {
+            Some(f) => {
+                f(&RT_API, mptr);
+                native_blocks += 1;
+            }
+            None => {
+                m.step();
+                fallback_steps += 1;
+            }
+        }
+    }
+
+    // FNV-1a framebuffer hash — must match the interpreter's `frames` run.
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for &px in &m.bus.framebuffer {
+        for b in px.to_le_bytes() {
+            hash ^= b as u64;
+            hash = hash.wrapping_mul(0x1_0000_01b3);
+        }
+    }
+    println!(
+        "frames: {} hash: {hash:016x} native_blocks: {native_blocks} fallback_steps: {fallback_steps}",
+        m.bus.frames
+    );
     Ok(())
 }

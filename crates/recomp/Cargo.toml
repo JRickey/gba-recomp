@@ -9,3 +9,4 @@ description = "Static recompiler CLI"
 armv4t = { path = "../armv4t" }
 gba-core = { path = "../gba-core" }
 minifb = "0.28"
+libloading = "0.8"

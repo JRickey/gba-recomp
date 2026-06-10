@@ -476,6 +476,7 @@ version = "0.1.0"
 dependencies = [
  "armv4t",
  "gba-core",
+ "libloading",
  "minifb",
 ]
 

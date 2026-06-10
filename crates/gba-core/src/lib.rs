@@ -11,6 +11,7 @@
 
 pub mod backup;
 pub mod bus;
+pub mod capi;
 pub mod cpu;
 pub mod exec;
 pub mod hle;

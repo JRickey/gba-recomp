@@ -139,7 +139,7 @@ impl Machine {
 /// Refined per-access costs come with the recompiler's static cycle sums;
 /// this keeps interpreter-mode video/timer/audio pacing in the right
 /// ballpark (commercial waitstate config assumed).
-fn instr_cost(region: usize, instr: &Instr) -> u64 {
+pub(crate) fn instr_cost(region: usize, instr: &Instr) -> u64 {
     let fetch: u64 = match region {
         0x0 | 0x3 | 0x7 => 1,                            // BIOS, IWRAM, OAM: 32-bit
         0x2 => if instr.thumb { 3 } else { 6 },          // EWRAM: 16-bit, 2 waits
