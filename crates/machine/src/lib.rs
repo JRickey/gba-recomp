@@ -1,0 +1,20 @@
+//! Target machine model.
+//!
+//! The interpreter executes the `armv4t::Instr` model directly. It serves
+//! three roles in the project (see docs/architecture.md):
+//! 1. the executable specification of ARM7TDMI semantics,
+//! 2. the differential-testing oracle for the recompiler,
+//! 3. the runtime fallback tier for RAM-resident/self-modifying code.
+//!
+//! Correctness over speed: this is the reference implementation. The
+//! recompiler's output is what has to be fast.
+
+pub mod bus;
+pub mod cpu;
+pub mod exec;
+pub mod hle;
+pub mod mem;
+
+pub use bus::Bus;
+pub use cpu::{Cpu, Mode};
+pub use mem::MemMap;

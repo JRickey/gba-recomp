@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/armv4t",
+    "crates/machine",
     "crates/recomp",
 ]
 

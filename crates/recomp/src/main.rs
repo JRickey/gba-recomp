@@ -7,7 +7,8 @@
 use std::path::Path;
 use std::process::ExitCode;
 
-use armv4t::{decode_arm, decode_thumb, Op};
+use armv4t::{decode_arm, decode_thumb, Cond, Op};
+use machine::{exec, Cpu, MemMap};
 
 const ROM_BASE: u32 = 0x0800_0000;
 
@@ -16,9 +17,11 @@ fn main() -> ExitCode {
     let result = match args.first().map(String::as_str) {
         Some("dis") => cmd_dis(&args[1..]),
         Some("entry-scan") => cmd_entry_scan(&args[1..]),
+        Some("run") => cmd_run(&args[1..]),
         _ => {
             eprintln!("usage: recomp dis <rom> [--addr HEX] [--count N] [--thumb]");
             eprintln!("       recomp entry-scan <dir>");
+            eprintln!("       recomp run <rom> [--max-steps N] [--trace]");
             return ExitCode::FAILURE;
         }
     };
@@ -110,6 +113,62 @@ fn cmd_entry_scan(args: &[String]) -> Result<(), String> {
     } else {
         Err("entry scan had failures".into())
     }
+}
+
+/// Run a ROM in the interpreter until it parks in an unconditional
+/// self-loop (the idiom every test ROM ends with), then dump CPU state.
+fn cmd_run(args: &[String]) -> Result<(), String> {
+    let mut rom_path = None;
+    let mut max_steps = 200_000_000u64;
+    let mut trace = false;
+
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "--max-steps" => {
+                max_steps = it.next().ok_or("--max-steps needs a value")?
+                    .parse().map_err(|e| format!("bad max-steps: {e}"))?
+            }
+            "--trace" => trace = true,
+            other if rom_path.is_none() => rom_path = Some(other.to_string()),
+            other => return Err(format!("unexpected argument {other:?}")),
+        }
+    }
+    let rom_path = rom_path.ok_or("missing ROM path")?;
+    let rom = std::fs::read(&rom_path).map_err(|e| format!("{rom_path}: {e}"))?;
+
+    let mut cpu = Cpu::new();
+    let mut mem = MemMap::new(rom);
+
+    let mut steps = 0u64;
+    while steps < max_steps {
+        let instr = exec::step_hle(&mut cpu, &mut mem);
+        // Crude per-instruction cost until the event scheduler lands; keeps
+        // the derived video timing (vsync polls) advancing.
+        mem.tick(4);
+        steps += 1;
+        if trace {
+            eprintln!("{:08x}: {}", instr.addr, instr.disasm());
+        }
+        // Parked: unconditional branch to itself.
+        if instr.cond == Cond::Al {
+            if let Op::Branch { link: false, target } = instr.op {
+                if target == instr.addr {
+                    break;
+                }
+            }
+        }
+    }
+
+    println!("steps: {steps}");
+    for r in 0..16 {
+        print!("r{r}={:08x} ", cpu.regs[r]);
+        if r % 4 == 3 {
+            println!();
+        }
+    }
+    println!("cpsr={:08x} mode={:?} thumb={}", cpu.cpsr, cpu.mode(), cpu.thumb());
+    Ok(())
 }
 
 fn file_name(p: &Path) -> &str {
