@@ -564,6 +564,22 @@ fn cmd_verify(args: &[String]) -> Result<(), String> {
     if interp == recomp { Ok(()) } else { Err("differential mismatch".into()) }
 }
 
+
+/// Deterministic demo input for differential runs: taps Start, then A,
+/// periodically — enough to leave title screens and menus in most games.
+fn demo_keys(frame: u64) -> u16 {
+    let mut keys = 0x3FFu16;
+    let phase = frame % 180;
+    if frame >= 240 {
+        if phase < 10 {
+            keys &= !(1 << 3); // Start
+        } else if (60..70).contains(&phase) {
+            keys &= !(1 << 0); // A
+        }
+    }
+    keys
+}
+
 fn fb_hash(m: &Machine) -> u64 {
     let mut hash = 0xcbf2_9ce4_8422_2325u64;
     for &px in &m.bus.framebuffer {
@@ -581,6 +597,7 @@ fn run_hash(rom_path: &str, frames: u64, recompiled: bool) -> Result<u64, String
     let mut m = Machine::new(rom);
     if !recompiled {
         for _ in 0..frames {
+            m.bus.keys = demo_keys(m.bus.frames);
             m.run_frame(5_000_000);
         }
         return Ok(fb_hash(&m));
@@ -600,10 +617,15 @@ fn run_hash(rom_path: &str, frames: u64, recompiled: bool) -> Result<u64, String
     };
     let mptr = &mut m as *mut Machine as *mut std::ffi::c_void;
     let mut guard = 0u64;
+    let mut keyed_frame = u64::MAX;
     while m.bus.frames < frames {
         guard += 1;
         if guard > 4_000_000_000 {
             return Err("step guard exceeded".into());
+        }
+        if keyed_frame != m.bus.frames {
+            keyed_frame = m.bus.frames;
+            m.bus.keys = demo_keys(keyed_frame);
         }
         if m.bus.halted
             || (m.cpu.regs[15] == gba_core::machine::IRQ_RETURN_ADDR

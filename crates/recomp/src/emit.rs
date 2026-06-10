@@ -401,7 +401,6 @@ fn emit_block(out: &mut String, b: &Block) {
         let expect = next | thumb_bit;
         let last = i + 1 == b.instrs.len();
         let cost = gba_core::machine_instr_cost(8, instr);
-        cx.cycles += cost;
 
         // Fused Thumb BL pair (always unconditional).
         if let Op::ThumbBlHigh { .. } = instr.op {
@@ -409,7 +408,7 @@ fn emit_block(out: &mut String, b: &Block) {
                 if let Some((target, ret)) =
                     armv4t::fuse_thumb_bl(instr, &b.instrs[i + 1])
                 {
-                    cx.cycles += gba_core::machine_instr_cost(8, &b.instrs[i + 1]);
+                    cx.cycles += cost + gba_core::machine_instr_cost(8, &b.instrs[i + 1]);
                     cx.flush_ticks();
                     let _ = writeln!(cx.out, "    c[14] = 0x{ret:08x}u;");
                     let _ = writeln!(
@@ -430,6 +429,7 @@ fn emit_block(out: &mut String, b: &Block) {
         // Control flow.
         match instr.op {
             Op::Branch { link, target } => {
+                cx.cycles += cost;
                 cx.flush_ticks();
                 let key = target | thumb_bit;
                 let guard = instr.cond != Cond::Al;
@@ -451,6 +451,7 @@ fn emit_block(out: &mut String, b: &Block) {
                 return;
             }
             Op::Bx { rm } if instr.cond == Cond::Al => {
+                cx.cycles += cost;
                 cx.flush_ticks();
                 let t = cx.reg(rm, instr);
                 let _ = writeln!(
@@ -464,6 +465,7 @@ fn emit_block(out: &mut String, b: &Block) {
             Op::BlockMem { load: true, rn, rlist, pre: false, up: true, s_bit: false, writeback: true }
                 if instr.cond == Cond::Al && rlist & (1 << PC) != 0 && rn != PC =>
             {
+                cx.cycles += cost;
                 cx.flush_ticks();
                 let regs: Vec<u8> = (0..15).filter(|r| rlist & (1 << r) != 0).collect();
                 let total = (regs.len() as u32 + 1) * 4;
@@ -484,11 +486,20 @@ fn emit_block(out: &mut String, b: &Block) {
         }
 
         // Straight-line instruction: inline or shell.
+        let touches_bus = matches!(instr.op, Op::Mem { .. } | Op::BlockMem { .. });
         match inline_body(&cx, instr) {
             Some(body) if instr.cond == Cond::Al => {
+                if touches_bus {
+                    cx.flush_ticks();
+                }
+                cx.cycles += cost;
                 let _ = writeln!(cx.out, "    {{\n{body}    }}");
             }
             Some(body) => {
+                if touches_bus {
+                    cx.flush_ticks();
+                }
+                cx.cycles += cost;
                 let _ = writeln!(
                     cx.out,
                     "    {{ uint32_t s_ = c[16]; uint32_t cn = s_ >> 31, cz = (s_ >> 30) & 1u, cc = (s_ >> 29) & 1u, cv = (s_ >> 28) & 1u;\n      if {} {{\n{body}      }} }}",
