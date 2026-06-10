@@ -171,6 +171,7 @@ pub struct MemMap {
     /// drained by the frontend.
     pub audio_buf: Vec<i16>,
     audio_cursor: u64,
+    apu: crate::apu::Apu,
     next_event: u64,
 }
 
@@ -220,6 +221,7 @@ impl MemMap {
             fifo_sample: [0; 2],
             audio_buf: Vec::new(),
             audio_cursor: 0,
+            apu: crate::apu::Apu::default(),
             next_event: HBLANK_FLAG_CYCLE,
         }
     }
@@ -285,8 +287,9 @@ impl MemMap {
     pub fn tick(&mut self, cycles: u64) {
         self.clock += cycles;
         while self.audio_cursor <= self.clock {
-            // Mix the two Direct Sound DAC levels (PSG channels TODO).
-            let s = (self.fifo_sample[0] as i16 + self.fifo_sample[1] as i16) * 64;
+            // Mix Direct Sound DAC levels with the PSG channels.
+            let mut s = (self.fifo_sample[0] as i16 + self.fifo_sample[1] as i16) * 64;
+            s = s.saturating_add(self.apu.sample(&self.io, AUDIO_SAMPLE_CYCLES as u32));
             if self.audio_buf.len() < 0x1_0000 {
                 self.audio_buf.push(s);
             }
@@ -622,6 +625,11 @@ impl MemMap {
                     11 => self.dma_write_control_hi(i, value),
                     _ => unreachable!(),
                 }
+            }
+            // PSG channel registers.
+            x if (0x0400_0060..0x0400_0080).contains(&x) => {
+                self.io[off as usize] = value;
+                self.apu.write8(&self.io, off as usize, value);
             }
             // Direct Sound FIFO data ports.
             x if (0x0400_00A0..0x0400_00A8).contains(&x) => {
