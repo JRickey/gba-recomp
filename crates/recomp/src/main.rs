@@ -152,14 +152,14 @@ fn cmd_run(args: &[String]) -> Result<(), String> {
         steps += 1;
         if let StepEvent::Instr(instr) = event {
             if trace {
-                eprintln!("{:08x}: {}", instr.addr, instr.disasm());
+                eprintln!("{:08x} [{}]: {}", instr.addr, m.bus.clock, instr.disasm());
             }
             // Histogram the tail of the run (where the steady state lives).
             if hist && steps > max_steps.saturating_sub(500_000) {
                 *counts.entry(instr.addr).or_default() += 1;
             }
             // Parked: unconditional branch to itself, with no way out.
-            if is_self_loop(&instr) && !m.bus.irq_pending() && m.bus.intr_wait.is_none() {
+            if is_self_loop(&instr) && !m.bus.irq_pending() {
                 break;
             }
         }
@@ -186,7 +186,7 @@ fn cmd_run(args: &[String]) -> Result<(), String> {
         println!("ewram[0]={:08x}", m.bus.read32(0x0200_0000));
         let dispstat = m.bus.read16(0x0400_0004);
         let biosflags = m.bus.read16(0x0300_7FF8);
-        println!("ie={:04x} if={:04x} ime={} dispstat={dispstat:04x} halted={} intr_wait={:?} biosflags={biosflags:04x}", m.bus.reg_ie, m.bus.reg_if, m.bus.ime, m.bus.halted, m.bus.intr_wait);
+        println!("ie={:04x} if={:04x} ime={} dispstat={dispstat:04x} halted={} armed={} biosflags={biosflags:04x}", m.bus.reg_ie, m.bus.reg_if, m.bus.ime, m.bus.halted, m.bus.intr_wait_armed);
     }
     Ok(())
 }

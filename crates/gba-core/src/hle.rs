@@ -15,10 +15,19 @@ pub fn bios_call<B: Bus>(cpu: &mut Cpu, bus: &mut B, num: u32) -> bool {
             bus.hle_halt();
             true
         }
-        0x04 => bus.hle_intr_wait(cpu.regs[0] != 0, cpu.regs[1] as u16),
-        0x05 => {
-            // VBlankIntrWait = IntrWait(discard=1, mask=VBlank).
-            bus.hle_intr_wait(true, 1)
+        0x04 | 0x05 => {
+            // IntrWait / VBlankIntrWait (the latter = IntrWait(1, VBlank)).
+            let (discard, mask) = if num == 0x05 {
+                (true, 1)
+            } else {
+                (cpu.regs[0] != 0, cpu.regs[1] as u16)
+            };
+            if !bus.hle_intr_wait(discard, mask) {
+                // Halted: rewind so this SWI re-executes after the wake
+                // and handler run, mirroring the BIOS halt-recheck loop.
+                cpu.branch = Some(cpu.regs[15]);
+            }
+            true
         }
         0x06 => {
             div(cpu, cpu.regs[0] as i32, cpu.regs[1] as i32);

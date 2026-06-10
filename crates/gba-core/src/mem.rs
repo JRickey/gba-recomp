@@ -132,7 +132,8 @@ pub struct MemMap {
     pub ime: bool,
     pub halted: bool,
     /// HLE IntrWait state: mask being waited on at 0x03007FF8.
-    pub intr_wait: Option<u16>,
+    /// True between an IntrWait arming (discard done) and its completion.
+    pub intr_wait_armed: bool,
 
     /// KEYINPUT value (active-low; 0x3FF = nothing pressed).
     pub keys: u16,
@@ -193,7 +194,7 @@ impl MemMap {
             reg_if: 0,
             ime: false,
             halted: false,
-            intr_wait: None,
+            intr_wait_armed: false,
             keys: 0x3FF,
             timers: [Timer::default(); 4],
             dma: [Dma::default(); 4],
@@ -821,14 +822,25 @@ impl Bus for MemMap {
     }
 
     fn hle_intr_wait(&mut self, discard: bool, mask: u16) -> bool {
-        if discard {
-            let flags = self.read16(0x0300_7FF8);
-            self.write16(0x0300_7FF8, flags & !mask);
+        // First execution: optionally discard stale flags, arm the wait.
+        if !self.intr_wait_armed {
+            if discard {
+                let flags = self.read16(0x0300_7FF8);
+                self.write16(0x0300_7FF8, flags & !mask);
+            }
+            self.intr_wait_armed = true;
         }
-        // The BIOS routine forces IME on.
+        let flags = self.read16(0x0300_7FF8);
+        if flags & mask != 0 {
+            self.write16(0x0300_7FF8, flags & !mask);
+            self.intr_wait_armed = false;
+            return true;
+        }
+        // The BIOS loop forces IME on and halts until any enabled
+        // interrupt is latched; the caller rewinds the SWI.
         self.ime = true;
-        self.intr_wait = Some(mask);
-        true
+        self.halted = true;
+        false
     }
 
     fn note_unhandled_swi(&mut self, num: u32) -> bool {

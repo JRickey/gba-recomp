@@ -37,10 +37,14 @@ pub trait Bus {
     /// SWI 0x02 Halt: sleep until any enabled interrupt is latched.
     fn hle_halt(&mut self) {}
 
-    /// SWI 0x04/0x05 IntrWait: sleep until the user IRQ handler sets
-    /// `mask` bits at 0x03007FF8. Returns true if the bus models this.
+    /// SWI 0x04/0x05 IntrWait, one iteration of the BIOS loop: handle the
+    /// (first-call-only) discard, then check the flags at 0x03007FF8.
+    /// Returns true when the wait is satisfied (matched flags consumed) —
+    /// the caller proceeds past the SWI. Returns false when the bus has
+    /// halted the CPU instead — the caller must rewind so the SWI
+    /// re-executes after wake + handler, exactly like the BIOS loop.
     fn hle_intr_wait(&mut self, _discard: bool, _mask: u16) -> bool {
-        false
+        true
     }
 
     /// Called for a SWI the HLE layer doesn't implement. Returning true
