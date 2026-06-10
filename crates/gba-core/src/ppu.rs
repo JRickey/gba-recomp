@@ -1,13 +1,628 @@
-//! Scanline PPU renderer.
+//! Scanline PPU renderer (hardware reference, "LCD Video Controller").
 //!
-//! Stub for now: fills each line with the backdrop color (palette entry 0)
-//! so mode/bitmap rendering can land in a focused follow-up. The call site
-//! (the HBlank event in `mem.rs`) and the framebuffer contract are final.
+//! Renders one visible scanline at HBlank into the RGB555 framebuffer:
+//! - modes 0-2: text backgrounds (4/8bpp tiles, flips, scrolling) and
+//!   affine backgrounds (8bpp, optional wrap, per-line reference stepping);
+//! - modes 3-5: bitmap backgrounds (16bpp, 8bpp paged, small paged);
+//! - sprites: 1D/2D mapping, 4/8bpp, flips, affine (incl. double-size),
+//!   per-pixel priority against backgrounds, semi-transparent mode,
+//!   OBJ-window mode;
+//! - windows 0/1, OBJ window, outside region;
+//! - color effects: alpha blend, brightness up/down, semi-transparent
+//!   sprites forcing alpha against second targets;
+//! - backdrop (palette entry 0).
+//!
+//! Mosaic is not yet implemented. Mid-scanline raster effects are out of
+//! scope by design (scanline granularity; see docs/architecture.md §6).
 
 use crate::mem::{MemMap, VISIBLE_WIDTH};
 
+const TRANSPARENT: u16 = 0xFFFF;
+
+/// One line of layer output: RGB555 color or TRANSPARENT.
+type Line = [u16; VISIBLE_WIDTH];
+
+#[derive(Clone, Copy)]
+struct ObjPixel {
+    color: u16,
+    priority: u8,
+    semi: bool,
+}
+
+const OBJ_EMPTY: ObjPixel = ObjPixel { color: TRANSPARENT, priority: 0xFF, semi: false };
+
+fn io16(mem: &MemMap, off: usize) -> u16 {
+    u16::from_le_bytes([mem.io[off], mem.io[off + 1]])
+}
+
+fn pal16(mem: &MemMap, index: usize) -> u16 {
+    u16::from_le_bytes([mem.palette[index * 2], mem.palette[index * 2 + 1]]) & 0x7FFF
+}
+
 pub fn render_scanline(mem: &mut MemMap, line: usize) {
-    let backdrop = u16::from_le_bytes([mem.palette[0], mem.palette[1]]);
-    let row = &mut mem.framebuffer[line * VISIBLE_WIDTH..(line + 1) * VISIBLE_WIDTH];
-    row.fill(backdrop);
+    let dispcnt = io16(mem, 0x00);
+
+    if dispcnt & 0x80 != 0 {
+        // Forced blank: white.
+        let row = &mut mem.framebuffer[line * VISIBLE_WIDTH..(line + 1) * VISIBLE_WIDTH];
+        row.fill(0x7FFF);
+        return;
+    }
+
+    // Latch / step the affine reference accumulators.
+    if line == 0 || mem.aff_dirty[0] {
+        mem.aff_ref[0] = sign_extend28(read_io32(mem, 0x28));
+        mem.aff_ref[1] = sign_extend28(read_io32(mem, 0x2C));
+        mem.aff_dirty[0] = false;
+    }
+    if line == 0 || mem.aff_dirty[1] {
+        mem.aff_ref[2] = sign_extend28(read_io32(mem, 0x38));
+        mem.aff_ref[3] = sign_extend28(read_io32(mem, 0x3C));
+        mem.aff_dirty[1] = false;
+    }
+
+    let mode = dispcnt & 7;
+    let mut bg_lines = [[TRANSPARENT; VISIBLE_WIDTH]; 4];
+    let mut bg_used = [false; 4];
+
+    match mode {
+        0 => {
+            for bg in 0..4 {
+                if dispcnt & (0x100 << bg) != 0 {
+                    render_text_bg(mem, bg, line, &mut bg_lines[bg]);
+                    bg_used[bg] = true;
+                }
+            }
+        }
+        1 => {
+            for bg in 0..2 {
+                if dispcnt & (0x100 << bg) != 0 {
+                    render_text_bg(mem, bg, line, &mut bg_lines[bg]);
+                    bg_used[bg] = true;
+                }
+            }
+            if dispcnt & 0x400 != 0 {
+                render_affine_bg(mem, 2, &mut bg_lines[2]);
+                bg_used[2] = true;
+            }
+        }
+        2 => {
+            for bg in 2..4 {
+                if dispcnt & (0x100 << bg) != 0 {
+                    render_affine_bg(mem, bg, &mut bg_lines[bg]);
+                    bg_used[bg] = true;
+                }
+            }
+        }
+        3 | 4 | 5 => {
+            if dispcnt & 0x400 != 0 {
+                render_bitmap_bg(mem, mode, dispcnt, line, &mut bg_lines[2]);
+                bg_used[2] = true;
+            }
+        }
+        _ => {}
+    }
+
+    // Sprites.
+    let mut obj_line = [OBJ_EMPTY; VISIBLE_WIDTH];
+    let mut obj_window = [false; VISIBLE_WIDTH];
+    if dispcnt & 0x1000 != 0 {
+        render_sprites(mem, dispcnt, line, &mut obj_line, &mut obj_window);
+    }
+
+    // Step affine accumulators for the next line (PB/PD).
+    mem.aff_ref[0] = mem.aff_ref[0].wrapping_add(io16(mem, 0x22) as i16 as i32);
+    mem.aff_ref[1] = mem.aff_ref[1].wrapping_add(io16(mem, 0x26) as i16 as i32);
+    mem.aff_ref[2] = mem.aff_ref[2].wrapping_add(io16(mem, 0x32) as i16 as i32);
+    mem.aff_ref[3] = mem.aff_ref[3].wrapping_add(io16(mem, 0x36) as i16 as i32);
+
+    compose(mem, dispcnt, line, &bg_lines, &bg_used, &obj_line, &obj_window);
+}
+
+fn read_io32(mem: &MemMap, off: usize) -> u32 {
+    u32::from_le_bytes([mem.io[off], mem.io[off + 1], mem.io[off + 2], mem.io[off + 3]])
+}
+
+fn sign_extend28(v: u32) -> i32 {
+    ((v << 4) as i32) >> 4
+}
+
+// ---- text backgrounds ----
+
+fn render_text_bg(mem: &MemMap, bg: usize, line: usize, out: &mut Line) {
+    let cnt = io16(mem, 0x08 + bg * 2);
+    let char_base = ((cnt >> 2) & 3) as usize * 0x4000;
+    let eight_bpp = cnt & 0x80 != 0;
+    let screen_base = ((cnt >> 8) & 0x1F) as usize * 0x800;
+    let size = (cnt >> 14) & 3;
+
+    let hofs = (io16(mem, 0x10 + bg * 4) & 0x1FF) as usize;
+    let vofs = (io16(mem, 0x12 + bg * 4) & 0x1FF) as usize;
+
+    let (w_tiles, h_tiles) = match size {
+        0 => (32, 32),
+        1 => (64, 32),
+        2 => (32, 64),
+        _ => (64, 64),
+    };
+
+    let y = (line + vofs) & (h_tiles * 8 - 1);
+    let ty = y / 8;
+    let py = y % 8;
+
+    for (sx, out_px) in out.iter_mut().enumerate() {
+        let x = (sx + hofs) & (w_tiles * 8 - 1);
+        let tx = x / 8;
+        let px = x % 8;
+
+        // Screenblock layout: 32x32-tile blocks, left-to-right then down.
+        let block = (ty / 32) * (w_tiles / 32) + tx / 32;
+        let entry_idx = block * 1024 + (ty % 32) * 32 + (tx % 32);
+        let entry_off = screen_base + entry_idx * 2;
+        let entry = u16::from_le_bytes([mem.vram[entry_off], mem.vram[entry_off + 1]]);
+
+        let tile = (entry & 0x3FF) as usize;
+        let hflip = entry & 0x400 != 0;
+        let vflip = entry & 0x800 != 0;
+
+        let fy = if vflip { 7 - py } else { py };
+        let fx = if hflip { 7 - px } else { px };
+
+        let color_idx = if eight_bpp {
+            let addr = char_base + tile * 64 + fy * 8 + fx;
+            if addr >= 0x1_0000 {
+                0
+            } else {
+                mem.vram[addr] as usize
+            }
+        } else {
+            let addr = char_base + tile * 32 + fy * 4 + fx / 2;
+            if addr >= 0x1_0000 {
+                0
+            } else {
+                let b = mem.vram[addr];
+                let nib = if fx & 1 == 0 { b & 0xF } else { b >> 4 } as usize;
+                if nib == 0 {
+                    0
+                } else {
+                    ((entry >> 12) as usize & 0xF) * 16 + nib
+                }
+            }
+        };
+
+        *out_px = if color_idx == 0 { TRANSPARENT } else { pal16(mem, color_idx) };
+    }
+}
+
+// ---- affine backgrounds ----
+
+fn render_affine_bg(mem: &MemMap, bg: usize, out: &mut Line) {
+    let cnt = io16(mem, 0x08 + bg * 2);
+    let char_base = ((cnt >> 2) & 3) as usize * 0x4000;
+    let screen_base = ((cnt >> 8) & 0x1F) as usize * 0x800;
+    let wrap = cnt & 0x2000 != 0;
+    let size_tiles = 16usize << ((cnt >> 14) & 3); // 16,32,64,128
+    let size_px = (size_tiles * 8) as i32;
+
+    let (pa, pc, ref_base) = if bg == 2 {
+        (io16(mem, 0x20) as i16 as i32, io16(mem, 0x24) as i16 as i32, 0)
+    } else {
+        (io16(mem, 0x30) as i16 as i32, io16(mem, 0x34) as i16 as i32, 2)
+    };
+    let mut fx = mem.aff_ref[ref_base];
+    let mut fy = mem.aff_ref[ref_base + 1];
+
+    for out_px in out.iter_mut() {
+        let mut tx = fx >> 8;
+        let mut ty = fy >> 8;
+        fx = fx.wrapping_add(pa);
+        fy = fy.wrapping_add(pc);
+
+        if wrap {
+            tx = tx.rem_euclid(size_px);
+            ty = ty.rem_euclid(size_px);
+        } else if tx < 0 || ty < 0 || tx >= size_px || ty >= size_px {
+            *out_px = TRANSPARENT;
+            continue;
+        }
+        let (tx, ty) = (tx as usize, ty as usize);
+
+        let entry_off = screen_base + (ty / 8) * size_tiles + tx / 8;
+        let tile = mem.vram[entry_off] as usize;
+        let addr = char_base + tile * 64 + (ty % 8) * 8 + tx % 8;
+        let color_idx = if addr < 0x1_0000 { mem.vram[addr] as usize } else { 0 };
+        *out_px = if color_idx == 0 { TRANSPARENT } else { pal16(mem, color_idx) };
+    }
+}
+
+// ---- bitmap backgrounds ----
+
+fn render_bitmap_bg(mem: &MemMap, mode: u16, dispcnt: u16, line: usize, out: &mut Line) {
+    let page = if dispcnt & 0x10 != 0 { 0xA000usize } else { 0 };
+    match mode {
+        3 => {
+            for (x, out_px) in out.iter_mut().enumerate() {
+                let off = (line * VISIBLE_WIDTH + x) * 2;
+                let c = u16::from_le_bytes([mem.vram[off], mem.vram[off + 1]]) & 0x7FFF;
+                *out_px = c;
+            }
+        }
+        4 => {
+            for (x, out_px) in out.iter_mut().enumerate() {
+                let idx = mem.vram[page + line * VISIBLE_WIDTH + x] as usize;
+                *out_px = if idx == 0 { TRANSPARENT } else { pal16(mem, idx) };
+            }
+        }
+        _ => {
+            // Mode 5: 160x128 16bpp, paged.
+            for (x, out_px) in out.iter_mut().enumerate() {
+                if x < 160 && line < 128 {
+                    let off = page + (line * 160 + x) * 2;
+                    let c = u16::from_le_bytes([mem.vram[off], mem.vram[off + 1]]) & 0x7FFF;
+                    *out_px = c;
+                } else {
+                    *out_px = TRANSPARENT;
+                }
+            }
+        }
+    }
+}
+
+// ---- sprites ----
+
+const OBJ_SIZES: [[(i32, i32); 4]; 3] = [
+    [(8, 8), (16, 16), (32, 32), (64, 64)],   // square
+    [(16, 8), (32, 8), (32, 16), (64, 32)],   // horizontal
+    [(8, 16), (8, 32), (16, 32), (32, 64)],   // vertical
+];
+
+fn render_sprites(
+    mem: &MemMap,
+    dispcnt: u16,
+    line: usize,
+    out: &mut [ObjPixel; VISIBLE_WIDTH],
+    window: &mut [bool; VISIBLE_WIDTH],
+) {
+    let one_dim = dispcnt & 0x40 != 0;
+    let bitmap_mode = (dispcnt & 7) >= 3;
+    let line = line as i32;
+
+    for i in 0..128 {
+        let a0 = u16::from_le_bytes([mem.oam[i * 8], mem.oam[i * 8 + 1]]);
+        let a1 = u16::from_le_bytes([mem.oam[i * 8 + 2], mem.oam[i * 8 + 3]]);
+        let a2 = u16::from_le_bytes([mem.oam[i * 8 + 4], mem.oam[i * 8 + 5]]);
+
+        let affine = a0 & 0x100 != 0;
+        if !affine && a0 & 0x200 != 0 {
+            continue; // disabled
+        }
+        let shape = ((a0 >> 14) & 3) as usize;
+        if shape == 3 {
+            continue; // prohibited
+        }
+        let size_idx = ((a1 >> 14) & 3) as usize;
+        let (w, h) = OBJ_SIZES[shape][size_idx];
+        let double = affine && a0 & 0x200 != 0;
+        let (bw, bh) = if double { (w * 2, h * 2) } else { (w, h) };
+
+        let mut y = (a0 & 0xFF) as i32;
+        if y >= 160 {
+            y -= 256;
+        }
+        let mut x = (a1 & 0x1FF) as i32;
+        if x >= 240 {
+            x -= 512;
+        }
+        if line < y || line >= y + bh {
+            continue;
+        }
+
+        let mode = (a0 >> 10) & 3;
+        let eight_bpp = a0 & 0x2000 != 0;
+        let tile_base = (a2 & 0x3FF) as usize;
+        let priority = ((a2 >> 10) & 3) as u8;
+        let palette = ((a2 >> 12) & 0xF) as usize;
+
+        // Affine parameters.
+        let (pa, pb, pc, pd) = if affine {
+            let g = ((a1 >> 9) & 0x1F) as usize * 32;
+            let p = |off: usize| {
+                u16::from_le_bytes([mem.oam[g + off], mem.oam[g + off + 1]]) as i16 as i32
+            };
+            (p(6), p(14), p(22), p(30))
+        } else {
+            (0x100, 0, 0, 0x100)
+        };
+
+        let row_tiles = if one_dim {
+            (w / 8) * if eight_bpp { 2 } else { 1 }
+        } else {
+            32
+        };
+
+        let ly = line - y;
+        for bx in 0..bw {
+            let sx = x + bx;
+            if !(0..VISIBLE_WIDTH as i32).contains(&sx) {
+                continue;
+            }
+            let sx_usize = sx as usize;
+
+            // Texture coordinates.
+            let (u, v) = if affine {
+                let dx = bx - bw / 2;
+                let dy = ly - bh / 2;
+                let u = ((pa * dx + pb * dy) >> 8) + w / 2;
+                let v = ((pc * dx + pd * dy) >> 8) + h / 2;
+                if u < 0 || v < 0 || u >= w || v >= h {
+                    continue;
+                }
+                (u, v)
+            } else {
+                let mut u = bx;
+                let mut v = ly;
+                if a1 & 0x1000 != 0 {
+                    u = w - 1 - u;
+                }
+                if a1 & 0x800 != 0 {
+                    v = h - 1 - v;
+                }
+                (u, v)
+            };
+
+            let (tu, pu) = (u / 8, u % 8);
+            let (tv, pv) = (v / 8, v % 8);
+            let tile_step = if eight_bpp { 2 } else { 1 };
+            let tile = tile_base + tv as usize * row_tiles as usize + tu as usize * tile_step;
+            // In bitmap modes the first 512 tiles overlap the bitmap.
+            if bitmap_mode && tile < 512 {
+                continue;
+            }
+            let addr = 0x1_0000
+                + if eight_bpp {
+                    (tile / 2) * 64 + pv as usize * 8 + pu as usize
+                } else {
+                    tile * 32 + pv as usize * 4 + pu as usize / 2
+                };
+            if addr >= 0x1_8000 {
+                continue;
+            }
+            let color_idx = if eight_bpp {
+                mem.vram[addr] as usize
+            } else {
+                let b = mem.vram[addr];
+                let nib = if pu & 1 == 0 { b & 0xF } else { b >> 4 } as usize;
+                if nib == 0 {
+                    0
+                } else {
+                    palette * 16 + nib
+                }
+            };
+            if color_idx == 0 {
+                continue;
+            }
+            let color = pal16(mem, 256 + color_idx);
+
+            if mode == 2 {
+                window[sx_usize] = true;
+            } else if out[sx_usize].priority == 0xFF || priority < out[sx_usize].priority {
+                out[sx_usize] = ObjPixel { color, priority, semi: mode == 1 };
+            }
+        }
+    }
+}
+
+// ---- composition ----
+
+/// Layer ids for blend targeting: 0-3 BGs, 4 OBJ, 5 backdrop.
+fn compose(
+    mem: &mut MemMap,
+    dispcnt: u16,
+    line: usize,
+    bg_lines: &[Line; 4],
+    bg_used: &[bool; 4],
+    obj_line: &[ObjPixel; VISIBLE_WIDTH],
+    obj_window: &[bool; VISIBLE_WIDTH],
+) {
+    let backdrop = pal16(mem, 0);
+
+    // Background priorities (compose ties: lower BG number wins).
+    let bg_prio: Vec<(u8, usize)> = {
+        let mut v: Vec<(u8, usize)> = (0..4)
+            .filter(|&bg| bg_used[bg])
+            .map(|bg| ((io16(mem, 0x08 + bg * 2) & 3) as u8, bg))
+            .collect();
+        v.sort();
+        v
+    };
+
+    let win0_on = dispcnt & 0x2000 != 0;
+    let win1_on = dispcnt & 0x4000 != 0;
+    let objwin_on = dispcnt & 0x8000 != 0;
+    let any_window = win0_on || win1_on || objwin_on;
+
+    let winin = io16(mem, 0x48);
+    let winout = io16(mem, 0x4A);
+
+    let win0h = io16(mem, 0x40);
+    let win1h = io16(mem, 0x42);
+    let win0v = io16(mem, 0x44);
+    let win1v = io16(mem, 0x46);
+
+    let in_win0_y = win0_on && in_window_range((win0v >> 8) as u8, win0v as u8, line as u8);
+    let in_win1_y = win1_on && in_window_range((win1v >> 8) as u8, win1v as u8, line as u8);
+
+    let bldcnt = io16(mem, 0x50);
+    let blend_mode = (bldcnt >> 6) & 3;
+    let bldalpha = io16(mem, 0x52);
+    let eva = (bldalpha & 0x1F).min(16) as u32;
+    let evb = ((bldalpha >> 8) & 0x1F).min(16) as u32;
+    let evy = (io16(mem, 0x54) & 0x1F).min(16) as u32;
+
+    let row = line * VISIBLE_WIDTH;
+    for x in 0..VISIBLE_WIDTH {
+        // Window control for this pixel: bits 0-3 BGs, 4 OBJ, 5 effects.
+        let control: u16 = if !any_window {
+            0x3F
+        } else if in_win0_y && in_window_range((win0h >> 8) as u8, win0h as u8, x as u8) {
+            winin & 0x3F
+        } else if in_win1_y && in_window_range((win1h >> 8) as u8, win1h as u8, x as u8) {
+            (winin >> 8) & 0x3F
+        } else if objwin_on && obj_window[x] {
+            (winout >> 8) & 0x3F
+        } else {
+            winout & 0x3F
+        };
+
+        // Find the top two visible layers (OBJ ranks above BGs of equal
+        // priority; BGs tie-break by index via the pre-sorted list).
+        let obj = &obj_line[x];
+        let obj_visible = obj.priority != 0xFF && control & 0x10 != 0;
+
+        let mut first: Option<(u16, usize)> = None;
+        let mut second: Option<(u16, usize)> = None;
+        'outer: for p in 0..4u8 {
+            if obj_visible && obj.priority == p {
+                if first.is_none() {
+                    first = Some((obj.color, 4));
+                } else {
+                    second = Some((obj.color, 4));
+                    break 'outer;
+                }
+            }
+            for &(bp, bg) in &bg_prio {
+                if bp == p && control & (1 << bg) != 0 {
+                    let c = bg_lines[bg][x];
+                    if c != TRANSPARENT {
+                        if first.is_none() {
+                            first = Some((c, bg));
+                        } else {
+                            second = Some((c, bg));
+                            break 'outer;
+                        }
+                    }
+                }
+            }
+        }
+        let (fc, fl) = first.unwrap_or((backdrop, 5));
+        let (sc, sl) = second.unwrap_or((backdrop, 5));
+
+        let effects_allowed = control & 0x20 != 0;
+        let semi = obj_visible && fl == 4 && obj.semi;
+
+        let color = if semi && bldcnt & (0x100 << sl) != 0 {
+            // Semi-transparent sprite forces alpha against 2nd targets.
+            alpha_blend(fc, sc, eva, evb)
+        } else if effects_allowed && blend_mode != 0 && bldcnt & (1 << fl) != 0 {
+            match blend_mode {
+                1 if bldcnt & (0x100 << sl) != 0 => alpha_blend(fc, sc, eva, evb),
+                2 => brighten(fc, evy),
+                3 => darken(fc, evy),
+                _ => fc,
+            }
+        } else {
+            fc
+        };
+
+        mem.framebuffer[row + x] = color;
+    }
+}
+
+/// Window coordinate test: x1 = left/top (inclusive), x2 = right/bottom
+/// (exclusive); x1 > x2 wraps.
+fn in_window_range(x1: u8, x2: u8, v: u8) -> bool {
+    if x1 <= x2 {
+        (x1..x2).contains(&v)
+    } else {
+        v >= x1 || v < x2
+    }
+}
+
+fn alpha_blend(a: u16, b: u16, eva: u32, evb: u32) -> u16 {
+    let (ar, ag, ab) = split(a);
+    let (br, bg, bb) = split(b);
+    let r = ((ar * eva + br * evb) / 16).min(31);
+    let g = ((ag * eva + bg * evb) / 16).min(31);
+    let b = ((ab * eva + bb * evb) / 16).min(31);
+    join(r, g, b)
+}
+
+fn brighten(c: u16, evy: u32) -> u16 {
+    let (r, g, b) = split(c);
+    join(r + (31 - r) * evy / 16, g + (31 - g) * evy / 16, b + (31 - b) * evy / 16)
+}
+
+fn darken(c: u16, evy: u32) -> u16 {
+    let (r, g, b) = split(c);
+    join(r - r * evy / 16, g - g * evy / 16, b - b * evy / 16)
+}
+
+fn split(c: u16) -> (u32, u32, u32) {
+    ((c & 31) as u32, ((c >> 5) & 31) as u32, ((c >> 10) & 31) as u32)
+}
+
+fn join(r: u32, g: u32, b: u32) -> u16 {
+    (r | (g << 5) | (b << 10)) as u16
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bus::Bus;
+
+    #[test]
+    fn mode3_pixel() {
+        let mut mem = MemMap::new(vec![]);
+        mem.write16(0x0400_0000, 0x0403); // mode 3, BG2 on
+        mem.write16(0x0600_0000 + 2 * (5 + 7 * 240), 0x7C1F); // magenta at (5,7)
+        render_scanline(&mut mem, 7);
+        assert_eq!(mem.framebuffer[7 * 240 + 5], 0x7C1F);
+        assert_eq!(mem.framebuffer[7 * 240 + 6], 0x0000);
+    }
+
+    #[test]
+    fn mode0_text_tile() {
+        let mut mem = MemMap::new(vec![]);
+        mem.write16(0x0400_0000, 0x0100); // mode 0, BG0 on
+        // BG0: char base 0, screen base block 31 (0xF800), 4bpp, 32x32.
+        mem.write16(0x0400_0008, 31 << 8);
+        // Palette 1, color 3 = red-ish.
+        mem.write16(0x0500_0000 + (16 + 3) * 2, 0x001F);
+        // Tile 1: all pixels = color 3.
+        for row in 0..8 {
+            mem.write32(0x0600_0000 + 32 + row * 4, 0x3333_3333);
+        }
+        // Map entry (0,0): tile 1, palette 1.
+        mem.write16(0x0600_F800, (1 << 12) | 1);
+        render_scanline(&mut mem, 0);
+        assert_eq!(mem.framebuffer[0], 0x001F);
+        // (8,0) is tile (1,0): map entry 0 -> tile 0 -> transparent -> backdrop.
+        assert_eq!(mem.framebuffer[8], pal16(&mem, 0));
+    }
+
+    #[test]
+    fn sprite_over_backdrop() {
+        let mut mem = MemMap::new(vec![]);
+        mem.write16(0x0400_0000, 0x1000); // mode 0, OBJ on
+        // OBJ palette color 1 = green.
+        mem.write16(0x0500_0200 + 2, 0x03E0);
+        // Tile 1 in OBJ charblock: all color 1 (4bpp).
+        for row in 0..8 {
+            mem.write32(0x0601_0000 + 32 + row * 4, 0x1111_1111);
+        }
+        // Sprite 0: 8x8 at (10, 20), tile 1.
+        mem.write16(0x0700_0000, 20); // attr0: y=20
+        mem.write16(0x0700_0002, 10); // attr1: x=10
+        mem.write16(0x0700_0004, 1); // attr2: tile 1
+        render_scanline(&mut mem, 22);
+        assert_eq!(mem.framebuffer[22 * 240 + 10], 0x03E0);
+        assert_eq!(mem.framebuffer[22 * 240 + 18], 0x0000); // outside sprite
+    }
+
+    #[test]
+    fn brightness_math() {
+        assert_eq!(brighten(0x0000, 16), 0x7FFF);
+        assert_eq!(darken(0x7FFF, 16), 0x0000);
+        assert_eq!(brighten(0x0000, 0), 0x0000);
+    }
 }

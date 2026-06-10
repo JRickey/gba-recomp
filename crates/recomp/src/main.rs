@@ -18,10 +18,12 @@ fn main() -> ExitCode {
         Some("dis") => cmd_dis(&args[1..]),
         Some("entry-scan") => cmd_entry_scan(&args[1..]),
         Some("run") => cmd_run(&args[1..]),
+        Some("frames") => cmd_frames(&args[1..]),
         _ => {
             eprintln!("usage: recomp dis <rom> [--addr HEX] [--count N] [--thumb]");
             eprintln!("       recomp entry-scan <dir>");
             eprintln!("       recomp run <rom> [--max-steps N] [--trace]");
+            eprintln!("       recomp frames <rom> [--frames N] [--out img.ppm] [--keys MASK]");
             return ExitCode::FAILURE;
         }
     };
@@ -165,6 +167,67 @@ fn cmd_run(args: &[String]) -> Result<(), String> {
     {
         use gba_core::Bus as _;
         println!("ewram[0]={:08x}", m.bus.read32(0x0200_0000));
+    }
+    Ok(())
+}
+
+/// Run a ROM for N frames headless, print a framebuffer hash, and
+/// optionally write the final frame as a binary PPM.
+fn cmd_frames(args: &[String]) -> Result<(), String> {
+    let mut rom_path = None;
+    let mut frames = 60u64;
+    let mut out: Option<String> = None;
+    let mut keys = 0x3FFu16; // active-low: nothing pressed
+
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "--frames" => {
+                frames = it.next().ok_or("--frames needs a value")?
+                    .parse().map_err(|e| format!("bad frames: {e}"))?
+            }
+            "--out" => out = Some(it.next().ok_or("--out needs a value")?.to_string()),
+            "--keys" => keys = parse_hex(it.next().ok_or("--keys needs a value")?)? as u16,
+            other if rom_path.is_none() => rom_path = Some(other.to_string()),
+            other => return Err(format!("unexpected argument {other:?}")),
+        }
+    }
+    let rom_path = rom_path.ok_or("missing ROM path")?;
+    let rom = std::fs::read(&rom_path).map_err(|e| format!("{rom_path}: {e}"))?;
+
+    let mut m = Machine::new(rom);
+    m.bus.keys = keys;
+    for _ in 0..frames {
+        m.run_frame(5_000_000);
+    }
+
+    // FNV-1a over the framebuffer for cheap regression hashing.
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for &px in &m.bus.framebuffer {
+        for b in px.to_le_bytes() {
+            hash ^= b as u64;
+            hash = hash.wrapping_mul(0x1_0000_01b3);
+        }
+    }
+    {
+        use gba_core::Bus as _;
+        let dispcnt = m.bus.read16(0x0400_0000);
+        println!(
+            "frames: {} hash: {hash:016x} dispcnt: {dispcnt:04x} pc: {:08x} mode: {:?} unhandled_swis: {:x}",
+            m.bus.frames, m.cpu.regs[15], m.cpu.mode(), m.bus.unhandled_swis
+        );
+    }
+
+    if let Some(path) = out {
+        let mut ppm = format!("P6\n240 160\n255\n").into_bytes();
+        for &px in &m.bus.framebuffer {
+            let r = (px & 31) as u8;
+            let g = ((px >> 5) & 31) as u8;
+            let b = ((px >> 10) & 31) as u8;
+            ppm.extend_from_slice(&[r << 3 | r >> 2, g << 3 | g >> 2, b << 3 | b >> 2]);
+        }
+        std::fs::write(&path, ppm).map_err(|e| format!("{path}: {e}"))?;
+        println!("wrote {path}");
     }
     Ok(())
 }
