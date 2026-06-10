@@ -123,6 +123,7 @@ fn cmd_run(args: &[String]) -> Result<(), String> {
     let mut rom_path = None;
     let mut max_steps = 200_000_000u64;
     let mut trace = false;
+    let mut hist = false;
 
     let mut it = args.iter();
     while let Some(arg) = it.next() {
@@ -132,6 +133,7 @@ fn cmd_run(args: &[String]) -> Result<(), String> {
                     .parse().map_err(|e| format!("bad max-steps: {e}"))?
             }
             "--trace" => trace = true,
+            "--hist" => hist = true,
             other if rom_path.is_none() => rom_path = Some(other.to_string()),
             other => return Err(format!("unexpected argument {other:?}")),
         }
@@ -140,6 +142,7 @@ fn cmd_run(args: &[String]) -> Result<(), String> {
     let rom = std::fs::read(&rom_path).map_err(|e| format!("{rom_path}: {e}"))?;
 
     let mut m = Machine::new(rom);
+    let mut counts: std::collections::HashMap<u32, u64> = std::collections::HashMap::new();
 
     let mut steps = 0u64;
     while steps < max_steps {
@@ -149,10 +152,22 @@ fn cmd_run(args: &[String]) -> Result<(), String> {
             if trace {
                 eprintln!("{:08x}: {}", instr.addr, instr.disasm());
             }
+            // Histogram the tail of the run (where the steady state lives).
+            if hist && steps > max_steps.saturating_sub(500_000) {
+                *counts.entry(instr.addr).or_default() += 1;
+            }
             // Parked: unconditional branch to itself, with no way out.
             if is_self_loop(&instr) && !m.bus.irq_pending() && m.bus.intr_wait.is_none() {
                 break;
             }
+        }
+    }
+
+    if hist {
+        let mut top: Vec<_> = counts.into_iter().collect();
+        top.sort_by_key(|&(_, n)| std::cmp::Reverse(n));
+        for (addr, n) in top.iter().take(10) {
+            println!("hot {addr:08x}: {n}");
         }
     }
 
@@ -167,6 +182,9 @@ fn cmd_run(args: &[String]) -> Result<(), String> {
     {
         use gba_core::Bus as _;
         println!("ewram[0]={:08x}", m.bus.read32(0x0200_0000));
+        let dispstat = m.bus.read16(0x0400_0004);
+        let biosflags = m.bus.read16(0x0300_7FF8);
+        println!("ie={:04x} if={:04x} ime={} dispstat={dispstat:04x} halted={} intr_wait={:?} biosflags={biosflags:04x}", m.bus.reg_ie, m.bus.reg_if, m.bus.ime, m.bus.halted, m.bus.intr_wait);
     }
     Ok(())
 }
@@ -216,6 +234,25 @@ fn cmd_frames(args: &[String]) -> Result<(), String> {
             "frames: {} hash: {hash:016x} dispcnt: {dispcnt:04x} pc: {:08x} mode: {:?} unhandled_swis: {:x}",
             m.bus.frames, m.cpu.regs[15], m.cpu.mode(), m.bus.unhandled_swis
         );
+    }
+
+    // Live disassembly around the final PC (reads through the bus, so
+    // RAM-resident code is visible) — invaluable for stuck-loop triage.
+    {
+        use gba_core::Bus as _;
+        let pc = m.cpu.regs[15];
+        let start = pc.saturating_sub(12);
+        for i in 0..8 {
+            if m.cpu.thumb() {
+                let a = start + i * 2;
+                let h = m.bus.read16(a & !1);
+                eprintln!("  {a:08x}: {}", decode_thumb(h, a & !1).disasm());
+            } else {
+                let a = start + i * 4;
+                let w = m.bus.read32(a & !3);
+                eprintln!("  {a:08x}: {}", decode_arm(w, a & !3).disasm());
+            }
+        }
     }
 
     if let Some(path) = out {

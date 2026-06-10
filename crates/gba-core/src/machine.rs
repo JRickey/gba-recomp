@@ -54,19 +54,23 @@ impl Machine {
         }
 
         // HLE IntrWait: sleep until the user handler sets the waited flags
-        // at 0x03007FF8. IRQ dispatch still happens from this state.
+        // at 0x03007FF8. IRQ dispatch still happens from this state — and
+        // while an IRQ is being serviced (I set), the CPU must execute
+        // normally so the handler can actually run and set those flags.
         if let Some(mask) = self.bus.intr_wait {
-            let flags = self.bus.read16(0x0300_7FF8);
-            if flags & mask != 0 {
-                self.bus.write16(0x0300_7FF8, flags & !mask);
-                self.bus.intr_wait = None;
-                // fall through and resume execution
-            } else if self.bus.irq_pending() && !self.cpu.flag(FLAG_I) {
-                self.dispatch_irq();
-                return StepEvent::Idle;
-            } else {
-                self.bus.skip_to_next_event();
-                return StepEvent::Idle;
+            if !self.cpu.flag(FLAG_I) {
+                let flags = self.bus.read16(0x0300_7FF8);
+                if flags & mask != 0 {
+                    self.bus.write16(0x0300_7FF8, flags & !mask);
+                    self.bus.intr_wait = None;
+                    // fall through and resume execution
+                } else if self.bus.irq_pending() {
+                    self.dispatch_irq();
+                    return StepEvent::Idle;
+                } else {
+                    self.bus.skip_to_next_event();
+                    return StepEvent::Idle;
+                }
             }
         }
 
