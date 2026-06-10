@@ -1,0 +1,8 @@
+[package]
+name = "armv4t"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "ARMv4T (ARM7TDMI) ARM + Thumb instruction model and decoder"
+
+[dependencies]

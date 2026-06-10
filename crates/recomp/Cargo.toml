@@ -1,0 +1,9 @@
+[package]
+name = "recomp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Static recompiler CLI"
+
+[dependencies]
+armv4t = { path = "../armv4t" }
