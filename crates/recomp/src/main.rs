@@ -168,6 +168,10 @@ fn cmd_run(args: &[String]) -> Result<(), String> {
         }
     }
     println!("cpsr={:08x} mode={:?} thumb={}", cpu.cpsr, cpu.mode(), cpu.thumb());
+    {
+        use machine::Bus as _;
+        println!("ewram[0]={:08x}", mem.read32(0x0200_0000));
+    }
     Ok(())
 }
 
