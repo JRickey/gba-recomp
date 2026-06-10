@@ -161,6 +161,11 @@ pub struct MemMap {
     pub backup: BackupKind,
     pub flash: Option<Flash>,
     pub eeprom: Option<Eeprom>,
+    /// Direct Sound FIFOs A/B: byte queues fed by writes/DMA at
+    /// 0x040000A0/A4, drained one sample per attached-timer overflow.
+    fifo: [std::collections::VecDeque<i8>; 2],
+    /// Most recent sample popped from each FIFO (the DAC output level).
+    pub fifo_sample: [i8; 2],
     next_event: u64,
 }
 
@@ -203,6 +208,8 @@ impl MemMap {
             backup,
             flash,
             eeprom,
+            fifo: [std::collections::VecDeque::new(), std::collections::VecDeque::new()],
+            fifo_sample: [0; 2],
             next_event: HBLANK_FLAG_CYCLE,
         }
     }
@@ -385,6 +392,16 @@ impl MemMap {
         if self.timers[i].irq_enabled() {
             self.raise_irq(irq::TIMER0 << i);
         }
+        // Direct Sound: timers 0/1 clock the FIFOs selected in SOUNDCNT_H.
+        if i < 2 {
+            let soundcnt_h = u16::from_le_bytes([self.io[0x82], self.io[0x83]]);
+            for f in 0..2 {
+                let timer_sel = (soundcnt_h >> (10 + f * 4)) & 1;
+                if timer_sel as usize == i {
+                    self.drain_fifo(f, times);
+                }
+            }
+        }
         // Cascade into the next timer.
         if i < 3 && self.timers[i + 1].enabled() && self.timers[i + 1].cascade() {
             for _ in 0..times {
@@ -415,6 +432,32 @@ impl MemMap {
         self.recompute_next_event();
     }
 
+    /// Consume samples from a FIFO; refill via sound DMA at the low mark.
+    fn drain_fifo(&mut self, f: usize, times: u64) {
+        for _ in 0..times {
+            if let Some(s) = self.fifo[f].pop_front() {
+                self.fifo_sample[f] = s;
+            }
+        }
+        if self.fifo[f].len() <= 16 {
+            let fifo_addr = 0x0400_00A0 + 4 * f as u32;
+            for ch in 1..=2usize {
+                if self.dma[ch].enabled()
+                    && self.dma[ch].timing() == 3
+                    && self.dma[ch].cur_dst & !3 == fifo_addr
+                {
+                    self.run_dma(ch);
+                }
+            }
+        }
+    }
+
+    fn fifo_push(&mut self, f: usize, value: u8) {
+        if self.fifo[f].len() < 64 {
+            self.fifo[f].push_back(value as i8);
+        }
+    }
+
     // ---- DMA ----
 
     /// Fire all enabled channels with the given start timing
@@ -429,18 +472,27 @@ impl MemMap {
 
     fn run_dma(&mut self, i: usize) {
         let ch = self.dma[i];
+        // Sound FIFO mode: always 4 words, 32-bit, fixed destination.
+        let sound_mode = ch.timing() == 3 && (i == 1 || i == 2);
         let max: u32 = if i == 3 { 0x1_0000 } else { 0x4000 };
-        let count = if ch.count == 0 { max } else { ch.count as u32 };
-        let unit: u32 = if ch.word() { 4 } else { 2 };
+        let count = if sound_mode {
+            4
+        } else if ch.count == 0 {
+            max
+        } else {
+            ch.count as u32
+        };
+        let word = ch.word() || sound_mode;
+        let unit: u32 = if word { 4 } else { 2 };
 
-        let dst_adj = (ch.control >> 5) & 3;
+        let dst_adj = if sound_mode { 2 } else { (ch.control >> 5) & 3 };
         let src_adj = (ch.control >> 7) & 3;
 
-        let mut src = ch.cur_src & if ch.word() { !3 } else { !1 };
-        let mut dst = ch.cur_dst & if ch.word() { !3 } else { !1 };
+        let mut src = ch.cur_src & if word { !3 } else { !1 };
+        let mut dst = ch.cur_dst & if word { !3 } else { !1 };
 
         for _ in 0..count {
-            if ch.word() {
+            if word {
                 let v = self.read32(src);
                 self.write32(dst, v);
             } else {
@@ -551,6 +603,21 @@ impl MemMap {
                     10 => self.dma[i].control = (self.dma[i].control & 0xFF00) | value as u16,
                     11 => self.dma_write_control_hi(i, value),
                     _ => unreachable!(),
+                }
+            }
+            // Direct Sound FIFO data ports.
+            x if (0x0400_00A0..0x0400_00A8).contains(&x) => {
+                let f = ((x - 0x0400_00A0) / 4) as usize;
+                self.fifo_push(f, value);
+            }
+            // SOUNDCNT_H: FIFO reset bits (11/15) clear the queues.
+            x if x == 0x0400_0083 => {
+                self.io[off as usize] = value;
+                if value & 0x08 != 0 {
+                    self.fifo[0].clear();
+                }
+                if value & 0x80 != 0 {
+                    self.fifo[1].clear();
                 }
             }
             // Affine BG reference points: request an accumulator reload.
