@@ -58,6 +58,7 @@ pub enum Exception {
     Irq = 0x18,
 }
 
+#[repr(C)]
 pub struct Cpu {
     /// Active register view for the current mode. `regs[15]` holds the
     /// *fetch* address of the next instruction between steps; during

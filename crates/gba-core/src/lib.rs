@@ -21,5 +21,5 @@ pub mod ppu;
 
 pub use bus::Bus;
 pub use cpu::{Cpu, Mode};
-pub use machine::{is_self_loop, Machine, StepEvent};
+pub use machine::{instr_cost as machine_instr_cost, is_self_loop, Machine, StepEvent};
 pub use mem::MemMap;
