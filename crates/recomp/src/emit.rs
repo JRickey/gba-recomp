@@ -384,14 +384,35 @@ fn inline_body(cx: &Ctx, instr: &Instr) -> Option<String> {
 }
 
 /// Emit one block as a C function.
-fn emit_block(out: &mut String, b: &Block) {
+fn emit_block(out: &mut String, b: &Block, view: &crate::analyze::View) {
     let thumb_bit = b.thumb as u32;
+    let region = (b.addr >> 24) as usize & 0xF;
     let _ = writeln!(
         out,
         "static uint32_t b_{:08x}_{}(const RtApi* a, void* m) {{\n    uint32_t* c = (uint32_t*)m;\n    uint32_t pc; (void)pc;",
         b.addr,
         if b.thumb { "t" } else { "a" }
     );
+
+    // RAM-resident blocks were translated from a profiling snapshot; guard
+    // the first and last instruction words so swapped/overwritten code
+    // falls back to the interpreter instead of running stale natives.
+    if region != 8 {
+        let last = b.instrs.last().unwrap();
+        let checks: [(u32, bool); 2] = [(b.addr, b.thumb), (last.addr, last.thumb)];
+        for (addr, thumb) in checks {
+            let (rd, val) = if thumb {
+                ("read16", view.read16(addr) as u32)
+            } else {
+                ("read32", view.read32(addr))
+            };
+            let _ = writeln!(
+                out,
+                "    if (a->{rd}(m, 0x{addr:08x}u) != 0x{val:08x}u) {{ c[15] = 0x{:08x}u; return a->interp_one(m); }}",
+                b.addr
+            );
+        }
+    }
 
     let mut cx = Ctx { out, thumb: b.thumb, cycles: 0 };
     let mut i = 0;
@@ -400,7 +421,7 @@ fn emit_block(out: &mut String, b: &Block) {
         let next = instr.addr.wrapping_add(instr.size());
         let expect = next | thumb_bit;
         let last = i + 1 == b.instrs.len();
-        let cost = gba_core::machine_instr_cost(8, instr);
+        let cost = gba_core::machine_instr_cost(region, instr);
 
         // Fused Thumb BL pair (always unconditional).
         if let Op::ThumbBlHigh { .. } = instr.op {
@@ -408,7 +429,7 @@ fn emit_block(out: &mut String, b: &Block) {
                 if let Some((target, ret)) =
                     armv4t::fuse_thumb_bl(instr, &b.instrs[i + 1])
                 {
-                    cx.cycles += cost + gba_core::machine_instr_cost(8, &b.instrs[i + 1]);
+                    cx.cycles += cost + gba_core::machine_instr_cost(region, &b.instrs[i + 1]);
                     cx.flush_ticks();
                     let _ = writeln!(cx.out, "    c[14] = 0x{ret:08x}u;");
                     let _ = writeln!(
@@ -530,13 +551,13 @@ fn emit_block(out: &mut String, b: &Block) {
     out.push_str("}\n\n");
 }
 
-pub fn emit_c(analysis: &Analysis) -> String {
+pub fn emit_c(analysis: &Analysis, view: &crate::analyze::View) -> String {
     let mut out = String::with_capacity(4 << 20);
     out.push_str(PREAMBLE);
     out.push('\n');
 
     for b in &analysis.blocks {
-        emit_block(&mut out, b);
+        emit_block(&mut out, b, view);
     }
 
     out.push_str("const RcgBlock rcg_blocks[] = {\n");

@@ -424,14 +424,65 @@ fn cmd_play(args: &[String]) -> Result<(), String> {
 /// Statically recompile a ROM: analyze, emit C, compile to a shared
 /// library with the system C compiler.
 fn cmd_build(args: &[String]) -> Result<(), String> {
-    let rom_path = args.first().ok_or("missing ROM path")?;
+    let mut rom_path = None;
+    let mut ram = false;
+    for arg in args {
+        match arg.as_str() {
+            "--ram" => ram = true,
+            other if rom_path.is_none() => rom_path = Some(other.to_string()),
+            other => return Err(format!("unexpected argument {other:?}")),
+        }
+    }
+    let rom_path = &rom_path.ok_or("missing ROM path")?;
     let rom = std::fs::read(rom_path).map_err(|e| format!("{rom_path}: {e}"))?;
 
-    let analysis = analyze::analyze(&rom);
+    // Profile-guided RAM discovery: run the interpreter briefly, recording
+    // control-transfer targets in EWRAM/IWRAM, then translate the observed
+    // RAM-resident code from the end-of-run snapshot (content-guarded at
+    // execution time).
+    let (seeds, ewram, iwram) = if !ram {
+        (Vec::new(), Vec::new(), Vec::new())
+    } else {
+        let mut m = Machine::new(rom.clone());
+        let mut seeds = std::collections::BTreeSet::new();
+        let mut prev_end = 0u32;
+        let mut steps = 0u64;
+        while m.bus.frames < 240 && steps < 60_000_000 {
+            steps += 1;
+            match m.step() {
+                StepEvent::Instr(instr) => {
+                    let pc = m.cpu.regs[15];
+                    // IWRAM only: EWRAM commonly holds streamed overlays,
+                    // which defeat entry guards; that needs write-watch
+                    // invalidation before it can be translated safely.
+                    if pc != prev_end && pc >> 24 == 3 {
+                        seeds.insert(pc | m.cpu.thumb() as u32);
+                    }
+                    prev_end = instr.addr.wrapping_add(instr.size());
+                }
+                StepEvent::Idle => {
+                    let pc = m.cpu.regs[15];
+                    if pc >> 24 == 3 && pc != prev_end {
+                        seeds.insert(pc | m.cpu.thumb() as u32);
+                    }
+                }
+            }
+        }
+        println!("profiled {} RAM entry points over {} frames", seeds.len(), m.bus.frames);
+        (seeds.into_iter().collect::<Vec<u32>>(), m.bus.ewram.clone(), m.bus.iwram.clone())
+    };
+
+    let _ = &ewram;
+    let view = analyze::View {
+        rom: &rom,
+        ewram: None,
+        iwram: if ram { Some(&iwram) } else { None },
+    };
+    let analysis = analyze::analyze(&view, &seeds);
     let n_instrs: usize = analysis.blocks.iter().map(|b| b.instrs.len()).sum();
     println!("blocks: {} instructions: {n_instrs}", analysis.blocks.len());
 
-    let c = emit::emit_c(&analysis);
+    let c = emit::emit_c(&analysis, &view);
     std::fs::create_dir_all("out").map_err(|e| e.to_string())?;
     let stem = Path::new(rom_path)
         .file_stem().and_then(|s| s.to_str()).unwrap_or("game").to_string();

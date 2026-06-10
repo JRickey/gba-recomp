@@ -38,20 +38,39 @@ pub struct Analysis {
     pub blocks: Vec<Block>,
 }
 
-/// True when `addr` lies inside the ROM image.
-fn in_rom(rom: &[u8], addr: u32) -> bool {
-    let off = addr.wrapping_sub(ROM_BASE);
-    (addr >> 24) == 0x08 && (off as usize) < rom.len()
+/// Composite code view: ROM plus optional profiled RAM snapshots.
+pub struct View<'a> {
+    pub rom: &'a [u8],
+    pub ewram: Option<&'a [u8]>,
+    pub iwram: Option<&'a [u8]>,
 }
 
-fn read16(rom: &[u8], addr: u32) -> u16 {
-    let o = (addr - ROM_BASE) as usize;
-    u16::from_le_bytes([rom[o], rom[o + 1]])
-}
+impl View<'_> {
+    fn slice(&self, addr: u32) -> Option<(&[u8], usize)> {
+        match addr >> 24 {
+            0x08 => {
+                let off = (addr & 0x01FF_FFFF) as usize;
+                (off < self.rom.len()).then_some((self.rom, off))
+            }
+            0x02 => self.ewram.map(|m| (m, (addr & 0x3_FFFF) as usize)),
+            0x03 => self.iwram.map(|m| (m, (addr & 0x7FFF) as usize)),
+            _ => None,
+        }
+    }
 
-fn read32(rom: &[u8], addr: u32) -> u32 {
-    let o = (addr - ROM_BASE) as usize;
-    u32::from_le_bytes([rom[o], rom[o + 1], rom[o + 2], rom[o + 3]])
+    fn valid(&self, addr: u32) -> bool {
+        matches!(self.slice(addr), Some((m, o)) if o + 3 < m.len() || o < m.len())
+    }
+
+    pub fn read16(&self, addr: u32) -> u16 {
+        let (m, o) = self.slice(addr).unwrap();
+        u16::from_le_bytes([m[o], m[o + 1]])
+    }
+
+    pub fn read32(&self, addr: u32) -> u32 {
+        let (m, o) = self.slice(addr).unwrap();
+        u32::from_le_bytes([m[o], m[o + 1], m[o + 2], m[o + 3]])
+    }
 }
 
 /// Static successors of an instruction, plus whether execution can fall
@@ -90,13 +109,32 @@ fn ends_block(instr: &Instr) -> bool {
         || matches!(instr.op, Op::BlockMem { load: true, rlist, .. } if rlist & (1 << PC) != 0)
 }
 
-pub fn analyze(rom: &[u8]) -> Analysis {
+pub fn analyze(view: &View, seeds: &[u32]) -> Analysis {
     let mut queue: VecDeque<u32> = VecDeque::new();
     let mut seen: BTreeSet<u32> = BTreeSet::new();
     let mut blocks: BTreeMap<u32, Block> = BTreeMap::new();
+    let seed_set: BTreeSet<u32> = seeds.iter().copied().collect();
 
-    // Entry: the header branch at 0x08000000 (ARM).
+    // RAM holds data that decodes as plausible instructions, so speculative
+    // discovery there explodes combinatorially (gigabytes of dead C). RAM
+    // translation stays anchored to *observed* execution: only profiled
+    // entries start RAM blocks, and edges out of RAM may target ROM or
+    // other profiled entries only.
+    // Edges into ROM are always fine. Edges into RAM are fine when they
+    // come from RAM code we already trust (anchored chains from observed
+    // execution); ROM-side discoveries may only target RAM at profiled
+    // entries — that is where snapshot-data-as-code explodes.
+    let may_enqueue = |target_key: u32, from_ram: bool, seed_set: &BTreeSet<u32>| -> bool {
+        let region = (target_key & !1) >> 24;
+        if region == 8 {
+            return true;
+        }
+        from_ram || seed_set.contains(&target_key)
+    };
+
+    // Entry: the header branch at 0x08000000 (ARM), plus profiled seeds.
     queue.push_back(ROM_BASE);
+    queue.extend(seeds.iter().copied());
 
     while let Some(key) = queue.pop_front() {
         if !seen.insert(key) {
@@ -104,31 +142,40 @@ pub fn analyze(rom: &[u8]) -> Analysis {
         }
         let thumb = key & 1 != 0;
         let start = key & !1;
-        if !in_rom(rom, start) || !in_rom(rom, start + 3) {
+        if !view.valid(start) || !view.valid(start + 3) {
             continue;
         }
 
+        let from_ram = start >> 24 != 0x08;
+        let max_len = if from_ram { 512 } else { 4096 };
         let mut instrs = Vec::new();
         let mut addr = start;
         let mut prev: Option<Instr> = None;
         loop {
-            if !in_rom(rom, addr) || !in_rom(rom, addr + 3) || instrs.len() >= 4096 {
+            if !view.valid(addr) || !view.valid(addr + 3) || instrs.len() >= max_len {
                 break;
             }
             let instr = if thumb {
-                decode_thumb(read16(rom, addr), addr)
+                decode_thumb(view.read16(addr), addr)
             } else {
-                decode_arm(read32(rom, addr), addr)
+                decode_arm(view.read32(addr), addr)
             };
 
             // Harvest literal pools: word literals that look like ROM code
             // pointers seed new entries (bit 0 selects the ISA).
-            if let Some(lit) = instr.literal_addr() {
-                if in_rom(rom, lit) && lit + 3 >= lit && in_rom(rom, lit + 3) {
-                    let v = read32(rom, lit);
-                    let t = v & !1;
-                    if in_rom(rom, t) && t & 1 == 0 && (v & 1 == 1 || v & 3 == 0) {
-                        queue.push_back(if v & 1 == 1 { t | 1 } else { t });
+            if !from_ram {
+                if let Some(lit) = instr.literal_addr() {
+                    if view.valid(lit) && view.valid(lit + 3) {
+                        let v = view.read32(lit);
+                        let t = v & !1;
+                        // Harvested pointers may target ROM, or RAM code we
+                        // actually observed executing.
+                        if view.valid(t) && t & 1 == 0 && (v & 1 == 1 || v & 3 == 0) {
+                            let key = if v & 1 == 1 { t | 1 } else { t };
+                            if may_enqueue(key, false, &seed_set) {
+                                queue.push_back(key);
+                            }
+                        }
                     }
                 }
             }
@@ -137,18 +184,21 @@ pub fn analyze(rom: &[u8]) -> Analysis {
             if let Op::ThumbBlLow { .. } = instr.op {
                 if let Some(p) = &prev {
                     if let Some((target, _)) = armv4t::fuse_thumb_bl(p, &instr) {
-                        if in_rom(rom, target & !1) {
-                            queue.push_back((target & !1) | 1);
+                        let tkey = (target & !1) | 1;
+                        if view.valid(target & !1) && may_enqueue(tkey, from_ram, &seed_set) {
+                            queue.push_back(tkey);
                         }
                         // The pair returns: continue after the BL.
-                        queue.push_back((addr + 2) | 1);
+                        if may_enqueue((addr + 2) | 1, from_ram, &seed_set) {
+                            queue.push_back((addr + 2) | 1);
+                        }
                     }
                 }
             }
 
             let (succs, falls) = successors(&instr, thumb);
             for s in succs {
-                if in_rom(rom, s & !1) {
+                if view.valid(s & !1) && may_enqueue(s, from_ram, &seed_set) {
                     queue.push_back(s);
                 }
             }
@@ -168,7 +218,7 @@ pub fn analyze(rom: &[u8]) -> Analysis {
         // Fall-through continuation for conditional block endings.
         if let Some(last) = instrs.last() {
             let (_, falls) = successors(last, thumb);
-            if falls && in_rom(rom, addr) {
+            if falls && view.valid(addr) && may_enqueue(addr | thumb as u32, from_ram, &seed_set) {
                 queue.push_back(addr | thumb as u32);
             }
         }
