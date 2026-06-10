@@ -25,6 +25,7 @@ fn main() -> ExitCode {
         Some("play") => cmd_play(&args[1..]),
         Some("build") => cmd_build(&args[1..]),
         Some("runc") => cmd_runc(&args[1..]),
+        Some("verify") => cmd_verify(&args[1..]),
         _ => {
             eprintln!("usage: recomp dis <rom> [--addr HEX] [--count N] [--thumb]");
             eprintln!("       recomp entry-scan <dir>");
@@ -475,4 +476,92 @@ fn cmd_runc(args: &[String]) -> Result<(), String> {
         m.bus.frames
     );
     Ok(())
+}
+
+/// Differential verification: run N frames interpreted and N frames
+/// recompiled (building if needed) and compare framebuffer hashes.
+fn cmd_verify(args: &[String]) -> Result<(), String> {
+    let mut rom_path = None;
+    let mut frames = 600u64;
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        match arg.as_str() {
+            "--frames" => {
+                frames = it.next().ok_or("--frames needs a value")?
+                    .parse().map_err(|e| format!("bad frames: {e}"))?
+            }
+            other if rom_path.is_none() => rom_path = Some(other.to_string()),
+            other => return Err(format!("unexpected argument {other:?}")),
+        }
+    }
+    let rom_path = rom_path.ok_or("missing ROM path")?;
+
+    let interp = run_hash(&rom_path, frames, false)?;
+    cmd_build(&[rom_path.clone()])?;
+    let recomp = run_hash(&rom_path, frames, true)?;
+    let verdict = if interp == recomp { "MATCH" } else { "MISMATCH" };
+    println!("verify {verdict} interp={interp:016x} recomp={recomp:016x}");
+    if interp == recomp { Ok(()) } else { Err("differential mismatch".into()) }
+}
+
+fn fb_hash(m: &Machine) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for &px in &m.bus.framebuffer {
+        for b in px.to_le_bytes() {
+            hash ^= b as u64;
+            hash = hash.wrapping_mul(0x1_0000_01b3);
+        }
+    }
+    hash
+}
+
+fn run_hash(rom_path: &str, frames: u64, recompiled: bool) -> Result<u64, String> {
+    use gba_core::capi::{RcgBlock, RtApi, RT_API};
+    let rom = std::fs::read(rom_path).map_err(|e| format!("{rom_path}: {e}"))?;
+    let mut m = Machine::new(rom);
+    if !recompiled {
+        for _ in 0..frames {
+            m.run_frame(5_000_000);
+        }
+        return Ok(fb_hash(&m));
+    }
+    let stem = Path::new(rom_path)
+        .file_stem().and_then(|s| s.to_str()).unwrap_or("game").to_string();
+    let lib_path = format!("out/{stem}.dylib");
+    let lib = unsafe { libloading::Library::new(&lib_path) }
+        .map_err(|e| format!("{lib_path}: {e}"))?;
+    let table: std::collections::HashMap<u32, extern "C" fn(*const RtApi, *mut std::ffi::c_void) -> u32> = unsafe {
+        let blocks: libloading::Symbol<*const RcgBlock> =
+            lib.get(b"rcg_blocks").map_err(|e| e.to_string())?;
+        let count: libloading::Symbol<*const u64> =
+            lib.get(b"rcg_block_count").map_err(|e| e.to_string())?;
+        std::slice::from_raw_parts(*blocks, **count as usize)
+            .iter().map(|b| (b.key, b.func)).collect()
+    };
+    let mptr = &mut m as *mut Machine as *mut std::ffi::c_void;
+    let mut guard = 0u64;
+    while m.bus.frames < frames {
+        guard += 1;
+        if guard > 4_000_000_000 {
+            return Err("step guard exceeded".into());
+        }
+        if m.bus.halted
+            || (m.cpu.regs[15] == gba_core::machine::IRQ_RETURN_ADDR
+                && m.cpu.mode() == gba_core::Mode::Irq)
+            || (m.bus.irq_pending() && !m.cpu.flag(gba_core::cpu::FLAG_I))
+        {
+            m.step();
+            continue;
+        }
+        let key = m.cpu.regs[15] | m.cpu.thumb() as u32;
+        match table.get(&key) {
+            Some(f) => {
+                f(&RT_API, mptr);
+            }
+            None => {
+                m.step();
+            }
+        }
+    }
+    Ok(fb_hash(&m))
 }
