@@ -1,0 +1,22 @@
+# Test data — local symlinks/clones, never committed
+/data/
+
+# Local working notes — never committed
+/CLAUDE.md
+/notes/
+
+# Build artifacts
+/target/
+*.o
+*.so
+*.dylib
+*.dll
+
+# Recompiler output
+/out/
+
+# Editor/OS noise
+.DS_Store
+*.swp
+.idea/
+.vscode/
