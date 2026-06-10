@@ -320,6 +320,56 @@ fn cmd_play(args: &[String]) -> Result<(), String> {
     .map_err(|e| e.to_string())?;
     window.set_target_fps(60);
 
+
+    // Audio: cpal output stream fed from a shared ring of 32768 Hz mono
+    // samples, nearest-neighbor resampled to the device rate.
+    let ring = std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::<i16>::new()));
+    let _stream = {
+        use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+        let host = cpal::default_host();
+        match host.default_output_device() {
+            Some(device) => match device.default_output_config() {
+                Ok(cfg) => {
+                    let rate = cfg.sample_rate().0 as f64;
+                    let channels = cfg.channels() as usize;
+                    let step = 32768.0 / rate;
+                    let ring2 = ring.clone();
+                    let mut frac = 0.0f64;
+                    let mut last = 0i16;
+                    let stream = device
+                        .build_output_stream(
+                            &cfg.into(),
+                            move |out: &mut [f32], _| {
+                                let mut q = ring2.lock().unwrap();
+                                for frame in out.chunks_mut(channels) {
+                                    frac += step;
+                                    while frac >= 1.0 {
+                                        frac -= 1.0;
+                                        if let Some(s) = q.pop_front() {
+                                            last = s;
+                                        }
+                                    }
+                                    let v = last as f32 / 32768.0;
+                                    for ch in frame.iter_mut() {
+                                        *ch = v;
+                                    }
+                                }
+                            },
+                            |e| eprintln!("audio error: {e}"),
+                            None,
+                        )
+                        .ok();
+                    if let Some(s) = &stream {
+                        let _ = s.play();
+                    }
+                    stream
+                }
+                Err(_) => None,
+            },
+            None => None,
+        }
+    };
+
     let mut buf = vec![0u32; 240 * 160];
     while window.is_open() && !window.is_key_down(Key::Escape) {
         // KEYINPUT is active-low.
@@ -344,6 +394,16 @@ fn cmd_play(args: &[String]) -> Result<(), String> {
         m.bus.keys = keys;
 
         m.run_frame(5_000_000);
+
+        // Hand this frame's audio to the output ring (cap ~250 ms).
+        {
+            let mut q = ring.lock().unwrap();
+            for s in m.bus.audio_buf.drain(..) {
+                if q.len() < 8192 {
+                    q.push_back(s);
+                }
+            }
+        }
 
         for (dst, &px) in buf.iter_mut().zip(m.bus.framebuffer.iter()) {
             let r = (px & 31) as u32;

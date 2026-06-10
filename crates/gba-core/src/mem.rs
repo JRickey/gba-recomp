@@ -167,8 +167,15 @@ pub struct MemMap {
     fifo: [std::collections::VecDeque<i8>; 2],
     /// Most recent sample popped from each FIFO (the DAC output level).
     pub fifo_sample: [i8; 2],
+    /// Mixed mono output collected at `AUDIO_SAMPLE_CYCLES` intervals;
+    /// drained by the frontend.
+    pub audio_buf: Vec<i16>,
+    audio_cursor: u64,
     next_event: u64,
 }
+
+/// ~32768 Hz on the 16.78 MHz master clock.
+pub const AUDIO_SAMPLE_CYCLES: u64 = 512;
 
 impl MemMap {
     pub fn new(rom: Vec<u8>) -> MemMap {
@@ -211,6 +218,8 @@ impl MemMap {
             eeprom,
             fifo: [std::collections::VecDeque::new(), std::collections::VecDeque::new()],
             fifo_sample: [0; 2],
+            audio_buf: Vec::new(),
+            audio_cursor: 0,
             next_event: HBLANK_FLAG_CYCLE,
         }
     }
@@ -275,6 +284,14 @@ impl MemMap {
     /// Advance the master clock and process any due events.
     pub fn tick(&mut self, cycles: u64) {
         self.clock += cycles;
+        while self.audio_cursor <= self.clock {
+            // Mix the two Direct Sound DAC levels (PSG channels TODO).
+            let s = (self.fifo_sample[0] as i16 + self.fifo_sample[1] as i16) * 64;
+            if self.audio_buf.len() < 0x1_0000 {
+                self.audio_buf.push(s);
+            }
+            self.audio_cursor += AUDIO_SAMPLE_CYCLES;
+        }
         while self.clock >= self.next_event {
             self.process_events();
         }
