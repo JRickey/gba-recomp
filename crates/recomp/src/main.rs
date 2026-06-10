@@ -19,11 +19,13 @@ fn main() -> ExitCode {
         Some("entry-scan") => cmd_entry_scan(&args[1..]),
         Some("run") => cmd_run(&args[1..]),
         Some("frames") => cmd_frames(&args[1..]),
+        Some("play") => cmd_play(&args[1..]),
         _ => {
             eprintln!("usage: recomp dis <rom> [--addr HEX] [--count N] [--thumb]");
             eprintln!("       recomp entry-scan <dir>");
             eprintln!("       recomp run <rom> [--max-steps N] [--trace]");
             eprintln!("       recomp frames <rom> [--frames N] [--out img.ppm] [--keys MASK]");
+            eprintln!("       recomp play <rom>");
             return ExitCode::FAILURE;
         }
     };
@@ -283,4 +285,72 @@ fn check_entry(path: &Path) -> Result<String, String> {
         Op::Branch { link: false, target } => Ok(format!("{word:08x} -> {target:08x}")),
         _ => Err(format!("{word:08x} decoded as {:?}", instr.disasm())),
     }
+}
+
+/// Interactive play: window + keyboard via minifb, 60 Hz pacing, and
+/// .sav persistence next to the image.
+///
+/// Keys: arrows = D-pad, Z = A, X = B, Enter = Start, RShift = Select,
+/// A = L, S = R, Esc = quit.
+fn cmd_play(args: &[String]) -> Result<(), String> {
+    use minifb::{Key, Window, WindowOptions};
+
+    let rom_path = args.first().ok_or("missing ROM path")?.clone();
+    let rom = std::fs::read(&rom_path).map_err(|e| format!("{rom_path}: {e}"))?;
+    let sav_path = format!("{}.sav", rom_path.trim_end_matches(".gba"));
+
+    let mut m = Machine::new(rom);
+    if let Ok(sav) = std::fs::read(&sav_path) {
+        m.bus.load_save_data(&sav);
+        eprintln!("loaded {sav_path}");
+    }
+
+    let mut window = Window::new(
+        "recomp",
+        240 * 3,
+        160 * 3,
+        WindowOptions { resize: true, ..WindowOptions::default() },
+    )
+    .map_err(|e| e.to_string())?;
+    window.set_target_fps(60);
+
+    let mut buf = vec![0u32; 240 * 160];
+    while window.is_open() && !window.is_key_down(Key::Escape) {
+        // KEYINPUT is active-low.
+        let pairs: [(Key, u16); 10] = [
+            (Key::Z, 1 << 0),         // A
+            (Key::X, 1 << 1),         // B
+            (Key::RightShift, 1 << 2), // Select
+            (Key::Enter, 1 << 3),     // Start
+            (Key::Right, 1 << 4),
+            (Key::Left, 1 << 5),
+            (Key::Up, 1 << 6),
+            (Key::Down, 1 << 7),
+            (Key::S, 1 << 8),         // R
+            (Key::A, 1 << 9),         // L
+        ];
+        let mut keys = 0x3FFu16;
+        for (key, bit) in pairs {
+            if window.is_key_down(key) {
+                keys &= !bit;
+            }
+        }
+        m.bus.keys = keys;
+
+        m.run_frame(5_000_000);
+
+        for (dst, &px) in buf.iter_mut().zip(m.bus.framebuffer.iter()) {
+            let r = (px & 31) as u32;
+            let g = ((px >> 5) & 31) as u32;
+            let b = ((px >> 10) & 31) as u32;
+            *dst = ((r << 3 | r >> 2) << 16) | ((g << 3 | g >> 2) << 8) | (b << 3 | b >> 2);
+        }
+        window.update_with_buffer(&buf, 240, 160).map_err(|e| e.to_string())?;
+    }
+
+    if let Some(data) = m.bus.save_data() {
+        std::fs::write(&sav_path, data).map_err(|e| format!("{sav_path}: {e}"))?;
+        eprintln!("saved {sav_path}");
+    }
+    Ok(())
 }

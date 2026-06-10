@@ -207,6 +207,41 @@ impl MemMap {
         }
     }
 
+    /// Current backup-media contents, for .sav persistence.
+    pub fn save_data(&self) -> Option<&[u8]> {
+        match self.backup {
+            BackupKind::None => None,
+            BackupKind::Sram => Some(&self.sram),
+            BackupKind::Flash64 | BackupKind::Flash128 => {
+                self.flash.as_ref().map(|f| f.data.as_slice())
+            }
+            BackupKind::Eeprom => self.eeprom.as_ref().map(|e| e.data.as_slice()),
+        }
+    }
+
+    /// Restore backup-media contents from a .sav file.
+    pub fn load_save_data(&mut self, bytes: &[u8]) {
+        match self.backup {
+            BackupKind::None => {}
+            BackupKind::Sram => {
+                let n = bytes.len().min(self.sram.len());
+                self.sram[..n].copy_from_slice(&bytes[..n]);
+            }
+            BackupKind::Flash64 | BackupKind::Flash128 => {
+                if let Some(f) = &mut self.flash {
+                    let n = bytes.len().min(f.data.len());
+                    f.data[..n].copy_from_slice(&bytes[..n]);
+                }
+            }
+            BackupKind::Eeprom => {
+                if let Some(e) = &mut self.eeprom {
+                    let n = bytes.len().min(e.data.len());
+                    e.data[..n].copy_from_slice(&bytes[..n]);
+                }
+            }
+        }
+    }
+
     /// EEPROM is addressed through the top of the 0x0D waitstate-2 image.
     fn is_eeprom_addr(&self, addr: u32) -> bool {
         self.eeprom.is_some()

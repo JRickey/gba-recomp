@@ -8,3 +8,4 @@ description = "Static recompiler CLI"
 [dependencies]
 armv4t = { path = "../armv4t" }
 gba-core = { path = "../gba-core" }
+minifb = "0.28"
