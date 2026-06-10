@@ -2,7 +2,7 @@
 resolver = "2"
 members = [
     "crates/armv4t",
-    "crates/machine",
+    "crates/gba-core",
     "crates/recomp",
 ]
 

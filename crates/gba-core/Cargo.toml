@@ -1,9 +1,9 @@
 [package]
-name = "machine"
+name = "gba-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Target machine model: ARM7TDMI interpreter, memory map, hardware"
+description = "GBA machine model: ARM7TDMI interpreter, memory map, hardware"
 
 [dependencies]
 armv4t = { path = "../armv4t" }

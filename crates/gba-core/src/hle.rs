@@ -11,6 +11,15 @@ use crate::cpu::Cpu;
 /// Attempt to handle BIOS call `num`. Returns true if fully handled.
 pub fn bios_call<B: Bus>(cpu: &mut Cpu, bus: &mut B, num: u32) -> bool {
     match num {
+        0x02 => {
+            bus.hle_halt();
+            true
+        }
+        0x04 => bus.hle_intr_wait(cpu.regs[0] != 0, cpu.regs[1] as u16),
+        0x05 => {
+            // VBlankIntrWait = IntrWait(discard=1, mask=VBlank).
+            bus.hle_intr_wait(true, 1)
+        }
         0x06 => {
             div(cpu, cpu.regs[0] as i32, cpu.regs[1] as i32);
             true

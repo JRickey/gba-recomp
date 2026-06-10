@@ -7,7 +7,7 @@ name = "armv4t"
 version = "0.1.0"
 
 [[package]]
-name = "machine"
+name = "gba-core"
 version = "0.1.0"
 dependencies = [
  "armv4t",
@@ -18,5 +18,5 @@ name = "recomp"
 version = "0.1.0"
 dependencies = [
  "armv4t",
- "machine",
+ "gba-core",
 ]

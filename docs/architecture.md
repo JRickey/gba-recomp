@@ -1,13 +1,13 @@
 # Static Recompiler — Architecture Brief
 
-> Target: a 2003-era handheld console built around a 16.78 MHz ARM7TDMI
+> Target: the GBA — a handheld console built around a 16.78 MHz ARM7TDMI
 > (ARMv4T), 240×160 LCD, tile/bitmap PPU, 4 PSG + 2 PCM-FIFO audio channels,
 > 4-channel DMA, flat cartridge address space, no OS — games bang hardware
 > registers directly. Test data is referenced by SHA-256 only.
 
 ## Thesis
 
-No public static recompiler exists for this platform — the niche is open.
+No public static recompiler exists for the GBA — the niche is open.
 Prior art brackets the problem: a well-known static-recomp toolchain for a
 1996-era 3D console proved the translate-everything + runtime-address-lookup
 model on real commercial games, and a historical dynarec emulator for this

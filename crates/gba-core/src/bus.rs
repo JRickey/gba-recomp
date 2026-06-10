@@ -29,4 +29,17 @@ pub trait Bus {
         self.write16(addr, value as u16);
         self.write16(addr.wrapping_add(2), (value >> 16) as u16);
     }
+
+    // HLE hooks for BIOS calls whose effect lives in the machine, not the
+    // CPU. Default no-ops keep simple test buses working; `MemMap`
+    // implements them.
+
+    /// SWI 0x02 Halt: sleep until any enabled interrupt is latched.
+    fn hle_halt(&mut self) {}
+
+    /// SWI 0x04/0x05 IntrWait: sleep until the user IRQ handler sets
+    /// `mask` bits at 0x03007FF8. Returns true if the bus models this.
+    fn hle_intr_wait(&mut self, _discard: bool, _mask: u16) -> bool {
+        false
+    }
 }

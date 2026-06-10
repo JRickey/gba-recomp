@@ -7,8 +7,8 @@
 use std::path::Path;
 use std::process::ExitCode;
 
-use armv4t::{decode_arm, decode_thumb, Cond, Op};
-use machine::{exec, Cpu, MemMap};
+use armv4t::{decode_arm, decode_thumb, Op};
+use gba_core::{is_self_loop, Machine, StepEvent};
 
 const ROM_BASE: u32 = 0x0800_0000;
 
@@ -137,40 +137,34 @@ fn cmd_run(args: &[String]) -> Result<(), String> {
     let rom_path = rom_path.ok_or("missing ROM path")?;
     let rom = std::fs::read(&rom_path).map_err(|e| format!("{rom_path}: {e}"))?;
 
-    let mut cpu = Cpu::new();
-    let mut mem = MemMap::new(rom);
+    let mut m = Machine::new(rom);
 
     let mut steps = 0u64;
     while steps < max_steps {
-        let instr = exec::step_hle(&mut cpu, &mut mem);
-        // Crude per-instruction cost until the event scheduler lands; keeps
-        // the derived video timing (vsync polls) advancing.
-        mem.tick(4);
+        let event = m.step();
         steps += 1;
-        if trace {
-            eprintln!("{:08x}: {}", instr.addr, instr.disasm());
-        }
-        // Parked: unconditional branch to itself.
-        if instr.cond == Cond::Al {
-            if let Op::Branch { link: false, target } = instr.op {
-                if target == instr.addr {
-                    break;
-                }
+        if let StepEvent::Instr(instr) = event {
+            if trace {
+                eprintln!("{:08x}: {}", instr.addr, instr.disasm());
+            }
+            // Parked: unconditional branch to itself, with no way out.
+            if is_self_loop(&instr) && !m.bus.irq_pending() && m.bus.intr_wait.is_none() {
+                break;
             }
         }
     }
 
-    println!("steps: {steps}");
+    println!("steps: {steps} frames: {}", m.bus.frames);
     for r in 0..16 {
-        print!("r{r}={:08x} ", cpu.regs[r]);
+        print!("r{r}={:08x} ", m.cpu.regs[r]);
         if r % 4 == 3 {
             println!();
         }
     }
-    println!("cpsr={:08x} mode={:?} thumb={}", cpu.cpsr, cpu.mode(), cpu.thumb());
+    println!("cpsr={:08x} mode={:?} thumb={}", m.cpu.cpsr, m.cpu.mode(), m.cpu.thumb());
     {
-        use machine::Bus as _;
-        println!("ewram[0]={:08x}", mem.read32(0x0200_0000));
+        use gba_core::Bus as _;
+        println!("ewram[0]={:08x}", m.bus.read32(0x0200_0000));
     }
     Ok(())
 }

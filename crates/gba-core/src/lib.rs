@@ -1,4 +1,4 @@
-//! Target machine model.
+//! GBA machine model.
 //!
 //! The interpreter executes the `armv4t::Instr` model directly. It serves
 //! three roles in the project (see docs/architecture.md):
@@ -13,8 +13,11 @@ pub mod bus;
 pub mod cpu;
 pub mod exec;
 pub mod hle;
+pub mod machine;
 pub mod mem;
+pub mod ppu;
 
 pub use bus::Bus;
 pub use cpu::{Cpu, Mode};
+pub use machine::{is_self_loop, Machine, StepEvent};
 pub use mem::MemMap;

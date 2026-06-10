@@ -7,4 +7,4 @@ description = "Static recompiler CLI"
 
 [dependencies]
 armv4t = { path = "../armv4t" }
-machine = { path = "../machine" }
+gba-core = { path = "../gba-core" }
