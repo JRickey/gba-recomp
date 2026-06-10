@@ -42,4 +42,11 @@ pub trait Bus {
     fn hle_intr_wait(&mut self, _discard: bool, _mask: u16) -> bool {
         false
     }
+
+    /// Called for a SWI the HLE layer doesn't implement. Returning true
+    /// suppresses the exception (sensible when no BIOS image is loaded —
+    /// vectoring into zeroed memory is strictly worse than a no-op).
+    fn note_unhandled_swi(&mut self, _num: u32) -> bool {
+        false
+    }
 }

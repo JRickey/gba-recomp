@@ -21,6 +21,7 @@
 //! and the four DMA channels. The `Machine` wrapper drives `tick()` and
 //! handles CPU-side interrupt entry.
 
+use crate::backup::{self, BackupKind, Eeprom, Flash};
 use crate::bus::Bus;
 
 const DISPSTAT: u32 = 0x0400_0004;
@@ -148,11 +149,30 @@ pub struct MemMap {
 
     /// 240×160 RGB555 output, written per scanline by the PPU.
     pub framebuffer: Vec<u16>,
+    /// Affine BG reference-point accumulators (bg2x, bg2y, bg3x, bg3y),
+    /// 19.8 fixed point. Latched from BG2X.. at frame start and whenever
+    /// the game writes them; stepped by PB/PD each scanline.
+    pub aff_ref: [i32; 4],
+    /// Reload request per affine BG (set by I/O writes to BGxX/BGxY).
+    pub aff_dirty: [bool; 2],
+    /// Bitmask of SWI numbers that were called but not HLE'd (triage aid).
+    pub unhandled_swis: u64,
+    /// Detected backup medium (drives 0x0D/0x0E region behavior).
+    pub backup: BackupKind,
+    pub flash: Option<Flash>,
+    pub eeprom: Option<Eeprom>,
     next_event: u64,
 }
 
 impl MemMap {
     pub fn new(rom: Vec<u8>) -> MemMap {
+        let backup = backup::detect(&rom);
+        let flash = match backup {
+            BackupKind::Flash64 => Some(Flash::new(false)),
+            BackupKind::Flash128 => Some(Flash::new(true)),
+            _ => None,
+        };
+        let eeprom = if backup == BackupKind::Eeprom { Some(Eeprom::new()) } else { None };
         MemMap {
             bios: vec![0; 0x4000],
             ewram: vec![0; 0x4_0000],
@@ -177,8 +197,21 @@ impl MemMap {
             frame_ready: false,
             frames: 0,
             framebuffer: vec![0; VISIBLE_WIDTH * VISIBLE_SCANLINES as usize],
+            aff_ref: [0; 4],
+            aff_dirty: [true; 2],
+            unhandled_swis: 0,
+            backup,
+            flash,
+            eeprom,
             next_event: HBLANK_FLAG_CYCLE,
         }
+    }
+
+    /// EEPROM is addressed through the top of the 0x0D waitstate-2 image.
+    fn is_eeprom_addr(&self, addr: u32) -> bool {
+        self.eeprom.is_some()
+            && addr >> 24 == 0x0D
+            && (self.rom.len() <= 0x100_0000 || addr & 0x01FF_FF00 == 0x01FF_FF00)
     }
 
     /// Current scanline (0..=227).
@@ -395,6 +428,14 @@ impl MemMap {
         // Rough cycle cost: 2 cycles per unit transferred plus setup.
         self.clock += 2 * count as u64 + 4;
 
+        // An EEPROM request is exactly one DMA; the end of the transfer
+        // delimits the serial bitstream.
+        if ch.cur_dst >> 24 == 0x0D {
+            if let Some(e) = &mut self.eeprom {
+                e.flush();
+            }
+        }
+
         if ch.repeat() && ch.timing() != 0 {
             // Repeat: count reloads; destination reloads in mode 3.
             if dst_adj == 3 {
@@ -476,6 +517,15 @@ impl MemMap {
                     11 => self.dma_write_control_hi(i, value),
                     _ => unreachable!(),
                 }
+            }
+            // Affine BG reference points: request an accumulator reload.
+            x if (0x0400_0028..0x0400_0030).contains(&x) => {
+                self.io[off as usize] = value;
+                self.aff_dirty[0] = true;
+            }
+            x if (0x0400_0038..0x0400_0040).contains(&x) => {
+                self.io[off as usize] = value;
+                self.aff_dirty[1] = true;
             }
             _ => self.io[off as usize] = value,
         }
@@ -577,6 +627,13 @@ impl Bus for MemMap {
             0x06 => self.vram[Self::vram_index(addr)],
             0x07 => self.oam[(addr & 0x3FF) as usize],
             0x08..=0x0D => {
+                if self.is_eeprom_addr(addr) {
+                    return if addr & 1 == 0 {
+                        self.eeprom.as_mut().unwrap().read_bit() as u8
+                    } else {
+                        0
+                    };
+                }
                 let idx = Self::rom_index(addr);
                 if idx < self.rom.len() {
                     self.rom[idx]
@@ -584,7 +641,10 @@ impl Bus for MemMap {
                     Self::rom_open_bus(addr)
                 }
             }
-            0x0E | 0x0F => self.sram[(addr & 0xFFFF) as usize],
+            0x0E | 0x0F => match &self.flash {
+                Some(flash) => flash.read(addr),
+                None => self.sram[(addr & 0xFFFF) as usize],
+            },
             _ => 0, // open bus (unmodeled)
         }
     }
@@ -614,8 +674,16 @@ impl Bus for MemMap {
                 }
             }
             0x07 => {} // byte writes to OAM are ignored
-            0x0E | 0x0F => self.sram[(addr & 0xFFFF) as usize] = value,
-            _ => {} // BIOS/ROM writes: backup-media commands, modeled later
+            0x0D => {
+                if self.is_eeprom_addr(addr) && addr & 1 == 0 {
+                    self.eeprom.as_mut().unwrap().write_bit(value as u16);
+                }
+            }
+            0x0E | 0x0F => match &mut self.flash {
+                Some(flash) => flash.write(addr, value),
+                None => self.sram[(addr & 0xFFFF) as usize] = value,
+            },
+            _ => {}
         }
     }
 
@@ -658,6 +726,13 @@ impl Bus for MemMap {
         // The BIOS routine forces IME on.
         self.ime = true;
         self.intr_wait = Some(mask);
+        true
+    }
+
+    fn note_unhandled_swi(&mut self, num: u32) -> bool {
+        // No BIOS image loaded: record it for triage and treat the call
+        // as a no-op rather than vectoring into zeroed memory.
+        self.unhandled_swis |= 1u64 << (num & 63);
         true
     }
 }

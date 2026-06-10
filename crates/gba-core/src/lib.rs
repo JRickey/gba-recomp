@@ -9,6 +9,7 @@
 //! Correctness over speed: this is the reference implementation. The
 //! recompiler's output is what has to be fast.
 
+pub mod backup;
 pub mod bus;
 pub mod cpu;
 pub mod exec;

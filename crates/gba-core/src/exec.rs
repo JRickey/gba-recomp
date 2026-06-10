@@ -35,7 +35,7 @@ fn step_inner<B: Bus>(cpu: &mut Cpu, bus: &mut B, hle: bool) -> Instr {
         let handled = if hle {
             if let Op::Swi { imm } = instr.op {
                 let num = if instr.thumb { imm } else { imm >> 16 };
-                crate::hle::bios_call(cpu, bus, num)
+                crate::hle::bios_call(cpu, bus, num) || bus.note_unhandled_swi(num)
             } else {
                 false
             }
@@ -374,7 +374,11 @@ fn exec_mem<B: Bus>(
     up: bool,
     writeback: bool,
 ) {
-    let base = read_reg(cpu, instr, rn, 0);
+    let mut base = read_reg(cpu, instr, rn, 0);
+    if instr.thumb && rn == PC {
+        // Thumb PC-relative loads use (PC & !3) as the base (LDR literal).
+        base &= !3;
+    }
     let off = match offset {
         MemOffset::Imm(imm) => imm as u32,
         MemOffset::Reg { rm, shift } => match shift {

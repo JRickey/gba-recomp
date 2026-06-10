@@ -110,14 +110,22 @@ fn decode_op(h: u32, addr: u32) -> (Cond, Op) {
             if bit(h, 12) {
                 decode_group_misc(h)
             } else {
-                // Format 12: add rd, pc|sp, #imm8*4 (adr / add-from-sp)
+                // Format 12: add rd, pc|sp, #imm8*4 (adr / add-from-sp).
+                // ADR uses (PC & !3) as the base; since the decoder knows
+                // the address, the alignment is folded into the immediate
+                // (wraps when PC ≡ 2 mod 4 and imm is 0 — consumers add
+                // with wrapping semantics).
                 let rn = if bit(h, 11) { SP } else { PC };
+                let mut imm = (h & 0xFF) * 4;
+                if rn == PC {
+                    imm = imm.wrapping_sub(addr & 2);
+                }
                 (al, Op::Alu {
                     op: AluOp::Add,
                     s: false,
                     rd: bits(h, 8, 10) as Reg,
                     rn,
-                    op2: Operand2::imm((h & 0xFF) * 4),
+                    op2: Operand2::imm(imm),
                 })
             }
         }

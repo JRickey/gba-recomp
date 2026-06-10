@@ -33,9 +33,272 @@ pub fn bios_call<B: Bus>(cpu: &mut Cpu, bus: &mut B, num: u32) -> bool {
             cpu.regs[0] = (cpu.regs[0] as f64).sqrt() as u32;
             true
         }
+        0x09 => {
+            // ArcTan(r0 = tan, 1.14 fixed) -> r0 = angle (-0x4000..0x4000).
+            let t = cpu.regs[0] as i16 as f64 / 16384.0;
+            cpu.regs[0] = ((t.atan() / std::f64::consts::PI) * 32768.0) as i32 as u32;
+            true
+        }
+        0x0A => {
+            // ArcTan2(r0 = x, r1 = y), 1.14 fixed -> r0 = angle 0..0xFFFF.
+            let x = cpu.regs[0] as i16 as f64;
+            let y = cpu.regs[1] as i16 as f64;
+            let angle = y.atan2(x) / (2.0 * std::f64::consts::PI) * 65536.0;
+            cpu.regs[0] = (angle as i32 as u32) & 0xFFFF;
+            true
+        }
+        0x01 => {
+            register_ram_reset(cpu, bus);
+            true
+        }
         0x0B => cpu_set(cpu, bus),
         0x0C => cpu_fast_set(cpu, bus),
+        0x0D => {
+            cpu.regs[0] = 0xBAAE_187F; // GetBiosChecksum
+            true
+        }
+        0x0E => {
+            bg_affine_set(cpu, bus);
+            true
+        }
+        0x0F => {
+            obj_affine_set(cpu, bus);
+            true
+        }
+        0x10 => {
+            bit_unpack(cpu, bus);
+            true
+        }
+        0x11 | 0x12 => {
+            lz77_uncomp(cpu, bus);
+            true
+        }
+        0x14 | 0x15 => {
+            rl_uncomp(cpu, bus);
+            true
+        }
         _ => false,
+    }
+}
+
+/// RegisterRamReset (r0 = flags). Clears the selected memory regions and
+/// resets I/O to power-on defaults. The last 0x200 bytes of IWRAM (BIOS
+/// work area, incl. the IRQ handler pointer) are preserved.
+fn register_ram_reset<B: Bus>(cpu: &mut Cpu, bus: &mut B) {
+    let flags = cpu.regs[0];
+    if flags & 0x01 != 0 {
+        for a in (0x0200_0000u32..0x0204_0000).step_by(4) {
+            bus.write32(a, 0);
+        }
+    }
+    if flags & 0x02 != 0 {
+        for a in (0x0300_0000u32..0x0300_7E00).step_by(4) {
+            bus.write32(a, 0);
+        }
+    }
+    if flags & 0x04 != 0 {
+        for a in (0x0500_0000u32..0x0500_0400).step_by(4) {
+            bus.write32(a, 0);
+        }
+    }
+    if flags & 0x08 != 0 {
+        for a in (0x0600_0000u32..0x0601_8000).step_by(4) {
+            bus.write32(a, 0);
+        }
+    }
+    if flags & 0x10 != 0 {
+        for a in (0x0700_0000u32..0x0700_0400).step_by(4) {
+            bus.write32(a, 0);
+        }
+    }
+    if flags & 0x80 != 0 {
+        // "Other" registers: display comes up in forced blank.
+        bus.write16(0x0400_0000, 0x0080);
+    }
+}
+
+/// BgAffineSet: r0 = src array, r1 = dst array, r2 = count.
+/// Src (20 bytes): ox.8, oy.8 (i32 19.8), cx, cy (i16), sx, sy (i16 8.8),
+/// theta (u16, 0..0xFFFF circle). Dst (16 bytes): pa..pd, dx, dy.
+fn bg_affine_set<B: Bus>(cpu: &mut Cpu, bus: &mut B) {
+    let mut src = cpu.regs[0];
+    let mut dst = cpu.regs[1];
+    for _ in 0..cpu.regs[2] {
+        let ox = bus.read32(src) as i32 as f64 / 256.0;
+        let oy = bus.read32(src + 4) as i32 as f64 / 256.0;
+        let cx = bus.read16(src + 8) as i16 as f64;
+        let cy = bus.read16(src + 10) as i16 as f64;
+        let sx = bus.read16(src + 12) as i16 as f64 / 256.0;
+        let sy = bus.read16(src + 14) as i16 as f64 / 256.0;
+        let theta = bus.read16(src + 16) as f64 / 65536.0 * 2.0 * std::f64::consts::PI;
+        src += 20;
+
+        let (sin, cos) = theta.sin_cos();
+        let pa = sx * cos;
+        let pb = -sx * sin;
+        let pc = sy * sin;
+        let pd = sy * cos;
+
+        bus.write16(dst, (pa * 256.0) as i32 as u16);
+        bus.write16(dst + 2, (pb * 256.0) as i32 as u16);
+        bus.write16(dst + 4, (pc * 256.0) as i32 as u16);
+        bus.write16(dst + 6, (pd * 256.0) as i32 as u16);
+        let dx = ox - (pa * cx + pb * cy);
+        let dy = oy - (pc * cx + pd * cy);
+        bus.write32(dst + 8, (dx * 256.0) as i32 as u32);
+        bus.write32(dst + 12, (dy * 256.0) as i32 as u32);
+        dst += 16;
+    }
+}
+
+/// ObjAffineSet: r0 = src, r1 = dst, r2 = count, r3 = dst stride
+/// (2 = packed, 8 = OAM layout). Src (8 bytes): sx, sy (8.8), theta, pad.
+fn obj_affine_set<B: Bus>(cpu: &mut Cpu, bus: &mut B) {
+    let mut src = cpu.regs[0];
+    let mut dst = cpu.regs[1];
+    let stride = cpu.regs[3];
+    for _ in 0..cpu.regs[2] {
+        let sx = bus.read16(src) as i16 as f64 / 256.0;
+        let sy = bus.read16(src + 2) as i16 as f64 / 256.0;
+        let theta = bus.read16(src + 4) as f64 / 65536.0 * 2.0 * std::f64::consts::PI;
+        src += 8;
+
+        let (sin, cos) = theta.sin_cos();
+        bus.write16(dst, (sx * cos * 256.0) as i32 as u16);
+        bus.write16(dst + stride, (-sx * sin * 256.0) as i32 as u16);
+        bus.write16(dst + stride * 2, (sy * sin * 256.0) as i32 as u16);
+        bus.write16(dst + stride * 3, (sy * cos * 256.0) as i32 as u16);
+        dst += stride * 4;
+    }
+}
+
+/// BitUnPack: r0 = src, r1 = dst (word-aligned), r2 = info ptr:
+/// u16 src length (bytes), u8 src width, u8 dst width, u32 offset
+/// (bit 31: also add offset to zero units).
+fn bit_unpack<B: Bus>(cpu: &mut Cpu, bus: &mut B) {
+    let src = cpu.regs[0];
+    let dst = cpu.regs[1];
+    let info = cpu.regs[2];
+    let len = bus.read16(info) as u32;
+    let src_width = bus.read8(info + 2) as u32;
+    let dst_width = bus.read8(info + 3) as u32;
+    let offset_field = bus.read32(info + 4);
+    let offset = offset_field & 0x7FFF_FFFF;
+    let zero_flag = offset_field & 0x8000_0000 != 0;
+
+    if src_width == 0 || dst_width == 0 || dst_width > 32 {
+        return;
+    }
+    let mut out_acc: u32 = 0;
+    let mut out_bits: u32 = 0;
+    let mut out_addr = dst;
+    let src_mask = (1u32 << src_width) - 1;
+
+    for i in 0..len {
+        let byte = bus.read8(src + i) as u32;
+        let mut bit = 0;
+        while bit < 8 {
+            let mut unit = (byte >> bit) & src_mask;
+            if unit != 0 || zero_flag {
+                unit = unit.wrapping_add(offset);
+            }
+            out_acc |= unit << out_bits;
+            out_bits += dst_width;
+            if out_bits >= 32 {
+                bus.write32(out_addr, out_acc);
+                out_addr += 4;
+                out_acc = 0;
+                out_bits = 0;
+            }
+            bit += src_width;
+        }
+    }
+    if out_bits > 0 {
+        bus.write32(out_addr, out_acc);
+    }
+}
+
+/// LZ77UnComp (WRAM/VRAM variants; we produce identical output).
+/// Header u32 at src: bits 8-31 = decompressed size. Stream: flag byte
+/// (MSB first); bit clear = literal byte, bit set = back-reference
+/// (disp = 12 bits + 1, len = 4 bits + 3).
+fn lz77_uncomp<B: Bus>(cpu: &mut Cpu, bus: &mut B) {
+    let mut src = cpu.regs[0];
+    let dst = cpu.regs[1];
+    let size = (bus.read32(src) >> 8) as usize;
+    src += 4;
+
+    let mut out: Vec<u8> = Vec::with_capacity(size);
+    while out.len() < size {
+        let flags = bus.read8(src);
+        src += 1;
+        for bit in (0..8).rev() {
+            if out.len() >= size {
+                break;
+            }
+            if flags & (1 << bit) == 0 {
+                out.push(bus.read8(src));
+                src += 1;
+            } else {
+                let b0 = bus.read8(src) as usize;
+                let b1 = bus.read8(src + 1) as usize;
+                src += 2;
+                let len = (b0 >> 4) + 3;
+                let disp = ((b0 & 0xF) << 8 | b1) + 1;
+                for _ in 0..len {
+                    if out.len() >= size {
+                        break;
+                    }
+                    let v = if disp <= out.len() { out[out.len() - disp] } else { 0 };
+                    out.push(v);
+                }
+            }
+        }
+    }
+    write_out(bus, dst, &out);
+}
+
+/// RLUnComp: flag byte bit 7 set = run (len = low 7 + 3, one byte),
+/// clear = literals (len = low 7 + 1).
+fn rl_uncomp<B: Bus>(cpu: &mut Cpu, bus: &mut B) {
+    let mut src = cpu.regs[0];
+    let dst = cpu.regs[1];
+    let size = (bus.read32(src) >> 8) as usize;
+    src += 4;
+
+    let mut out: Vec<u8> = Vec::with_capacity(size);
+    while out.len() < size {
+        let flag = bus.read8(src) as usize;
+        src += 1;
+        if flag & 0x80 != 0 {
+            let len = (flag & 0x7F) + 3;
+            let v = bus.read8(src);
+            src += 1;
+            for _ in 0..len.min(size - out.len()) {
+                out.push(v);
+            }
+        } else {
+            let len = (flag & 0x7F) + 1;
+            for _ in 0..len.min(size - out.len()) {
+                out.push(bus.read8(src));
+                src += 1;
+            }
+        }
+    }
+    write_out(bus, dst, &out);
+}
+
+/// Write decompressed output as halfwords (works for both the WRAM and
+/// VRAM SWI variants; VRAM ignores byte writes, so halfword stores are
+/// the safe common denominator).
+fn write_out<B: Bus>(bus: &mut B, dst: u32, data: &[u8]) {
+    let mut i = 0;
+    while i + 1 < data.len() {
+        bus.write16(dst + i as u32, u16::from_le_bytes([data[i], data[i + 1]]));
+        i += 2;
+    }
+    if i < data.len() {
+        bus.write16(dst + i as u32, data[i] as u16);
     }
 }
 
