@@ -1,0 +1,9 @@
+[package]
+name = "gba-launcher"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Frontend launcher: ROM selection, input setup, A/V settings"
+
+[dependencies]
+eframe = "0.34.3"
