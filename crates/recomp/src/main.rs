@@ -422,6 +422,9 @@ fn cmd_play(args: &[String]) -> Result<(), String> {
     let mut emu_ema_ms = 0.0f64;
     let mut frames_run = 0u64;
     let mut slow_warned = false;
+    let mut native_run = 0u64;
+    let mut fallback_run = 0u64;
+    let mut sav_seen = m.bus.save_data().map(fnv64);
     while window.is_open() && !window.is_key_down(Key::Escape) {
         // KEYINPUT is active-low.
         let mut keys = 0x3FFu16;
@@ -459,7 +462,9 @@ fn cmd_play(args: &[String]) -> Result<(), String> {
         match &native {
             Some((_lib, table)) => {
                 let mptr = &mut m as *mut Machine as *mut std::ffi::c_void;
-                run_frame_native(&mut m, table, mptr, 5_000_000);
+                let (n, f) = run_frame_native(&mut m, table, mptr, 5_000_000);
+                native_run += n;
+                fallback_run += f;
             }
             None => m.run_frame(5_000_000),
         }
@@ -475,6 +480,33 @@ fn cmd_play(args: &[String]) -> Result<(), String> {
                 "DEGRADED: emulation averaging {emu_ema_ms:.1} ms/frame \
                  (budget 16.7 ms) — below native speed"
             );
+        }
+
+        // Live perf readout in the title, once a second: emulation cost
+        // against the 16.7 ms budget and the native-dispatch share.
+        if frames_run % 60 == 0 {
+            let total = native_run + fallback_run;
+            let share = if total == 0 { 0.0 } else { native_run as f64 * 100.0 / total as f64 };
+            window.set_title(&format!(
+                "recomp · {emu_ema_ms:.2} ms/frame ({:.1}x headroom) · native {share:.0}%",
+                16.7 / emu_ema_ms.max(0.01),
+            ));
+            native_run = 0;
+            fallback_run = 0;
+        }
+
+        // Flush backup media periodically when it changed, so an external
+        // teardown (launcher exit kills us) can't lose more than ~5 s of
+        // save progress.
+        if frames_run % 300 == 0 {
+            if let Some(data) = m.bus.save_data() {
+                let h = fnv64(data);
+                if sav_seen != Some(h) {
+                    if std::fs::write(&sav_path, data).is_ok() {
+                        sav_seen = Some(h);
+                    }
+                }
+            }
         }
 
         // Hand this frame's audio to the output ring (cap ~250 ms).
@@ -901,6 +933,16 @@ fn demo_keys(frame: u64) -> u16 {
         }
     }
     keys
+}
+
+/// FNV-1a, used for cheap change detection on backup media.
+fn fnv64(bytes: &[u8]) -> u64 {
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x1_0000_01b3);
+    }
+    h
 }
 
 fn fb_hash(m: &Machine) -> u64 {

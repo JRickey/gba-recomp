@@ -44,15 +44,15 @@ fn recomp_bin() -> Result<PathBuf, String> {
     Ok(PathBuf::from("recomp")) // resolved via PATH at spawn time
 }
 
-/// Launch a cartridge in the play runtime. Returns the child pid.
+/// Launch a cartridge in the play runtime. The caller owns the child:
+/// the launcher tracks it and tears it down when the launcher exits.
 #[cfg(not(target_os = "android"))]
-pub fn launch(rom: &Path) -> Result<u32, String> {
+pub fn launch(rom: &Path) -> Result<std::process::Child, String> {
     let bin = recomp_bin()?;
     std::process::Command::new(&bin)
         .arg("play")
         .arg(rom)
         .spawn()
-        .map(|c| c.id())
         .map_err(|e| format!("failed to start {}: {e}", bin.display()))
 }
 
@@ -70,6 +70,6 @@ pub fn pick_rom() -> Option<PathBuf> {
 
 /// Android: no play runtime is built for this target yet.
 #[cfg(target_os = "android")]
-pub fn launch(_rom: &Path) -> Result<u32, String> {
+pub fn launch(_rom: &Path) -> Result<std::process::Child, String> {
     Err("the play runtime is not available on this platform yet".into())
 }

@@ -13,6 +13,19 @@ const MAX_RECENTS: usize = 10;
 pub struct PlayScreen {
     recents: Vec<PathBuf>,
     status: String,
+    /// Running play processes we spawned. Reaped as they finish; any
+    /// still alive are killed when the launcher exits — closing the
+    /// launcher tears the whole product down.
+    children: Vec<std::process::Child>,
+}
+
+impl Drop for PlayScreen {
+    fn drop(&mut self) {
+        for child in &mut self.children {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
 }
 
 enum RowAction {
@@ -23,10 +36,13 @@ enum RowAction {
 
 impl PlayScreen {
     pub fn new() -> Self {
-        Self { recents: load_recents(), status: String::new() }
+        Self { recents: load_recents(), status: String::new(), children: Vec::new() }
     }
 
     pub fn ui(&mut self, ui: &mut Ui) {
+        // Reap finished play processes so the list only holds live ones.
+        self.children.retain_mut(|c| matches!(c.try_wait(), Ok(None)));
+
         // files dropped anywhere count as an insert
         let dropped: Vec<PathBuf> = ui.ctx().input(|i| {
             i.raw.dropped_files.iter().filter_map(|f| f.path.clone()).collect()
@@ -107,7 +123,11 @@ impl PlayScreen {
 
     fn launch(&mut self, path: &Path) {
         self.status = match platform::launch(path) {
-            Ok(pid) => format!("\u{25B6} now playing: {} (pid {pid})", stem(path)),
+            Ok(child) => {
+                let pid = child.id();
+                self.children.push(child);
+                format!("\u{25B6} now playing: {} (pid {pid})", stem(path))
+            }
             Err(e) => format!("\u{2716} {e}"),
         };
         // move to top of the shelf
