@@ -315,15 +315,18 @@ fn cmd_play(args: &[String]) -> Result<(), String> {
     let sav_path = format!("{}.sav", rom_path.trim_end_matches(".gba"));
 
     // Native translation: load from the per-user cache, building it on
-    // first launch. Any failure falls back to the interpreter — playing
-    // slower beats not playing.
+    // first launch. The product bar is full speed at full accuracy — the
+    // interpreter fallback below is a defect surface, not a graceful
+    // mode: it exists so a translation failure stays loudly diagnosable
+    // instead of crashing, and the loop alarms if speed drops below
+    // realtime either way.
     let native = if interp_only {
         None
     } else {
         match ensure_native(&rom_path, &rom) {
             Ok(v) => Some(v),
             Err(e) => {
-                eprintln!("native translation unavailable ({e}); using interpreter");
+                eprintln!("DEGRADED: native translation unavailable ({e}); interpreter only");
                 None
             }
         }
@@ -416,6 +419,9 @@ fn cmd_play(args: &[String]) -> Result<(), String> {
     };
 
     let mut buf = vec![0u32; 240 * 160];
+    let mut emu_ema_ms = 0.0f64;
+    let mut frames_run = 0u64;
+    let mut slow_warned = false;
     while window.is_open() && !window.is_key_down(Key::Escape) {
         // KEYINPUT is active-low.
         let mut keys = 0x3FFu16;
@@ -449,12 +455,26 @@ fn cmd_play(args: &[String]) -> Result<(), String> {
         }
         m.bus.keys = keys;
 
+        let emu_t0 = std::time::Instant::now();
         match &native {
             Some((_lib, table)) => {
                 let mptr = &mut m as *mut Machine as *mut std::ffi::c_void;
                 run_frame_native(&mut m, table, mptr, 5_000_000);
             }
             None => m.run_frame(5_000_000),
+        }
+        // Realtime alarm: the frame budget is 16.7 ms. If smoothed
+        // emulation cost approaches it, the product promise is broken —
+        // say so once, with the number.
+        let dt_ms = emu_t0.elapsed().as_secs_f64() * 1e3;
+        emu_ema_ms = if frames_run == 0 { dt_ms } else { emu_ema_ms * 0.95 + dt_ms * 0.05 };
+        frames_run += 1;
+        if !slow_warned && frames_run > 120 && emu_ema_ms > 15.0 {
+            slow_warned = true;
+            eprintln!(
+                "DEGRADED: emulation averaging {emu_ema_ms:.1} ms/frame \
+                 (budget 16.7 ms) — below native speed"
+            );
         }
 
         // Hand this frame's audio to the output ring (cap ~250 ms).
