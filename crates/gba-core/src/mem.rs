@@ -788,6 +788,23 @@ impl MemMap {
 
     /// Route an I/O-register byte write to the owning peripheral.
     fn io_write8(&mut self, off: u32, value: u8) {
+        // Diagnostic (RECOMP_TRACE_IOW): scroll/blend register write
+        // timing, for scanline-effect divergence between dispatch paths.
+        {
+            static TRACE_IOW: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            if *TRACE_IOW.get_or_init(|| std::env::var_os("RECOMP_TRACE_IOW").is_some())
+                && ((0x10..0x20).contains(&off) || (0x50..0x56).contains(&off))
+            {
+                eprintln!(
+                    "IOW f={} line={} lcyc={} off={:02x} val={:02x}",
+                    self.frames,
+                    self.scanline(),
+                    self.clock.wrapping_sub(self.vline_start),
+                    off,
+                    value
+                );
+            }
+        }
         match 0x0400_0000 + off {
             REG_IE => self.reg_ie = (self.reg_ie & 0xFF00) | value as u16,
             x if x == REG_IE + 1 => {
@@ -1276,6 +1293,17 @@ impl Bus for MemMap {
         }
         let flags = self.read16(0x0300_7FF8);
         if flags & mask != 0 {
+            // Diagnostic (RECOMP_TRACE_IOW): IntrWait satisfaction timing.
+            {
+                static TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                if *TRACE.get_or_init(|| std::env::var_os("RECOMP_TRACE_IOW").is_some()) {
+                    eprintln!(
+                        "INTRWAIT-OK f={} line={} mask={mask:04x} flags={flags:04x}",
+                        self.frames,
+                        self.scanline()
+                    );
+                }
+            }
             self.write16(0x0300_7FF8, flags & !mask);
             self.intr_wait_armed = false;
             return true;

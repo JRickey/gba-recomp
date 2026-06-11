@@ -106,6 +106,18 @@ impl Machine {
 
     /// HLE of the BIOS IRQ dispatcher prologue.
     fn dispatch_irq(&mut self) {
+        // Diagnostic (RECOMP_TRACE_IOW): IRQ dispatch timing vs raise.
+        {
+            static TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            if *TRACE.get_or_init(|| std::env::var_os("RECOMP_TRACE_IOW").is_some()) {
+                eprintln!(
+                    "IRQDISPATCH f={} line={} if={:04x}",
+                    self.bus.frames,
+                    self.bus.scanline(),
+                    self.bus.reg_if
+                );
+            }
+        }
         let cpu = &mut self.cpu;
         // lr_irq such that `subs pc, lr, #4` resumes at the interrupted
         // instruction (regs[15] is the next fetch address).
