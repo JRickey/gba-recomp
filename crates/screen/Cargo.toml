@@ -1,0 +1,24 @@
+[package]
+name = "screen"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Per-revision screen simulation: colorimetry, temporal response, GPU presentation"
+
+[features]
+default = ["gpu"]
+gpu = ["dep:wgpu", "dep:raw-window-handle", "dep:pollster"]
+
+[dependencies]
+wgpu = { version = "26", optional = true }
+raw-window-handle = { version = "0.6", optional = true }
+pollster = { version = "0.4", optional = true }
+
+[dev-dependencies]
+naga = { version = "26", features = ["wgsl-in"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-quartz-core = { version = "0.3", features = ["CAMetalLayer"] }
+objc2-core-graphics = "0.3"
+objc2-core-foundation = "0.3"

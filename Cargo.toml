@@ -6,6 +6,7 @@ members = [
     "crates/input-config",
     "crates/launcher",
     "crates/recomp",
+    "crates/screen",
 ]
 
 [workspace.package]
