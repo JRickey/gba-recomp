@@ -1351,6 +1351,7 @@ dependencies = [
  "gilrs",
  "input-config",
  "rfd",
+ "winit",
 ]
 
 [[package]]

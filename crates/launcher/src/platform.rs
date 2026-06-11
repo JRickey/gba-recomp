@@ -55,3 +55,21 @@ pub fn launch(rom: &Path) -> Result<u32, String> {
         .map(|c| c.id())
         .map_err(|e| format!("failed to start {}: {e}", bin.display()))
 }
+
+/// Android: the sanctioned interface is the system document picker (SAF,
+/// ACTION_OPEN_DOCUMENT) — scoped storage forbids raw filesystem browsing.
+/// Delivering the picked URI back to Rust needs onActivityResult, which
+/// the plain NativeActivity glue does not forward; the plan (see
+/// docs/launcher.md) is a small Java activity subclass that launches the
+/// picker and hands the URI across JNI. Until that shim lands, selection
+/// is unavailable on this target.
+#[cfg(target_os = "android")]
+pub fn pick_rom() -> Option<PathBuf> {
+    None
+}
+
+/// Android: no play runtime is built for this target yet.
+#[cfg(target_os = "android")]
+pub fn launch(_rom: &Path) -> Result<u32, String> {
+    Err("the play runtime is not available on this platform yet".into())
+}

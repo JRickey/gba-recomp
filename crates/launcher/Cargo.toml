@@ -3,11 +3,25 @@ name = "gba-launcher"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Frontend launcher: ROM selection, input setup, A/V settings"
+description = "Frontend launcher: cartridge selection, input setup, A/V settings"
+
+[lib]
+name = "gba_launcher"
+crate-type = ["lib", "cdylib"]
+
+[features]
+# Android build (cdylib through the NativeActivity glue):
+#   cargo build --target aarch64-linux-android --features android-native-activity
+android-native-activity = ["eframe/android-native-activity"]
 
 [dependencies]
 dirs = "6.0.0"
 eframe = "0.34.3"
 gilrs = "0.11.2"
 input-config = { version = "0.1.0", path = "../input-config" }
+
+[target.'cfg(not(target_os = "android"))'.dependencies]
 rfd = "0.17.2"
+
+[target.'cfg(target_os = "android")'.dependencies]
+winit = "0.30"
