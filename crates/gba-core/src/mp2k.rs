@@ -1,4 +1,4 @@
-//! MP2K ("m4a"/"sappy") sound-driver detection and HLE shadow mixer.
+//! MP2K ("m4a") sound-driver detection and HLE shadow mixer.
 //!
 //! The majority of commercial images ship the SDK's MusicPlayer2000
 //! driver, whose software mixer accumulates voices into a signed 8-bit
@@ -266,46 +266,71 @@ impl SelfCheck {
         };
         let canon_level = (mean(&self.ex, 0) + mean(&self.ex, 1)) / 2.0;
         let shadow_level = (mean(&self.ey, 0) + mean(&self.ey, 1)) / 2.0;
-        let mut best: Option<f32> = None;
+        let mut verdict: Option<(f32, f32)> = None;
         if canon_level >= CHECK_MIN_LEVEL as f64 {
-            for lag in (0..=CHECK_MAX_LAG).step_by(2) {
-                let mut sum = 0.0;
-                let mut sides = 0;
-                for side in 0..2 {
-                    let x: Vec<f64> = self.ex[CHECK_MAX_LAG..CHECK_WINDOW]
-                        .iter()
-                        .map(|e| if side == 0 { e.0 as f64 } else { e.1 as f64 })
-                        .collect();
-                    let y: Vec<f64> = self.ey[CHECK_MAX_LAG - lag..CHECK_WINDOW - lag]
-                        .iter()
-                        .map(|e| if side == 0 { e.0 as f64 } else { e.1 as f64 })
-                        .collect();
-                    let mx = x.iter().sum::<f64>() / n as f64;
-                    let my = y.iter().sum::<f64>() / n as f64;
-                    let mut cov = 0.0;
-                    let mut vx = 0.0;
-                    let mut vy = 0.0;
-                    for (a, b) in x.iter().zip(&y) {
-                        cov += (a - mx) * (b - my);
-                        vx += (a - mx) * (a - mx);
-                        vy += (b - my) * (b - my);
+            let ratio = (shadow_level / canon_level) as f32;
+            // Does the canon envelope carry structure at all this
+            // window (vs a held constant amplitude)?
+            let canon_var: f64 = {
+                let m0 = mean(&self.ex, 0);
+                let m1 = mean(&self.ex, 1);
+                self.ex
+                    .iter()
+                    .map(|e| {
+                        let a = e.0 as f64 - m0;
+                        let b = e.1 as f64 - m1;
+                        a * a + b * b
+                    })
+                    .sum::<f64>()
+                    / self.ex.len() as f64
+            };
+            if canon_var <= 1e-10 {
+                // Flat canon: nothing to correlate — level is the whole
+                // verdict (r reported as 1, the gate is the ratio).
+                verdict = Some((1.0, ratio));
+            } else {
+                let mut best: Option<f32> = None;
+                for lag in (0..=CHECK_MAX_LAG).step_by(2) {
+                    let mut sum = 0.0;
+                    let mut sides = 0;
+                    for side in 0..2 {
+                        let x: Vec<f64> = self.ex[CHECK_MAX_LAG..CHECK_WINDOW]
+                            .iter()
+                            .map(|e| if side == 0 { e.0 as f64 } else { e.1 as f64 })
+                            .collect();
+                        let y: Vec<f64> = self.ey[CHECK_MAX_LAG - lag..CHECK_WINDOW - lag]
+                            .iter()
+                            .map(|e| if side == 0 { e.0 as f64 } else { e.1 as f64 })
+                            .collect();
+                        let mx = x.iter().sum::<f64>() / n as f64;
+                        let my = y.iter().sum::<f64>() / n as f64;
+                        let mut cov = 0.0;
+                        let mut vx = 0.0;
+                        let mut vy = 0.0;
+                        for (a, b) in x.iter().zip(&y) {
+                            cov += (a - mx) * (b - my);
+                            vx += (a - mx) * (a - mx);
+                            vy += (b - my) * (b - my);
+                        }
+                        if vx > 1e-12 && vy > 1e-12 {
+                            sum += cov / (vx * vy).sqrt();
+                            sides += 1;
+                        }
                     }
-                    if vx > 1e-12 && vy > 1e-12 {
-                        sum += cov / (vx * vy).sqrt();
-                        sides += 1;
+                    if sides > 0 {
+                        let r = (sum / sides as f64) as f32;
+                        best = Some(best.map_or(r, |b: f32| b.max(r)));
                     }
                 }
-                if sides > 0 {
-                    let r = (sum / sides as f64) as f32;
-                    best = Some(best.map_or(r, |b: f32| b.max(r)));
-                }
+                // A structured canon with a flat shadow (best=None) is
+                // the silent-desync failure class — that IS a verdict,
+                // the worst one, not an abstention.
+                verdict = Some((best.unwrap_or(0.0), ratio));
             }
-            // Both streams flat (sides==0 at every lag, e.g. a held
-            // constant tone): structurally consistent — no verdict.
         }
         self.ex.clear();
         self.ey.clear();
-        best.map(|r| (r, (shadow_level / canon_level) as f32))
+        verdict
     }
 }
 
@@ -460,7 +485,7 @@ impl Mp2kHle {
                 self.voices[ch].on = false;
                 continue;
             }
-            // Reversed playback (pokeemerald-era extension): not
+            // Reversed playback (late-era SDK extension): not
             // implemented; mute the voice rather than render garbage.
             if ctype & 0x10 != 0 {
                 self.voices[ch].on = false;
@@ -510,10 +535,12 @@ impl Mp2kHle {
                     env_now = 0;
                 }
             } else if iec {
-                // Pseudo-echo hold: guest decrements echoLength and
-                // kills at zero; env holds at echoVolume.
+                // Pseudo-echo hold: env holds at echoVolume. The guest
+                // decrements echoLength THEN tests zero, so a stored 1
+                // dies this very tick (0 cannot occur on entry; treat
+                // it as dead rather than mirror the u8 wrap).
                 env_now = env;
-                if echo_len == 0 {
+                if echo_len <= 1 {
                     dead = true;
                 }
             } else if stopping {
@@ -647,7 +674,14 @@ impl Mp2kHle {
             left += s * gl;
         }
 
-        self.ring[self.ring_pos] = (right, left);
+        // The guest mixer saturates its 8-bit buffer; its reverb
+        // recirculates the SATURATED signal and its FIFO carries it.
+        // Keep the clean mix for output, but feed the canon-domain
+        // (saturated) copy to both the reverb ring and the self-check,
+        // or hot mixes inflate the level and shred the correlation
+        // against a clipping canon.
+        let sat = (right.clamp(-1.0, 127.0 / 128.0), left.clamp(-1.0, 127.0 / 128.0));
+        self.ring[self.ring_pos] = sat;
         self.ring_pos = (self.ring_pos + 1) % self.ring.len();
 
         // Differential self-check vs the canon stream (FIFO A carries
@@ -655,7 +689,7 @@ impl Mp2kHle {
         // programming). Sustained divergence means our shadow does not
         // match what the game's own mixer produced — revert loudly.
         let canon_rl = (canon[0] as f32 / 128.0, canon[1] as f32 / 128.0);
-        if let Some((r, ratio)) = self.check.push(canon_rl, (right, left)) {
+        if let Some((r, ratio)) = self.check.push(canon_rl, sat) {
             self.check.last_r = r;
             self.check.last_ratio = ratio;
             // Two failure axes: structure (correlation) and level
@@ -664,17 +698,24 @@ impl Mp2kHle {
             // version). The canon's 8-bit per-voice truncation makes it
             // genuinely quieter than the ideal mix on quiet content, so
             // the band is asymmetric and generous.
-            let level_ok = (0.5..=3.0).contains(&ratio);
+            // Legitimate ratio spread is narrow: canon per-voice
+            // truncation and ZOH-image energy move it ~+-30%; a 2x
+            // offset means this driver revision scales volume
+            // differently and substituting would be wrong-but-pretty.
+            let level_ok = (0.55..=1.6).contains(&ratio);
             if r < CHECK_MIN_R || !level_ok {
                 self.check.strikes += 1;
                 if self.check.strikes >= CHECK_MAX_STRIKES {
                     self.revert(format!(
                         "shadow/canon correlation {r:.2}, level ratio {ratio:.2} \
-                         for {CHECK_MAX_STRIKES} s (driver variant or unsupported feature)"
+                         (driver variant or unsupported feature)"
                     ));
                 }
             } else {
-                self.check.strikes = 0;
+                // Decay, don't clear: a window-flapper (alternating
+                // pass/fail) must still ratchet to revert; only a
+                // sustained clean run earns back trust.
+                self.check.strikes = self.check.strikes.saturating_sub(1);
             }
         }
 
@@ -700,7 +741,11 @@ fn note_on(v: &mut Voice, mem: &MemView, ctype: u8, count: u32, wav: u32) -> boo
     if size == 0 || size > 0x0100_0000 || loop_start > size {
         return false;
     }
-    let compressed = ctype & 0x20 != 0 || hdr_type != 0;
+    // Compressed iff the channel type says so (the wave header's type
+    // halfword is not reliable across driver generations; decoding
+    // plain PCM as DPCM is the louder failure).
+    let compressed = ctype & 0x20 != 0;
+    let _ = hdr_type;
     // The full data range must be resolvable now — no per-sample
     // surprises later.
     let bytes = if compressed {

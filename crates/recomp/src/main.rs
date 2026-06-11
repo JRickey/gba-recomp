@@ -1597,6 +1597,18 @@ fn cmd_runc(args: &[String]) -> Result<(), String> {
     println!("loaded {} translated blocks", table.len);
 
     let mut m = Machine::new(rom);
+    // RECOMP_MP2K=1: arm the HLE shadow under native dispatch — the
+    // hook-at-block-boundary path play uses, validated headless here.
+    if std::env::var_os("RECOMP_MP2K").is_some() {
+        m.bus.tap_channels = true;
+        match gba_core::mp2k::detect(&m.bus.rom) {
+            Some(sig) => {
+                eprintln!("mp2k: driver detected, SoundMainRAM {:#010x}", sig.sound_main_ram & !1);
+                m.bus.mp2k = Some(Box::new(gba_core::mp2k::Mp2kHle::new(sig)));
+            }
+            None => eprintln!("mp2k: no stock driver signature"),
+        }
+    }
     let mptr = &mut m as *mut Machine as *mut std::ffi::c_void;
 
     let mut native_blocks = 0u64;
@@ -1623,6 +1635,21 @@ fn cmd_runc(args: &[String]) -> Result<(), String> {
         "frames: {} hash: {hash:016x} native_blocks: {native_blocks} fallback_steps: {fallback_steps}",
         m.bus.frames
     );
+    if let Some(h) = m.bus.mp2k.as_deref() {
+        let (corr, ratio) = h.last_correlation();
+        eprintln!(
+            "mp2k: hooks={} stale={} bad_waves={} corr={corr:.3} ratio={ratio:.2} engaged={} active={}{}",
+            h.hooks,
+            h.stale_ticks,
+            h.bad_waves,
+            h.engaged,
+            h.active,
+            h.reverted
+                .as_deref()
+                .map(|m| format!(" REVERTED: {m}"))
+                .unwrap_or_default()
+        );
+    }
     if std::env::var_os("RECOMP_TRACE_IWRAM").is_some() {
         IWRAM_HITS.with(|h| {
             let mut v: Vec<_> = h.borrow().iter().map(|(&k, &n)| (k, n)).collect();
