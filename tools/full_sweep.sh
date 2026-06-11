@@ -38,7 +38,11 @@ if [ -z "$(ls "$SWEEP_DST"/*.gba 2>/dev/null | head -1)" ] || [ "${SWEEP_REEXTRA
       if ! unzip -p "$zip" "$entry" > "$tmp" 2>/dev/null; then
         rm -f "$tmp"; exit 0
       fi
-      sha=$(shasum -a 256 "$tmp" | cut -d" " -f1)
+      if command -v sha256sum >/dev/null 2>&1; then
+        sha=$(sha256sum "$tmp" | cut -d" " -f1)
+      else
+        sha=$(shasum -a 256 "$tmp" | cut -d" " -f1)
+      fi
       if [ -e "$SWEEP_DST/$sha.gba" ]; then
         rm -f "$tmp"
       else
@@ -63,9 +67,22 @@ echo "[stage 2] $todo of $total images pending, $SWEEP_FRAMES frames, $jobs jobs
 
 # Watchdog: abort everything if the kernel reaches critical memory
 # pressure, so a runaway can never take the machine down again.
+# Darwin reports a pressure level directly; elsewhere derive one from
+# /proc/meminfo MemAvailable (<5% critical, <15% warning).
+mem_pressure_level() {
+  lvl=$(sysctl -n kern.memorystatus_vm_pressure_level 2>/dev/null)
+  if [ -n "$lvl" ]; then
+    echo "$lvl"
+  elif [ -r /proc/meminfo ]; then
+    awk '/^MemTotal:/{t=$2} /^MemAvailable:/{a=$2}
+         END{p=a*100/t; if(p<5) print 4; else if(p<15) print 2; else print 1}' /proc/meminfo
+  else
+    echo 1
+  fi
+}
 (
   while :; do
-    lvl=$(sysctl -n kern.memorystatus_vm_pressure_level 2>/dev/null || echo 1)
+    lvl=$(mem_pressure_level)
     if [ "$lvl" -ge 4 ]; then
       echo "WATCHDOG: critical memory pressure — aborting sweep" >> "$log"
       pkill -f "$SWEEP_BIN verify" 2>/dev/null
