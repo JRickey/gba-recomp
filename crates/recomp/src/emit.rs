@@ -32,6 +32,7 @@ typedef struct {
     void (*write16)(void*, uint32_t, uint32_t);
     void (*write32)(void*, uint32_t, uint32_t);
     void (*tick)(void*, uint32_t);
+    uint32_t (*guard)(void*, uint32_t, uint32_t, uint64_t);
 } RtApi;
 typedef struct { uint32_t key; uint32_t (*fn)(const RtApi*, void*); } RcgBlock;
 
@@ -394,24 +395,23 @@ fn emit_block(out: &mut String, b: &Block, view: &crate::analyze::View) {
         if b.thumb { "t" } else { "a" }
     );
 
-    // RAM-resident blocks were translated from a profiling snapshot; guard
-    // the first and last instruction words so swapped/overwritten code
-    // falls back to the interpreter instead of running stale natives.
+    // RAM-resident blocks were translated from a profiling snapshot;
+    // guard the whole block's content (one FNV-1a hash call) so swapped
+    // or overwritten code falls back to the interpreter instead of
+    // running stale natives. First/last-word checks proved insufficient:
+    // overlays routinely share prologue/epilogue words.
     if region != 8 {
         let last = b.instrs.last().unwrap();
-        let checks: [(u32, bool); 2] = [(b.addr, b.thumb), (last.addr, last.thumb)];
-        for (addr, thumb) in checks {
-            let (rd, val) = if thumb {
-                ("read16", view.read16(addr) as u32)
-            } else {
-                ("read32", view.read32(addr))
-            };
-            let _ = writeln!(
-                out,
-                "    if (a->{rd}(m, 0x{addr:08x}u) != 0x{val:08x}u) {{ c[15] = 0x{:08x}u; return a->interp_one(m); }}",
-                b.addr
-            );
-        }
+        let len = last.addr.wrapping_add(last.size()).wrapping_sub(b.addr);
+        let bytes = view
+            .bytes(b.addr, len as usize)
+            .expect("RAM block must be inside the profiling snapshot");
+        let hash = crate::fnv64(bytes);
+        let _ = writeln!(
+            out,
+            "    if (!a->guard(m, 0x{:08x}u, {len}u, 0x{hash:016x}ull)) {{ c[15] = 0x{:08x}u; return a->interp_one(m); }}",
+            b.addr, b.addr
+        );
     }
 
     let mut cx = Ctx { out, thumb: b.thumb, cycles: 0 };
@@ -455,9 +455,18 @@ fn emit_block(out: &mut String, b: &Block, view: &crate::analyze::View) {
                 let key = target | thumb_bit;
                 let guard = instr.cond != Cond::Al;
                 if guard {
+                    // A taken conditional BL links like any BL — LR must
+                    // be written inside the taken arm (hand-written
+                    // assembly uses bl<cond>; compilers never emit it,
+                    // which long hid this path).
+                    let lr = if link {
+                        format!("c[14] = 0x{:08x}u; ", instr.addr.wrapping_add(4))
+                    } else {
+                        String::new()
+                    };
                     let _ = writeln!(
                         cx.out,
-                        "    {{ uint32_t s_ = c[16]; uint32_t cn = s_ >> 31, cz = (s_ >> 30) & 1u, cc = (s_ >> 29) & 1u, cv = (s_ >> 28) & 1u;\n      if {} {{ c[15] = 0x{:08x}u; return 0x{key:08x}u; }} }}",
+                        "    {{ uint32_t s_ = c[16]; uint32_t cn = s_ >> 31, cz = (s_ >> 30) & 1u, cc = (s_ >> 29) & 1u, cv = (s_ >> 28) & 1u;\n      if {} {{ {lr}c[15] = 0x{:08x}u; return 0x{key:08x}u; }} }}",
                         cond_expr(instr.cond),
                         target
                     );

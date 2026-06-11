@@ -29,6 +29,10 @@ pub struct RtApi {
     pub write16: extern "C" fn(*mut core::ffi::c_void, u32, u32),
     pub write32: extern "C" fn(*mut core::ffi::c_void, u32, u32),
     pub tick: extern "C" fn(*mut core::ffi::c_void, u32),
+    /// Content guard for RAM-translated blocks: returns 1 iff the FNV-1a
+    /// hash of `len` guest bytes at `addr` equals `expect`. One call per
+    /// block entry; hashes the IWRAM slice directly on the fast path.
+    pub guard: extern "C" fn(*mut core::ffi::c_void, u32, u32, u64) -> u32,
 }
 
 const _: () = {
@@ -65,6 +69,24 @@ extern "C" fn rt_tick(m: *mut core::ffi::c_void, cycles: u32) {
     mach!(m).bus.tick(cycles as u64)
 }
 
+extern "C" fn rt_guard(m: *mut core::ffi::c_void, addr: u32, len: u32, expect: u64) -> u32 {
+    let bus = &mut mach!(m).bus;
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    let off = (addr & 0x7FFF) as usize;
+    if addr >> 24 == 3 && off + len as usize <= bus.iwram.len() {
+        for &b in &bus.iwram[off..off + len as usize] {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x1_0000_01b3);
+        }
+    } else {
+        for i in 0..len {
+            h ^= crate::Bus::read8(bus, addr.wrapping_add(i)) as u64;
+            h = h.wrapping_mul(0x1_0000_01b3);
+        }
+    }
+    (h == expect) as u32
+}
+
 /// A translated block: `key` is the guest address with bit 0 = Thumb.
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -90,4 +112,5 @@ pub const RT_API: RtApi = RtApi {
     write16: rt_write16,
     write32: rt_write32,
     tick: rt_tick,
+    guard: rt_guard,
 };

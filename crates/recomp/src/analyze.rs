@@ -71,6 +71,12 @@ impl View<'_> {
         let (m, o) = self.slice(addr).unwrap();
         u32::from_le_bytes([m[o], m[o + 1], m[o + 2], m[o + 3]])
     }
+
+    /// A contiguous byte range, if it lies fully inside one region.
+    pub fn bytes(&self, addr: u32, len: usize) -> Option<&[u8]> {
+        let (m, o) = self.slice(addr)?;
+        m.get(o..o + len)
+    }
 }
 
 /// Static successors of an instruction, plus whether execution can fall

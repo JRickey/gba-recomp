@@ -227,6 +227,12 @@ fn cmd_frames(args: &[String]) -> Result<(), String> {
         m.run_frame(5_000_000);
     }
 
+    // Triage: dump RAM snapshots for offline disassembly.
+    if let Some(p) = std::env::var_os("RECOMP_DUMP_IWRAM") {
+        std::fs::write(&p, &m.bus.iwram).map_err(|e| e.to_string())?;
+        eprintln!("dumped iwram to {}", p.to_string_lossy());
+    }
+
     // FNV-1a over the framebuffer for cheap regression hashing.
     let mut hash = 0xcbf2_9ce4_8422_2325u64;
     for &px in &m.bus.framebuffer {
@@ -542,9 +548,17 @@ fn status_line(s: &str) {
     let _ = out.flush();
 }
 
+/// Translation cache revision. Bump on ANY change that can invalidate a
+/// cached translation: emitter output, runtime ABI, or emulation
+/// semantics — `--ram` builds bake interpreter-profiled state (seeds +
+/// RAM snapshots) into the translation, so HLE/core fixes count too.
+/// Rev history: 1 = initial; 2 = HuffUnComp HLE, whole-block RAM
+/// guards, conditional-BL link fix.
+const TRANSLATION_REV: u32 = 2;
+
 /// Locate (or build) the cached native translation for this image.
-/// Cache key is the ROM's SHA-256 under a translation-format revision
-/// directory, so a future emitter change can't load stale natives.
+/// Cache key is the ROM's SHA-256 under the `TRANSLATION_REV` directory,
+/// so stale natives can never load; superseded revision dirs are swept.
 /// With `status`, build progress is reported as `STATUS building <pct>`.
 fn ensure_native(
     rom_path: &str,
@@ -556,10 +570,24 @@ fn ensure_native(
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect::<String>();
-    let dir = dirs::cache_dir()
+    let base = dirs::cache_dir()
         .unwrap_or_else(std::env::temp_dir)
-        .join("gba-recomp")
-        .join("t1");
+        .join("gba-recomp");
+    let dir = base.join(format!("t{TRANSLATION_REV}"));
+    // Sweep superseded revision directories — they can only hold stale
+    // translations no current binary will ever load.
+    if let Ok(entries) = std::fs::read_dir(&base) {
+        for e in entries.flatten() {
+            let name = e.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with('t')
+                && name[1..].chars().all(|c| c.is_ascii_digit())
+                && *name != *format!("t{TRANSLATION_REV}")
+            {
+                let _ = std::fs::remove_dir_all(e.path());
+            }
+        }
+    }
     std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     let lib_path = dir.join(format!("{sha}.dylib"));
     let lib_str = lib_path.to_str().ok_or("non-UTF8 cache path")?;
@@ -972,7 +1000,10 @@ fn build_dylib(
             .args(["-O1", "-c", "-o", &o_path, &c_path])
             .status()
             .map_err(|e| format!("cc: {e}"))?;
-        let _ = std::fs::remove_file(&c_path);
+        // Triage: keep the emitted C around for inspection.
+        if std::env::var_os("RECOMP_KEEP_C").is_none() {
+            let _ = std::fs::remove_file(&c_path);
+        }
         if !status.success() {
             return Err(format!("cc failed on {c_path}"));
         }
@@ -1038,12 +1069,22 @@ impl BlockTable {
             other: std::collections::HashMap::new(),
             len: blocks.len(),
         };
+        // Diagnostic: RECOMP_IWRAM_MAX=<hex> drops IWRAM natives above
+        // the threshold at load time (cheap block bisection, no rebuild).
+        let iwram_max = std::env::var("RECOMP_IWRAM_MAX")
+            .ok()
+            .and_then(|v| u32::from_str_radix(v.trim_start_matches("0x"), 16).ok());
         for b in blocks {
             let r = b.key.wrapping_sub(ROM_BASE) as usize;
             let w = b.key.wrapping_sub(IWRAM_BASE) as usize;
             if r < t.rom.len() {
                 t.rom[r] = Some(b.func);
             } else if w < t.iwram.len() {
+                if let Some(mx) = iwram_max {
+                    if b.key & !1 > mx {
+                        continue;
+                    }
+                }
                 t.iwram[w] = Some(b.func);
             } else {
                 t.other.insert(b.key, b.func);
@@ -1101,6 +1142,10 @@ fn run_frame_native(
         let key = m.cpu.regs[15] | m.cpu.thumb() as u32;
         match table.get(key) {
             Some(f) => {
+                // Diagnostic: census of executed IWRAM natives.
+                if std::env::var_os("RECOMP_TRACE_IWRAM").is_some() && key >> 24 == 3 {
+                    IWRAM_HITS.with(|h| *h.borrow_mut().entry(key).or_insert(0u64) += 1);
+                }
                 f(&RT_API, mptr);
                 native += 1;
             }
@@ -1117,12 +1162,19 @@ fn run_frame_native(
 /// frame (a frame is ~280K cycles) while still bounding a wedged run.
 const FRAME_STEP_GUARD: u64 = 200_000_000;
 
+thread_local! {
+    /// Diagnostic (RECOMP_TRACE_IWRAM): executed-IWRAM-native census.
+    static IWRAM_HITS: std::cell::RefCell<std::collections::HashMap<u32, u64>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
 /// Run a recompiled image: translated blocks where available, interpreter
 /// fallback elsewhere, interrupt machinery at block boundaries.
 fn cmd_runc(args: &[String]) -> Result<(), String> {
 
     let mut rom_path = None;
     let mut frames = 600u64;
+    let mut out: Option<String> = None;
     let mut it = args.iter();
     while let Some(arg) = it.next() {
         match arg.as_str() {
@@ -1130,6 +1182,7 @@ fn cmd_runc(args: &[String]) -> Result<(), String> {
                 frames = it.next().ok_or("--frames needs a value")?
                     .parse().map_err(|e| format!("bad frames: {e}"))?
             }
+            "--out" => out = Some(it.next().ok_or("--out needs a value")?.to_string()),
             other if rom_path.is_none() => rom_path = Some(other.to_string()),
             other => return Err(format!("unexpected argument {other:?}")),
         }
@@ -1172,6 +1225,17 @@ fn cmd_runc(args: &[String]) -> Result<(), String> {
         "frames: {} hash: {hash:016x} native_blocks: {native_blocks} fallback_steps: {fallback_steps}",
         m.bus.frames
     );
+    if std::env::var_os("RECOMP_TRACE_IWRAM").is_some() {
+        IWRAM_HITS.with(|h| {
+            let mut v: Vec<_> = h.borrow().iter().map(|(&k, &n)| (k, n)).collect();
+            v.sort_by_key(|&(_, n)| std::cmp::Reverse(n));
+            for (k, n) in v.iter().take(30) {
+                println!("iwram native {k:08x}: {n}");
+            }
+            println!("iwram natives executed: {}", v.len());
+        });
+    }
+    dump_frame(&m, out)?;
     Ok(())
 }
 
