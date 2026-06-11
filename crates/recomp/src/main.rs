@@ -957,6 +957,8 @@ fn cmd_runc(args: &[String]) -> Result<(), String> {
 fn cmd_verify(args: &[String]) -> Result<(), String> {
     let mut rom_path = None;
     let mut frames = 600u64;
+    let mut reuse = false;
+    let mut dump: Option<String> = None;
     let mut it = args.iter();
     while let Some(arg) = it.next() {
         match arg.as_str() {
@@ -964,15 +966,26 @@ fn cmd_verify(args: &[String]) -> Result<(), String> {
                 frames = it.next().ok_or("--frames needs a value")?
                     .parse().map_err(|e| format!("bad frames: {e}"))?
             }
+            // Triage helpers: --reuse skips the rebuild when out/<stem>.dylib
+            // already exists; --dump <prefix> writes both final frames as
+            // <prefix>.interp.ppm / <prefix>.recomp.ppm.
+            "--reuse" => reuse = true,
+            "--dump" => dump = Some(it.next().ok_or("--dump needs a value")?.to_string()),
             other if rom_path.is_none() => rom_path = Some(other.to_string()),
             other => return Err(format!("unexpected argument {other:?}")),
         }
     }
     let rom_path = rom_path.ok_or("missing ROM path")?;
 
-    let interp = run_hash(&rom_path, frames, false)?;
-    cmd_build(&[rom_path.clone()])?;
-    let recomp = run_hash(&rom_path, frames, true)?;
+    let stem = Path::new(&rom_path)
+        .file_stem().and_then(|s| s.to_str()).unwrap_or("game").to_string();
+    if !(reuse && Path::new(&format!("out/{stem}.dylib")).is_file()) {
+        cmd_build(&[rom_path.clone()])?;
+    }
+    let interp = run_hash(&rom_path, frames, false,
+        dump.as_ref().map(|p| format!("{p}.interp.ppm")))?;
+    let recomp = run_hash(&rom_path, frames, true,
+        dump.as_ref().map(|p| format!("{p}.recomp.ppm")))?;
     let verdict = if interp == recomp { "MATCH" } else { "MISMATCH" };
     println!("verify {verdict} interp={interp:016x} recomp={recomp:016x}");
     if interp == recomp { Ok(()) } else { Err("differential mismatch".into()) }
@@ -1015,7 +1028,12 @@ fn fb_hash(m: &Machine) -> u64 {
     hash
 }
 
-fn run_hash(rom_path: &str, frames: u64, recompiled: bool) -> Result<u64, String> {
+fn run_hash(
+    rom_path: &str,
+    frames: u64,
+    recompiled: bool,
+    dump: Option<String>,
+) -> Result<u64, String> {
     let rom = std::fs::read(rom_path).map_err(|e| format!("{rom_path}: {e}"))?;
     let mut m = Machine::new(rom);
     if !recompiled {
@@ -1023,6 +1041,7 @@ fn run_hash(rom_path: &str, frames: u64, recompiled: bool) -> Result<u64, String
             m.bus.keys = demo_keys(m.bus.frames);
             m.run_frame(5_000_000);
         }
+        dump_frame(&m, dump)?;
         return Ok(fb_hash(&m));
     }
     let stem = Path::new(rom_path)
@@ -1040,5 +1059,18 @@ fn run_hash(rom_path: &str, frames: u64, recompiled: bool) -> Result<u64, String
             return Err("step guard exceeded".into());
         }
     }
+    dump_frame(&m, dump)?;
     Ok(fb_hash(&m))
+}
+
+fn dump_frame(m: &Machine, path: Option<String>) -> Result<(), String> {
+    let Some(path) = path else { return Ok(()) };
+    let mut ppm = b"P6\n240 160\n255\n".to_vec();
+    for &px in &m.bus.framebuffer {
+        let r = (px & 31) as u8;
+        let g = ((px >> 5) & 31) as u8;
+        let b = ((px >> 10) & 31) as u8;
+        ppm.extend_from_slice(&[r << 3 | r >> 2, g << 3 | g >> 2, b << 3 | b >> 2]);
+    }
+    std::fs::write(&path, ppm).map_err(|e| format!("{path}: {e}"))
 }

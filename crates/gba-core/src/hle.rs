@@ -82,6 +82,10 @@ pub fn bios_call<B: Bus>(cpu: &mut Cpu, bus: &mut B, num: u32) -> bool {
             lz77_uncomp(cpu, bus);
             true
         }
+        0x13 => {
+            huff_uncomp(cpu, bus);
+            true
+        }
         0x14 | 0x15 => {
             rl_uncomp(cpu, bus);
             true
@@ -267,6 +271,61 @@ fn lz77_uncomp<B: Bus>(cpu: &mut Cpu, bus: &mut B) {
     write_out(bus, dst, &out);
 }
 
+/// HuffUnComp. Header u32 at src: bits 0-3 = data unit size in bits
+/// (4 or 8), bits 8-31 = decompressed size in bytes. src+4: tree size
+/// byte n (bitstream starts at src+4 + (n+1)*2), src+5: tree table,
+/// root first. Non-leaf node: bits 0-5 = offset (child0 at
+/// (addr AND NOT 1) + offset*2 + 2, child1 right after), bit 7 = child0
+/// is a leaf, bit 6 = child1 is a leaf; a leaf byte is the data unit.
+/// Bitstream: u32 words consumed MSB-first (0 = child0, 1 = child1).
+/// Units pack into output bytes LSB-first.
+fn huff_uncomp<B: Bus>(cpu: &mut Cpu, bus: &mut B) {
+    let src = cpu.regs[0];
+    let dst = cpu.regs[1];
+    let header = bus.read32(src);
+    let unit_bits = (header & 0xF).max(1).min(8);
+    let size = (header >> 8) as usize;
+    let tree_size = bus.read8(src + 4) as u32;
+    let root = src + 5;
+    let mut stream = src + 4 + (tree_size + 1) * 2;
+
+    let mut word = 0u32;
+    let mut bits_left = 0u32;
+    let mut byte = 0u8;
+    let mut shift = 0u32;
+    let mut out: Vec<u8> = Vec::with_capacity(size);
+    while out.len() < size {
+        // Walk the tree one bit at a time until a leaf yields a unit.
+        let mut node = root;
+        let unit = loop {
+            if bits_left == 0 {
+                word = bus.read32(stream);
+                stream += 4;
+                bits_left = 32;
+            }
+            let b = word >> 31;
+            word <<= 1;
+            bits_left -= 1;
+
+            let n = bus.read8(node);
+            let child = (node & !1) + 2 + (n as u32 & 0x3F) * 2 + b;
+            let leaf = n & if b == 0 { 0x80 } else { 0x40 } != 0;
+            if leaf {
+                break bus.read8(child);
+            }
+            node = child;
+        };
+        byte |= unit << shift;
+        shift += unit_bits;
+        if shift >= 8 {
+            out.push(byte);
+            byte = 0;
+            shift = 0;
+        }
+    }
+    write_out(bus, dst, &out);
+}
+
 /// RLUnComp: flag byte bit 7 set = run (len = low 7 + 3, one byte),
 /// clear = literals (len = low 7 + 1).
 fn rl_uncomp<B: Bus>(cpu: &mut Cpu, bus: &mut B) {
@@ -372,4 +431,47 @@ fn cpu_fast_set<B: Bus>(cpu: &mut Cpu, bus: &mut B) -> bool {
         bus.write32(dst + i * 4, v);
     }
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::mem::MemMap;
+
+    /// Two-symbol tree: root at src+5 with both children leaves
+    /// (offset 0), leaf0 at src+6, leaf1 at src+7, bitstream at src+8.
+    fn huff_fixture(bus: &mut MemMap, src: u32, header: u32, l0: u8, l1: u8, stream: u32) {
+        bus.write32(src, header);
+        bus.write8(src + 4, 1); // tree size byte: stream at src+4+(1+1)*2
+        bus.write8(src + 5, 0xC0);
+        bus.write8(src + 6, l0);
+        bus.write8(src + 7, l1);
+        bus.write32(src + 8, stream);
+    }
+
+    #[test]
+    fn huff_uncomp_8bit() {
+        let mut bus = MemMap::new(vec![]);
+        let (src, dst) = (0x0200_0000u32, 0x0200_0100u32);
+        // 4 bytes decompressed, 8-bit units; bits 0,0,1,0 -> A A B A
+        huff_fixture(&mut bus, src, (4 << 8) | 0x28, 0x41, 0x42, 0b0010 << 28);
+        let mut cpu = Cpu::new();
+        cpu.regs[0] = src;
+        cpu.regs[1] = dst;
+        assert!(bios_call(&mut cpu, &mut bus, 0x13));
+        assert_eq!(bus.read32(dst), 0x4142_4141);
+    }
+
+    #[test]
+    fn huff_uncomp_4bit_packs_low_nibble_first() {
+        let mut bus = MemMap::new(vec![]);
+        let (src, dst) = (0x0200_0000u32, 0x0200_0100u32);
+        // 2 bytes decompressed, 4-bit units; bits 0,1,1,0 -> 1,2,2,1
+        huff_fixture(&mut bus, src, (2 << 8) | 0x24, 0x1, 0x2, 0b0110 << 28);
+        let mut cpu = Cpu::new();
+        cpu.regs[0] = src;
+        cpu.regs[1] = dst;
+        assert!(bios_call(&mut cpu, &mut bus, 0x13));
+        assert_eq!(bus.read16(dst), 0x1221);
+    }
 }
