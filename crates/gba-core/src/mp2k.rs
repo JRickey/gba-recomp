@@ -204,6 +204,11 @@ struct Voice {
     /// Decoded DPCM block cache (33 bytes -> 64 samples).
     blk_idx: u32,
     blk: [i8; 64],
+    /// Canon-domain check copy: the guest mixer samples this voice at
+    /// ITS mix rate (decimation aliasing and all) — the self-check
+    /// must compare against that rendition, not our full-rate one.
+    chk_hold: f32,
+    chk_acc: f64,
 }
 
 impl Default for Voice {
@@ -221,6 +226,8 @@ impl Default for Voice {
             g1: (0.0, 0.0),
             blk_idx: u32::MAX,
             blk: [0; 64],
+            chk_hold: 0.0,
+            chk_acc: 0.0,
         }
     }
 }
@@ -426,6 +433,8 @@ pub struct Mp2kHle {
     /// the mode on structure-failure pauses and let correlation pick.
     count_mode: u8,
     mode_dwell: u32,
+    /// Grid samples per guest mixer output sample (65536/pcmFreq).
+    mix_step: f64,
 }
 
 impl Mp2kHle {
@@ -471,6 +480,7 @@ impl Mp2kHle {
             pauses: 0,
             count_mode: 0,
             mode_dwell: 0,
+            mix_step: 65536.0 / 13379.0,
         }
     }
 
@@ -546,6 +556,7 @@ impl Mp2kHle {
             return;
         }
         self.dma_period = (head[0x0B]).clamp(1, 16);
+        self.mix_step = RENDER_HZ / pcm_freq as f64;
         self.engaged = true;
         // Diagnostic: raw per-channel bytes, whole array.
         if std::env::var_os("RECOMP_MP2K_TRACE").is_some() && self.hooks % 30 == 0 {
@@ -772,15 +783,32 @@ impl Mp2kHle {
             left = mono;
         }
 
+        // Output uses intra-tick interpolated gains (removes envelope
+        // zipper — the enhancement); the SELF-CHECK copy uses the
+        // guest's held-per-tick gains, because the canon mixer renders
+        // a gain staircase and on fast decays a smooth envelope
+        // under-correlates against it (a comparison-domain artifact,
+        // verified by disassembling a shipping mixer).
+        let (mut chk_r, mut chk_l) = (right, left);
         for v in self.voices.iter_mut() {
             if !v.on {
                 continue;
             }
             let s = sample_voice(v, mem);
+            // Guest-rate ZOH: re-sample only when the guest mixer
+            // would, so heavily pitched-up instruments alias in the
+            // check copy exactly as they do in the canon stream.
+            v.chk_acc -= 1.0;
+            if v.chk_acc <= 0.0 {
+                v.chk_hold = s;
+                v.chk_acc += self.mix_step;
+            }
             let gr = v.g0.0 + (v.g1.0 - v.g0.0) * t;
             let gl = v.g0.1 + (v.g1.1 - v.g0.1) * t;
             right += s * gr * self.gain;
             left += s * gl * self.gain;
+            chk_r += v.chk_hold * v.g0.0 * self.gain;
+            chk_l += v.chk_hold * v.g0.1 * self.gain;
         }
 
         // The guest mixer saturates its 8-bit buffer; its reverb
@@ -789,7 +817,7 @@ impl Mp2kHle {
         // (saturated) copy to both the reverb ring and the self-check,
         // or hot mixes inflate the level and shred the correlation
         // against a clipping canon.
-        let sat = (right.clamp(-1.0, 127.0 / 128.0), left.clamp(-1.0, 127.0 / 128.0));
+        let sat = (chk_r.clamp(-1.0, 127.0 / 128.0), chk_l.clamp(-1.0, 127.0 / 128.0));
         self.ring[self.ring_pos] = sat;
         self.ring_pos = (self.ring_pos + 1) % self.ring.len();
 

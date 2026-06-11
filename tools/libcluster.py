@@ -62,22 +62,52 @@ def m4a_detect(rom: bytes) -> bool:
         pos = i + 2
 
 
-# Cheap engine strings (engine names are not game titles; fine to match).
-STRINGS = {
-    "GAX": [b"GAX Sound Engine"],
-    "Krawall": [b"Krawall", b"$Id: kramWorker"],
-    "MusyX": [b"MusyX"],
-    "GHX": [b"GHX Sound Engine"],
-}
+# Engine recipes. Engine/middleware names
+# are not game titles; fine to match and report.
+
+# GAX v1 bannerless family: 32-byte library-function prefixes minted
+# from the bit-matched decomp, plus a 4-way constant-table conjunction
+# (16-byte prefixes of the driver LUTs) that survives recompiled
+# builds where function bodies differ.
+GAX1_FUNCS = [
+    bytes.fromhex("70B5051C0E1C306803210840002800D0B4E070680840002800D0AFE0B0680840"),
+    bytes.fromhex("F0B557464E464546E0B481B0051C8946171C98461949066888225200B0180268"),
+]
+GAX1_TABLES = [
+    bytes.fromhex("0010F310F511061328145B15A016F917"),  # note ratios 2^(n/12)
+    bytes.fromhex("00101A0F410E740DB20CFC0B500BAD0A"),  # inverse pitch
+    bytes.fromhex("7B07820789079007"),                  # PSG period LUT
+    bytes.fromhex("00606060404040408080808020202020"),  # wave volume LUT
+]
 
 
 def annotate(rom: bytes) -> list[str]:
     tags = []
     if m4a_detect(rom):
         tags.append("M4A")
-    for name, needles in STRINGS.items():
-        if any(rom.find(n) >= 0 for n in needles):
-            tags.append(name)
+    # GAX v2/v3: version banner.
+    i = rom.find(b"GAX Sound Engine")
+    if i >= 0:
+        import re
+        m = re.match(rb"[ v]*(\d\.\d+)", rom[i + 16 : i + 26])
+        tags.append(f"GAX{m.group(1).decode() if m else ''}")
+    elif sum(t in rom for t in GAX1_TABLES) == 4:
+        # Bannerless GAX lineage: all four driver LUTs present.
+        tags.append("GAX1" if any(f in rom for f in GAX1_FUNCS) else "GAXlin")
+    # Krawall: CVS keyword qualified by library strings.
+    j = rom.find(b"$Id: ")
+    while j >= 0:
+        end = rom.find(b"\x00", j, j + 160)
+        blob = rom[j : end if end > 0 else j + 160]
+        if b"Krawall" in blob or b"version.h" in blob or b"player.c,v" in blob:
+            tags.append("Krawall")
+            break
+        j = rom.find(b"$Id: ", j + 5)
+    # Rare in-house driver ships its diagnostics.
+    if rom.count(b"AUDIO ERROR, ") >= 2:
+        tags.append("Rare")
+    if b"MusyX" in rom:
+        tags.append("MusyX")
     return tags
 
 
