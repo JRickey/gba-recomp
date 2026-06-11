@@ -306,10 +306,26 @@ impl MemMap {
         self.ime && self.irq_line()
     }
 
-    /// Advance the master clock and process any due events.
+    /// Advance the master clock and process any due events, generating
+    /// audio grid samples up to each event first so they see the DAC/PSG
+    /// state that was current at their own instants.
     pub fn tick(&mut self, cycles: u64) {
         self.clock += cycles;
-        while self.audio_cursor <= self.clock {
+        while self.clock >= self.next_event {
+            let ev = self.next_event;
+            self.pump_audio(ev);
+            self.process_events();
+        }
+        self.pump_audio(self.clock);
+    }
+
+    /// Generate audio samples on the 65536 Hz grid up to `until` (capped
+    /// at the clock). Every path that advances the clock in bulk must
+    /// pump before state changes land, or DAC transitions inside the
+    /// gap collapse into one held ledge (an audible thump per gap).
+    fn pump_audio(&mut self, until: u64) {
+        let until = until.min(self.clock);
+        while self.audio_cursor <= until {
             // Mix Direct Sound DAC levels with the PSG channels into a
             // stereo pair, honoring the SOUNDCNT routing the hardware
             // applies: per-side FIFO enables and the 50%/100% volume
@@ -352,17 +368,17 @@ impl MemMap {
             }
             self.audio_cursor += AUDIO_SAMPLE_CYCLES;
         }
-        while self.clock >= self.next_event {
-            self.process_events();
-        }
     }
 
     /// Jump the clock to the next event (used while halted/waiting).
     pub fn skip_to_next_event(&mut self) {
         self.clock = self.clock.max(self.next_event);
         while self.clock >= self.next_event {
+            let ev = self.next_event;
+            self.pump_audio(ev);
             self.process_events();
         }
+        self.pump_audio(self.clock);
     }
 
     fn video_due(&self) -> u64 {
@@ -635,6 +651,7 @@ impl MemMap {
             if !sound_mode && done % 16 == 0 {
                 self.clock += 32;
                 self.advance_timers();
+                self.pump_audio(self.clock);
             }
         }
 
