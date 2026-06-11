@@ -1,19 +1,19 @@
 # Test data — local symlinks/clones, never committed
-/data/
+/data
 
 # Local working notes — never committed
 /CLAUDE.md
-/notes/
+/notes
 
 # Build artifacts
-/target/
+/target
 *.o
 *.so
 *.dylib
 *.dll
 
 # Recompiler output
-/out/
+/out
 
 # Editor/OS noise
 .DS_Store

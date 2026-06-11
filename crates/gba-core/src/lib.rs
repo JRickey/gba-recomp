@@ -22,6 +22,7 @@ pub mod machine;
 pub mod mem;
 pub mod mp2k;
 pub mod ppu;
+pub mod rdrv;
 pub mod shadow;
 
 pub use bus::Bus;

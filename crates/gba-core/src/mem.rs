@@ -192,6 +192,8 @@ pub struct MemMap {
     /// GAX v1 HLE shadow mixer (same contract as `mp2k`; at most one
     /// engine shadow is armed per session).
     pub gax: Option<Box<crate::gax::GaxHle>>,
+    /// In-house (R) driver HLE shadow mixer (same contract).
+    pub rdrv: Option<Box<crate::rdrv::RdrvHle>>,
     /// Shadow-mixer stereo output on the tap grid (interleaved L, R;
     /// hardware-rail units scaled to ±0.5 like the play-side floats).
     pub hle_tap: Vec<f32>,
@@ -259,6 +261,7 @@ impl MemMap {
             psg_tap: Vec::new(),
             mp2k: None,
             gax: None,
+            rdrv: None,
             hle_tap: Vec::new(),
             fifo_underruns: [0; 2],
             fifo_refills: [0; 2],
@@ -349,6 +352,7 @@ impl MemMap {
         // `self` so they can read guest memory while we mutate the taps.
         let mut mp2k = self.mp2k.take();
         let mut gax = self.gax.take();
+        let mut rdrv = self.rdrv.take();
         while self.audio_cursor <= until {
             // Mix Direct Sound DAC levels with the PSG channels into a
             // stereo pair, honoring the SOUNDCNT routing the hardware
@@ -427,11 +431,32 @@ impl MemMap {
                         }
                     }
                 }
+                if let Some(rr) = rdrv.as_deref_mut() {
+                    if rr.active {
+                        let mem = crate::mp2k::MemView {
+                            rom: &self.rom,
+                            ewram: &self.ewram,
+                            iwram: &self.iwram,
+                        };
+                        if !rr.engaged {
+                            // Probe until the driver's IWRAM blob copy
+                            // appears, then harvest its layout.
+                            rr.try_engage(&mem);
+                        } else {
+                            let (hl, hr) = rr.render(&mem, self.fifo_sample, self.audio_cursor);
+                            if self.hle_tap.len() < 0x2_0000 {
+                                self.hle_tap.push(hl);
+                                self.hle_tap.push(hr);
+                            }
+                        }
+                    }
+                }
             }
             self.audio_cursor += AUDIO_SAMPLE_CYCLES;
         }
         self.mp2k = mp2k;
         self.gax = gax;
+        self.rdrv = rdrv;
     }
 
     /// GAX HLE hook: dispatch loops call this when PC lands on one of
@@ -446,6 +471,20 @@ impl MemMap {
             };
             g.frame_hook(&mem, self.audio_cursor, key, r0);
             self.gax = Some(g);
+        }
+    }
+
+    /// In-house (R) HLE hook: dispatch loops call this when PC lands
+    /// on the shadow's mix or advance entries.
+    pub fn rdrv_frame_hook(&mut self, key: u32) {
+        if let Some(mut rr) = self.rdrv.take() {
+            let mem = crate::mp2k::MemView {
+                rom: &self.rom,
+                ewram: &self.ewram,
+                iwram: &self.iwram,
+            };
+            rr.frame_hook(&mem, self.audio_cursor, key);
+            self.rdrv = Some(rr);
         }
     }
 
