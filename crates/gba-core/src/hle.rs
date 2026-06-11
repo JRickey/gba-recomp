@@ -90,6 +90,17 @@ pub fn bios_call<B: Bus>(cpu: &mut Cpu, bus: &mut B, num: u32) -> bool {
             rl_uncomp(cpu, bus);
             true
         }
+        0x1F => {
+            // MidiKey2Freq(wa, key, fine): sample frequency for a MIDI
+            // key. freq = wa->freq / 2^((180 - key - fine/256) / 12).
+            // Sound-driver builds that call the BIOS for this produce
+            // pure noise if it returns garbage — every sample step in
+            // the mixer goes wild.
+            let base = bus.read32(cpu.regs[0].wrapping_add(4)) as f64;
+            let exp = (180.0 - cpu.regs[1] as f64 - cpu.regs[2] as f64 / 256.0) / 12.0;
+            cpu.regs[0] = (base / exp.exp2()) as u32;
+            true
+        }
         _ => false,
     }
 }

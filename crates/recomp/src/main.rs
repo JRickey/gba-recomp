@@ -223,8 +223,51 @@ fn cmd_frames(args: &[String]) -> Result<(), String> {
 
     let mut m = Machine::new(rom);
     m.bus.keys = keys;
+
+    // Diagnostic (RECOMP_DUMP_AUDIO=<prefix>): capture the full audio taps
+    // headless — <prefix>.mixed.wav / .psg.wav (PCM16 mono @ tap rate)
+    // and <prefix>.fifoN.bin ((i8 sample, u32le period) DAC events).
+    let dump_audio = std::env::var("RECOMP_DUMP_AUDIO").ok();
+    let mut mixed: Vec<i16> = Vec::new();
+    let mut psg: Vec<i16> = Vec::new();
+    let mut fifo_ev: [Vec<(i8, u32)>; 2] = [Vec::new(), Vec::new()];
+    if dump_audio.is_some() {
+        m.bus.tap_channels = true;
+    }
     for _ in 0..frames {
         m.run_frame(5_000_000);
+        if dump_audio.is_some() {
+            mixed.extend(m.bus.audio_buf.drain(..));
+            psg.extend(m.bus.psg_tap.drain(..));
+            for f in 0..2 {
+                fifo_ev[f].append(&mut m.bus.fifo_tap[f]);
+            }
+        }
+    }
+    if let Some(prefix) = &dump_audio {
+        write_wav(&format!("{prefix}.mixed.wav"), &mixed, gba_core::mem::AUDIO_RATE_HZ)?;
+        write_wav(&format!("{prefix}.psg.wav"), &psg, gba_core::mem::AUDIO_RATE_HZ)?;
+        for f in 0..2 {
+            let mut raw = Vec::with_capacity(fifo_ev[f].len() * 5);
+            for &(s, p) in &fifo_ev[f] {
+                raw.push(s as u8);
+                raw.extend_from_slice(&p.to_le_bytes());
+            }
+            let path = format!("{prefix}.fifo{f}.bin");
+            std::fs::write(&path, raw).map_err(|e| format!("{path}: {e}"))?;
+        }
+        eprintln!(
+            "audio dump: {} mixed samples, fifo events A={} B={}, underruns A={} B={}, refills A={} B={}, pushes A={} B={}",
+            mixed.len(),
+            fifo_ev[0].len(),
+            fifo_ev[1].len(),
+            m.bus.fifo_underruns[0],
+            m.bus.fifo_underruns[1],
+            m.bus.fifo_refills[0],
+            m.bus.fifo_refills[1],
+            m.bus.fifo_pushes[0],
+            m.bus.fifo_pushes[1],
+        );
     }
 
     // Triage: dump RAM snapshots for offline disassembly.
@@ -668,7 +711,13 @@ fn start_audio(
                             e.dc.next(sum)
                         }
                         None => {
-                            frac += step;
+                            // The emulated DAC runs on the 59.73 Hz frame
+                            // grid while the window paces 60 — steer the
+                            // faithful path too, or the ring overflows
+                            // into a burst-drop buzz at the cap.
+                            let err = (st.mixed.len() as f64 - RING_TARGET as f64)
+                                / RING_TARGET as f64;
+                            frac += step * (1.0 + 0.01 * err.clamp(-1.0, 1.0));
                             while frac >= 1.0 {
                                 frac -= 1.0;
                                 if let Some(s) = st.mixed.pop_front() {
@@ -746,7 +795,7 @@ impl DcBlock {
 }
 
 /// Fixed-ratio polyphase windowed-sinc resampler with gentle (max
-/// ±0.5%) consumption-rate control against the queue fill. Band-limits
+/// ±1%) consumption-rate control against the queue fill. Band-limits
 /// to the narrower of the two Nyquists, so downsampling to a 44.1/48
 /// kHz device does not fold images the way the zero-order-hold path
 /// does. Used for the PSG grid stream.
@@ -774,7 +823,7 @@ impl SincResampler {
         // Steer consumption toward the target fill; an underrun repeats
         // the newest sample (a one-sample ZOH the DC blocker smooths).
         let err = (q.len() as f64 - RING_TARGET as f64) / RING_TARGET as f64;
-        self.frac += self.ratio * (1.0 + 0.005 * err.clamp(-1.0, 1.0));
+        self.frac += self.ratio * (1.0 + 0.01 * err.clamp(-1.0, 1.0));
         while self.frac >= 1.0 {
             self.frac -= 1.0;
             let s = match q.pop_front() {
@@ -829,7 +878,7 @@ impl FifoInterp {
         // Steer toward ~62 ms queued at the channel's current rate.
         let target = ((1u64 << 24) as f64 / self.period / 16.0).max(64.0);
         let err = (q.len() as f64 - target) / target;
-        self.frac += self.out_step * (1.0 + 0.005 * err.clamp(-1.0, 1.0));
+        self.frac += self.out_step * (1.0 + 0.01 * err.clamp(-1.0, 1.0));
         while self.frac >= self.period {
             self.frac -= self.period;
             let s = match q.pop_front() {
@@ -1348,6 +1397,28 @@ fn run_hash(
     }
     dump_frame(&m, dump)?;
     Ok(fb_hash(&m))
+}
+
+/// Minimal PCM16LE mono WAV writer for audio triage dumps.
+fn write_wav(path: &str, samples: &[i16], rate: u32) -> Result<(), String> {
+    let data_len = (samples.len() * 2) as u32;
+    let mut w = Vec::with_capacity(44 + samples.len() * 2);
+    w.extend_from_slice(b"RIFF");
+    w.extend_from_slice(&(36 + data_len).to_le_bytes());
+    w.extend_from_slice(b"WAVEfmt ");
+    w.extend_from_slice(&16u32.to_le_bytes());
+    w.extend_from_slice(&1u16.to_le_bytes()); // PCM
+    w.extend_from_slice(&1u16.to_le_bytes()); // mono
+    w.extend_from_slice(&rate.to_le_bytes());
+    w.extend_from_slice(&(rate * 2).to_le_bytes());
+    w.extend_from_slice(&2u16.to_le_bytes());
+    w.extend_from_slice(&16u16.to_le_bytes());
+    w.extend_from_slice(b"data");
+    w.extend_from_slice(&data_len.to_le_bytes());
+    for s in samples {
+        w.extend_from_slice(&s.to_le_bytes());
+    }
+    std::fs::write(path, w).map_err(|e| format!("{path}: {e}"))
 }
 
 fn dump_frame(m: &Machine, path: Option<String>) -> Result<(), String> {

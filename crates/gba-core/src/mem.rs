@@ -178,6 +178,11 @@ pub struct MemMap {
     pub tap_channels: bool,
     pub fifo_tap: [Vec<(i8, u32)>; 2],
     pub psg_tap: Vec<i16>,
+    /// Diagnostics: DAC events that found the FIFO empty (held level),
+    /// and sound-DMA refills triggered at the low mark.
+    pub fifo_underruns: [u64; 2],
+    pub fifo_refills: [u64; 2],
+    pub fifo_pushes: [u64; 2],
     audio_cursor: u64,
     apu: crate::apu::Apu,
     next_event: u64,
@@ -234,6 +239,9 @@ impl MemMap {
             tap_channels: false,
             fifo_tap: [Vec::new(), Vec::new()],
             psg_tap: Vec::new(),
+            fifo_underruns: [0; 2],
+            fifo_refills: [0; 2],
+            fifo_pushes: [0; 2],
             audio_cursor: 0,
             apu: crate::apu::Apu::default(),
             next_event: HBLANK_FLAG_CYCLE,
@@ -481,27 +489,55 @@ impl MemMap {
     /// the hardware DAC, so the tap stays a uniform stream).
     fn drain_fifo(&mut self, f: usize, times: u64, period: u32) {
         for _ in 0..times {
-            if let Some(s) = self.fifo[f].pop_front() {
-                self.fifo_sample[f] = s;
+            match self.fifo[f].pop_front() {
+                Some(s) => self.fifo_sample[f] = s,
+                None => {
+                    self.fifo_underruns[f] += 1;
+                    if std::env::var_os("RECOMP_TRACE_SDMA").is_some()
+                        && f == 0
+                        && self.fifo_underruns[0] % 200 == 1
+                    {
+                        let d = &self.dma[1];
+                        eprintln!(
+                            "underrun#{} clock={} dma1: en={} timing={} repeat={} dst={:08x} src={:08x} cnt_h={:04x}",
+                            self.fifo_underruns[0], self.clock,
+                            d.enabled(), d.timing(), d.repeat(), d.cur_dst, d.cur_src, d.control
+                        );
+                    }
+                }
             }
             if self.tap_channels && self.fifo_tap[f].len() < 0x1_0000 {
                 self.fifo_tap[f].push((self.fifo_sample[f], period));
             }
-        }
-        if self.fifo[f].len() <= 16 {
-            let fifo_addr = 0x0400_00A0 + 4 * f as u32;
-            for ch in 1..=2usize {
-                if self.dma[ch].enabled()
-                    && self.dma[ch].timing() == 3
-                    && self.dma[ch].cur_dst & !3 == fifo_addr
-                {
-                    self.run_dma(ch);
+            // The hardware raises the FIFO DMA request per overflow at
+            // the low mark — refill inside the loop, or a batched timer
+            // catch-up (large `times`) blows through the 32-byte FIFO
+            // and manufactures underruns the hardware never had.
+            if self.fifo[f].len() <= 16 {
+                let fifo_addr = 0x0400_00A0 + 4 * f as u32;
+                for ch in 1..=2usize {
+                    if self.dma[ch].enabled()
+                        && self.dma[ch].timing() == 3
+                        && self.dma[ch].cur_dst & !3 == fifo_addr
+                    {
+                        self.fifo_refills[f] += 1;
+                        if std::env::var_os("RECOMP_TRACE_SDMA").is_some()
+                            && self.fifo_refills[f] % 64 == 1
+                        {
+                            eprintln!(
+                                "sdma f{f} ch{ch} refill#{} src={:08x} clock={}",
+                                self.fifo_refills[f], self.dma[ch].cur_src, self.clock
+                            );
+                        }
+                        self.run_dma(ch);
+                    }
                 }
             }
         }
     }
 
     fn fifo_push(&mut self, f: usize, value: u8) {
+        self.fifo_pushes[f] += 1;
         if self.fifo[f].len() < 64 {
             self.fifo[f].push_back(value as i8);
         }
@@ -540,6 +576,7 @@ impl MemMap {
         let mut src = ch.cur_src & if word { !3 } else { !1 };
         let mut dst = ch.cur_dst & if word { !3 } else { !1 };
 
+        let mut done = 0u32;
         for _ in 0..count {
             if word {
                 let v = self.read32(src);
@@ -558,11 +595,23 @@ impl MemMap {
                 1 => dst.wrapping_sub(unit),
                 _ => dst,
             };
+            done += 1;
+            // Hardware gives the sound FIFO channels priority: they
+            // preempt a long lower-priority transfer mid-flight. Account
+            // the clock chunkwise and service the timers so FIFO DMA can
+            // interleave — otherwise a big graphics/overlay copy starves
+            // the FIFO for its whole duration (audible ~1-2 ms dropouts).
+            if !sound_mode && done % 16 == 0 {
+                self.clock += 32;
+                self.advance_timers();
+            }
         }
 
         self.dma[i].cur_src = src;
-        // Rough cycle cost: 2 cycles per unit transferred plus setup.
-        self.clock += 2 * count as u64 + 4;
+        // Rough cycle cost: 2 cycles per unit transferred plus setup
+        // (minus what the chunked accounting above already added).
+        let accounted = if sound_mode { 0 } else { (count as u64 / 16) * 32 };
+        self.clock += 2 * count as u64 + 4 - accounted;
 
         // An EEPROM request is exactly one DMA; the end of the transfer
         // delimits the serial bitstream.
