@@ -241,7 +241,10 @@ pub fn chrome_strip(p: &egui::Painter, rect: Rect) {
     p.line_segment([rect.left_top(), rect.right_top()], Stroke::new(1.0, white(200)));
 }
 
-/// Classic diagonal hazard stripes, clipped to `rect`.
+/// Classic diagonal hazard stripes, clipped to `rect`. Currently between
+/// users (the A/V video placeholder grew up); kept for the next
+/// under-construction surface.
+#[allow(dead_code)]
 pub fn hazard_stripes(p: &egui::Painter, rect: Rect) {
     let clipped = p.with_clip_rect(rect);
     clipped.rect_filled(rect, CornerRadius::ZERO, tint(INK, 230));

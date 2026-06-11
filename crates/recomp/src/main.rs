@@ -669,7 +669,54 @@ fn cmd_play(args: &[String]) -> Result<(), String> {
         input_config::Device::Keyboard => None,
     };
 
+    // Screen simulation (see crates/screen): temporal response on the
+    // emulated-frame stream, color LUT to the display's colorspace, and a
+    // GPU grid/scaling pass on this same window. Settings come from the
+    // launcher-managed A/V config; unknown values fall back loudly.
+    let screen_kind = screen::ScreenKind::by_name(&av.screen).unwrap_or_else(|| {
+        eprintln!("av.cfg: unknown video.screen {:?} — using frontlit", av.screen);
+        screen::ScreenKind::Frontlit
+    });
+    let display_target = screen::DisplayTarget::by_name(&av.display_gamut)
+        .unwrap_or_else(|| {
+            eprintln!("av.cfg: unknown video.gamut {:?} — using auto", av.display_gamut);
+            screen::DisplayTarget::Auto
+        });
+    let lut = screen::ColorLut::build(&screen::ColorSettings {
+        screen: screen_kind,
+        darken: input_config::AvConfig::knob(&av.screen_darken)
+            .map(f64::from)
+            .unwrap_or(f64::NAN),
+        target: display_target,
+    });
+    let response = screen::ResponseMode::by_name(&av.response).unwrap_or_else(|| {
+        eprintln!("av.cfg: unknown video.response {:?} — using smart", av.response);
+        screen::ResponseMode::Smart
+    });
+    let mut temporal = screen::Temporal::new(
+        240 * 160,
+        response,
+        0,
+        input_config::AvConfig::knob(&av.response_keep)
+            .unwrap_or_else(|| screen::blend::default_rho(screen_kind)),
+    );
+    let grid_params = screen::present::GridParams::with_strength(
+        input_config::AvConfig::knob(&av.grid)
+            .unwrap_or_else(|| screen_kind.default_grid_strength()),
+    );
+    // GPU presenter on this window; if unavailable, the minifb CPU blit
+    // below still carries the full color + response simulation (no grid).
+    let mut presenter =
+        match screen::present::Presenter::new(&window, 240, 160, display_target) {
+            Ok(p) => Some(p),
+            Err(e) => {
+                eprintln!("video: GPU presenter unavailable ({e}); basic scaling active");
+                None
+            }
+        };
+
     let mut buf = vec![0u32; 240 * 160];
+    let mut rgba = vec![[0u8; 4]; 240 * 160];
     let mut emu_ema_ms = 0.0f64;
     let mut frames_run = 0u64;
     let mut slow_warned = false;
@@ -740,6 +787,10 @@ fn cmd_play(args: &[String]) -> Result<(), String> {
                 }
                 None => m.run_frame(5_000_000),
             }
+            // Advance the screen's temporal response once per EMULATED
+            // frame — never per presented frame, or flicker-transparency
+            // titles lock onto one phase (the classic parity bug).
+            temporal.push(&m.bus.framebuffer, &lut);
             // Realtime alarm: the frame budget is 16.7 ms. If smoothed
             // emulation cost approaches it, the product promise is broken —
             // say so once, with the number.
@@ -913,11 +964,25 @@ fn cmd_play(args: &[String]) -> Result<(), String> {
             }
         }
 
-        for (dst, &px) in buf.iter_mut().zip(m.bus.framebuffer.iter()) {
-            let r = (px & 31) as u32;
-            let g = ((px >> 5) & 31) as u32;
-            let b = ((px >> 10) & 31) as u32;
-            *dst = ((r << 3 | r >> 2) << 16) | ((g << 3 | g >> 2) << 8) | (b << 3 | b >> 2);
+        // Resolve the visible image (temporal response + color LUT) and
+        // present: GPU grid/scaling pass when available, otherwise the
+        // plain minifb blit (still fully color-corrected).
+        temporal.compose(&lut, &mut rgba);
+        if let Some(p) = presenter.as_mut() {
+            let phys = p.physical_size(window.get_size());
+            match p.present(&rgba, phys, &grid_params) {
+                Ok(()) => {
+                    window.update();
+                    continue;
+                }
+                Err(e) => {
+                    eprintln!("video: GPU presenter failed ({e}); basic scaling active");
+                    presenter = None;
+                }
+            }
+        }
+        for (dst, px) in buf.iter_mut().zip(rgba.iter()) {
+            *dst = (px[0] as u32) << 16 | (px[1] as u32) << 8 | px[2] as u32;
         }
         window.update_with_buffer(&buf, 240, 160).map_err(|e| e.to_string())?;
     }

@@ -187,18 +187,42 @@ pub fn button_by_name(name: &str) -> Option<Button> {
 /// Audio/video settings, launcher-edited, honored by the play runtime.
 /// Lives in its own file (`av.cfg`) so input and A/V concerns stay
 /// independently versionable.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+///
+/// Video fields are stored as plain strings here (this crate stays
+/// dependency-free); the `screen` crate owns the vocabulary and both
+/// frontends parse through it. "auto" means "the screen model's default".
+#[derive(Clone, PartialEq, Debug)]
 pub struct AvConfig {
     /// The premium audio path (final name TBD): band-limited sinc
     /// resampling, DC blocking, and buffer rate control instead of the
     /// hardware-faithful nearest-neighbor output. Off until the feature
     /// is complete enough to name and ship on by default.
     pub audio_enhanced: bool,
+    /// Screen simulation model: raw | unlit | frontlit | backlit | classic.
+    pub screen: String,
+    /// Viewing-darkness knob for the reflective screens: "auto" or 0..1.
+    pub screen_darken: String,
+    /// Temporal response: off | simple | smart | persistence.
+    pub response: String,
+    /// Persistence carryover: "auto" or 0..0.9.
+    pub response_keep: String,
+    /// Pixel-grid strength: "auto" (per-screen default) or 0..1.
+    pub grid: String,
+    /// Output colorspace: auto | srgb | display-p3.
+    pub display_gamut: String,
 }
 
 impl Default for AvConfig {
     fn default() -> Self {
-        Self { audio_enhanced: false }
+        Self {
+            audio_enhanced: false,
+            screen: "frontlit".into(),
+            screen_darken: "auto".into(),
+            response: "smart".into(),
+            response_keep: "auto".into(),
+            grid: "auto".into(),
+            display_gamut: "auto".into(),
+        }
     }
 }
 
@@ -208,15 +232,44 @@ impl AvConfig {
         for line in text.lines() {
             let line = line.split('#').next().unwrap_or("").trim();
             let Some((k, v)) = line.split_once('=') else { continue };
-            if k.trim() == "audio.enhanced" {
-                cfg.audio_enhanced = v.trim().eq_ignore_ascii_case("true");
+            let v = v.trim();
+            match k.trim() {
+                "audio.enhanced" => cfg.audio_enhanced = v.eq_ignore_ascii_case("true"),
+                "video.screen" => cfg.screen = v.to_ascii_lowercase(),
+                "video.darken" => cfg.screen_darken = v.to_ascii_lowercase(),
+                "video.response" => cfg.response = v.to_ascii_lowercase(),
+                "video.response_keep" => cfg.response_keep = v.to_ascii_lowercase(),
+                "video.grid" => cfg.grid = v.to_ascii_lowercase(),
+                "video.gamut" => cfg.display_gamut = v.to_ascii_lowercase(),
+                _ => {}
             }
         }
         cfg
     }
 
     pub fn serialize(&self) -> String {
-        format!("# gba-recomp a/v settings\naudio.enhanced = {}\n", self.audio_enhanced)
+        format!(
+            "# gba-recomp a/v settings\n\
+             audio.enhanced = {}\n\
+             video.screen = {}\n\
+             video.darken = {}\n\
+             video.response = {}\n\
+             video.response_keep = {}\n\
+             video.grid = {}\n\
+             video.gamut = {}\n",
+            self.audio_enhanced,
+            self.screen,
+            self.screen_darken,
+            self.response,
+            self.response_keep,
+            self.grid,
+            self.display_gamut,
+        )
+    }
+
+    /// "auto" (or anything unparseable) -> None; otherwise the number.
+    pub fn knob(value: &str) -> Option<f32> {
+        value.parse::<f32>().ok().filter(|v| v.is_finite())
     }
 
     /// Load from the default path; missing or unreadable = defaults.
@@ -283,8 +336,34 @@ mod tests {
     #[test]
     fn av_roundtrip_and_default_off() {
         assert!(!AvConfig::default().audio_enhanced);
-        let cfg = AvConfig { audio_enhanced: true };
+        let cfg = AvConfig { audio_enhanced: true, ..AvConfig::default() };
         assert_eq!(AvConfig::parse(&cfg.serialize()), cfg);
-        assert_eq!(AvConfig::parse("junk\naudio.enhanced = TRUE # ok\n"), cfg);
+        assert_eq!(
+            AvConfig::parse("junk\naudio.enhanced = TRUE # ok\n"),
+            cfg,
+            "unknown keys keep defaults"
+        );
+    }
+
+    #[test]
+    fn av_video_roundtrip() {
+        let cfg = AvConfig {
+            screen: "backlit".into(),
+            screen_darken: "0.5".into(),
+            response: "persistence".into(),
+            response_keep: "0.42".into(),
+            grid: "0".into(),
+            display_gamut: "display-p3".into(),
+            ..AvConfig::default()
+        };
+        assert_eq!(AvConfig::parse(&cfg.serialize()), cfg);
+        // Old config files (audio-only) parse to video defaults.
+        let old = AvConfig::parse("audio.enhanced = true\n");
+        assert_eq!(old.screen, "frontlit");
+        assert_eq!(old.response, "smart");
+        // Knob parsing: auto and garbage are None, numbers are Some.
+        assert_eq!(AvConfig::knob("auto"), None);
+        assert_eq!(AvConfig::knob("0.5"), Some(0.5));
+        assert_eq!(AvConfig::knob("nan"), None);
     }
 }

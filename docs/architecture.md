@@ -77,6 +77,42 @@ whole-function dead-flag elimination deletes the majority of flag computations
 AArch64 hosts guest NZCV maps ~1:1 to host flags including the NOT-borrow
 carry convention.
 
+## Presentation & screen simulation
+
+The `screen` crate reproduces, per hardware revision, what the console's
+panels did to the colors developers authored (raw output on a modern
+monitor is famously oversaturated — games were tuned for the panel):
+
+```
+raw BGR555 frames ─→ temporal response ─→ color LUT ─→ grid + scale ─→ present
+   (emulation)        (per EMULATED        (32768-entry  (GPU pass,
+                       frame: flicker       BGR555→RGBA8, band-limited
+                       fusing/persistence)  display-encoded) apertures)
+```
+
+- **Color** is first-principles colorimetry: measured panel primaries
+  (public-domain colorimeter dataset; derivation cross-checked in tests
+  against the dataset's published transform) → XYZ → the display's
+  colorspace. Two panel gamuts exist (reflective/frontlit family vs the
+  near-sRGB late backlit revision); a continuous darken knob spans the
+  unlit↔lit tone response (2.2→3.8 pure power law).
+- **Display targeting**: on macOS the surface's layer is colorspace-tagged
+  so the compositor color-matches per monitor (wide-gamut laptop panels
+  included); elsewhere sRGB is the SDR assumption with a manual wide-gamut
+  override. The panel gamuts sit entirely inside sRGB — accuracy is about
+  correct mapping, not wide gamut.
+- **Temporal response** advances on the emulated-frame stream, never
+  presented frames (frame-skip parity is the classic bug); flicker-based
+  transparency in many titles makes this a correctness feature.
+- **Grid** is a clean-room band-limited implementation (analytic aperture
+  integration per output pixel): moiré-free at any window scale, BGR
+  subpixel stripe order, fades out below ~2× scale.
+- **Pacing**: presentation never paces emulation (audio clock owns speed);
+  the GPU surface presents without vsync blocking. Frame hashes / verify /
+  sweeps stay defined on raw BGR555 — the pipeline is present-time only.
+- Fallback: if no GPU surface is available, the CPU blit path keeps the
+  full color + response simulation (no grid) and says so on stderr.
+
 ## Platform & distribution
 
 - macOS/Windows/Linux: tool + runtime distributed (binaries via CI); user
