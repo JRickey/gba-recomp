@@ -254,11 +254,27 @@ fn cmd_frames(args: &[String]) -> Result<(), String> {
         m.bus.tap_channels = true;
         eprintln!("hle: {}", arm_audio_hle(&mut m));
     }
+    // Diagnostic (RECOMP_COST_FROM=N): from frame N on, attribute charged
+    // cycles to the PC that incurred them; dump the histogram at exit.
+    let cost_from: Option<u64> = std::env::var("RECOMP_COST_FROM").ok().and_then(|v| v.parse().ok());
+    let mut cost: std::collections::HashMap<u32, u64> = std::collections::HashMap::new();
     for _ in 0..frames {
         if demo {
             m.bus.keys = demo_keys(m.bus.frames);
         }
-        m.run_frame(5_000_000);
+        if cost_from.is_some_and(|n| m.bus.frames >= n) {
+            m.bus.frame_ready = false;
+            let mut steps = 0u64;
+            while !m.bus.frame_ready && steps < 5_000_000 {
+                let pc = m.cpu.regs[15];
+                let c0 = m.bus.clock;
+                m.step();
+                *cost.entry(pc).or_insert(0) += m.bus.clock - c0;
+                steps += 1;
+            }
+        } else {
+            m.run_frame(5_000_000);
+        }
         if dump_audio.is_some() {
             mixed.extend(m.bus.audio_buf.drain(..));
             psg.extend(m.bus.psg_tap.drain(..));
@@ -268,6 +284,15 @@ fn cmd_frames(args: &[String]) -> Result<(), String> {
         }
         if mp2k_on {
             hle.extend(m.bus.hle_tap.drain(..));
+        }
+    }
+    if !cost.is_empty() {
+        let mut v: Vec<(u32, u64)> = cost.into_iter().collect();
+        v.sort_by_key(|&(_, c)| std::cmp::Reverse(c));
+        let total: u64 = v.iter().map(|&(_, c)| c).sum();
+        eprintln!("COST total={total} cycles over traced frames; top PCs:");
+        for (pc, c) in v.iter().take(40) {
+            eprintln!("  COST {pc:08x} {c}");
         }
     }
     if let Some(h) = m.bus.mp2k.as_deref() {
@@ -920,8 +945,9 @@ fn status_line(s: &str) {
 /// RAM snapshots) into the translation, so HLE/core fixes count too.
 /// Rev history: 1 = initial; 2 = HuffUnComp HLE, whole-block RAM
 /// guards, conditional-BL link fix; 3 = MidiKey2Freq HLE + sound
-/// FIFO/DMA timing fixes (profiled state shifts).
-const TRANSLATION_REV: u32 = 3;
+/// FIFO/DMA timing fixes (profiled state shifts); 4 = SWI ends blocks
+/// (halt ordering vs following instructions — scanline-effect timing).
+const TRANSLATION_REV: u32 = 4;
 
 /// Locate (or build) the cached native translation for this image.
 /// Cache key is the ROM's SHA-256 under the `TRANSLATION_REV` directory,
@@ -1745,13 +1771,59 @@ fn cmd_runc(args: &[String]) -> Result<(), String> {
 
     let mut native_blocks = 0u64;
     let mut fallback_steps = 0u64;
+    // Diagnostic (RECOMP_COST_FROM=N): from frame N on, attribute charged
+    // cycles to the dispatch key (block entry or interp PC) that incurred
+    // them; dump the histogram at exit.
+    let cost_from: Option<u64> = std::env::var("RECOMP_COST_FROM").ok().and_then(|v| v.parse().ok());
+    let mut cost: std::collections::HashMap<u32, u64> = std::collections::HashMap::new();
     while m.bus.frames < frames {
         let before = m.bus.frames;
-        let (n, f) = run_frame_native(&mut m, &table, mptr, FRAME_STEP_GUARD);
-        native_blocks += n;
-        fallback_steps += f;
+        if cost_from.is_some_and(|n| m.bus.frames >= n) {
+            use gba_core::capi::RT_API;
+            m.bus.frame_ready = false;
+            let mut steps = 0u64;
+            while !m.bus.frame_ready && steps < FRAME_STEP_GUARD {
+                steps += 1;
+                let pc = m.cpu.regs[15];
+                let c0 = m.bus.clock;
+                if m.bus.halted
+                    || (m.cpu.regs[15] == gba_core::machine::IRQ_RETURN_ADDR
+                        && m.cpu.mode() == gba_core::Mode::Irq)
+                    || (m.bus.irq_pending() && !m.cpu.flag(gba_core::cpu::FLAG_I))
+                {
+                    m.step();
+                    *cost.entry(pc).or_insert(0) += m.bus.clock - c0;
+                    continue;
+                }
+                let key = m.cpu.regs[15] | m.cpu.thumb() as u32;
+                match table.get(key) {
+                    Some(f) => {
+                        f(&RT_API, mptr);
+                        native_blocks += 1;
+                    }
+                    None => {
+                        m.step();
+                        fallback_steps += 1;
+                    }
+                }
+                *cost.entry(pc).or_insert(0) += m.bus.clock - c0;
+            }
+        } else {
+            let (n, f) = run_frame_native(&mut m, &table, mptr, FRAME_STEP_GUARD);
+            native_blocks += n;
+            fallback_steps += f;
+        }
         if m.bus.frames == before {
             return Err("step guard exceeded".into());
+        }
+    }
+    if !cost.is_empty() {
+        let mut v: Vec<(u32, u64)> = cost.into_iter().collect();
+        v.sort_by_key(|&(_, c)| std::cmp::Reverse(c));
+        let total: u64 = v.iter().map(|&(_, c)| c).sum();
+        eprintln!("COST total={total} cycles over traced frames; top PCs:");
+        for (pc, c) in v.iter().take(40) {
+            eprintln!("  COST {pc:08x} {c}");
         }
     }
 

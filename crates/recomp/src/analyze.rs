@@ -110,6 +110,15 @@ fn ends_block(instr: &Instr) -> bool {
             | Op::Bx { .. }
             | Op::ThumbBlLow { .. }
             | Op::Undefined { .. }
+            // SWI is a control transfer: Halt-class calls flip machine
+            // sleep state that must gate execution of the NEXT
+            // instruction (the dispatch loop owns halt/IRQ interleaving).
+            // Emitting it mid-block reorders the following instructions
+            // ahead of the halt — a spin-on-flag loop after `swi Halt`
+            // then reads its flag before sleeping and the trailing halt
+            // eats real time after wake (3d624dba intro scanline
+            // effects landed 125 lines late).
+            | Op::Swi { .. }
     ) || matches!(instr.op, Op::Alu { rd, .. } if rd == PC)
         || matches!(instr.op, Op::Mem { load: true, rd, .. } if rd == PC)
         || matches!(instr.op, Op::BlockMem { load: true, rlist, .. } if rlist & (1 << PC) != 0)
