@@ -171,11 +171,11 @@ impl<'a> MemView<'a> {
         region.get(off..off.checked_add(len)?)
     }
 
-    fn u8(&self, addr: u32) -> Option<u8> {
+    pub fn u8(&self, addr: u32) -> Option<u8> {
         self.slice(addr, 1).map(|s| s[0])
     }
 
-    fn u32(&self, addr: u32) -> Option<u32> {
+    pub fn u32(&self, addr: u32) -> Option<u32> {
         self.slice(addr, 4).map(|s| u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
     }
 }
@@ -232,152 +232,6 @@ impl Default for Voice {
     }
 }
 
-/// Differential self-check: our shadow mix vs the canon FIFO DAC
-/// stream (which keeps running underneath). Raw-sample correlation is
-/// the wrong tool here — the canon stream is an 8-bit ZOH staircase
-/// whose image energy decorrelates from a clean render, and tonal
-/// content flips sign within a couple of ms of lag error. What we
-/// police is *structure*: the same notes at the same loudness at the
-/// same time. So both streams are rectified and lowpassed into
-/// envelopes, decimated, and Pearson-correlated over a coarse lag
-/// range covering the driver's DMA pipeline delay.
-struct SelfCheck {
-    /// One-pole envelope followers (per side, canon and shadow).
-    lp_x: (f32, f32),
-    lp_y: (f32, f32),
-    /// Decimated envelopes for the current window.
-    ex: Vec<(f32, f32)>,
-    ey: Vec<(f32, f32)>,
-    phase: u32,
-    strikes: u32,
-    /// Most recent windowed correlation and level ratio (diagnostics).
-    pub last_r: f32,
-    pub last_ratio: f32,
-}
-
-/// Envelope decimation: one entry per 64 grid samples (~1 ms).
-const DECIM: u32 = 64;
-/// Window: 1 s (1024 decimated entries).
-const CHECK_WINDOW: usize = 1024;
-/// Lag search 0..=56 decimated steps (~3.5 driver frames), step 2.
-const CHECK_MAX_LAG: usize = 56;
-/// Envelope follower pole (~80 Hz at the grid rate).
-const ENV_ALPHA: f32 = 0.0075;
-/// Windows whose canon envelope mean is below this carry no verdict.
-const CHECK_MIN_LEVEL: f32 = 0.002;
-/// Sustained correlation below this reverts the HLE.
-const CHECK_MIN_R: f32 = 0.5;
-const CHECK_MAX_STRIKES: u32 = 3;
-
-impl SelfCheck {
-    fn new() -> SelfCheck {
-        SelfCheck {
-            lp_x: (0.0, 0.0),
-            lp_y: (0.0, 0.0),
-            ex: Vec::with_capacity(CHECK_WINDOW),
-            ey: Vec::with_capacity(CHECK_WINDOW),
-            phase: 0,
-            strikes: 0,
-            last_r: 0.0,
-            last_ratio: 0.0,
-        }
-    }
-
-    /// Feed one grid sample; returns Some((best_r, level_ratio)) at
-    /// window ends that produced a verdict.
-    fn push(&mut self, canon: (f32, f32), shadow: (f32, f32)) -> Option<(f32, f32)> {
-        self.lp_x.0 += ENV_ALPHA * (canon.0.abs() - self.lp_x.0);
-        self.lp_x.1 += ENV_ALPHA * (canon.1.abs() - self.lp_x.1);
-        self.lp_y.0 += ENV_ALPHA * (shadow.0.abs() - self.lp_y.0);
-        self.lp_y.1 += ENV_ALPHA * (shadow.1.abs() - self.lp_y.1);
-        self.phase += 1;
-        if self.phase < DECIM {
-            return None;
-        }
-        self.phase = 0;
-        self.ex.push(self.lp_x);
-        self.ey.push(self.lp_y);
-        if self.ex.len() < CHECK_WINDOW {
-            return None;
-        }
-
-        // The canon stream lags the shadow (mix-ahead + FIFO depth):
-        // correlate canon[t] against shadow[t - lag], lag >= 0.
-        let n = CHECK_WINDOW - CHECK_MAX_LAG;
-        let mean = |v: &[(f32, f32)], side: usize| -> f64 {
-            v.iter().map(|e| if side == 0 { e.0 as f64 } else { e.1 as f64 }).sum::<f64>()
-                / v.len() as f64
-        };
-        let canon_level = (mean(&self.ex, 0) + mean(&self.ex, 1)) / 2.0;
-        let shadow_level = (mean(&self.ey, 0) + mean(&self.ey, 1)) / 2.0;
-        let mut verdict: Option<(f32, f32)> = None;
-        if canon_level >= CHECK_MIN_LEVEL as f64 {
-            let ratio = (shadow_level / canon_level) as f32;
-            // Does the canon envelope carry structure at all this
-            // window (vs a held constant amplitude)?
-            let canon_var: f64 = {
-                let m0 = mean(&self.ex, 0);
-                let m1 = mean(&self.ex, 1);
-                self.ex
-                    .iter()
-                    .map(|e| {
-                        let a = e.0 as f64 - m0;
-                        let b = e.1 as f64 - m1;
-                        a * a + b * b
-                    })
-                    .sum::<f64>()
-                    / self.ex.len() as f64
-            };
-            if canon_var <= 1e-10 {
-                // Flat canon: nothing to correlate — level is the whole
-                // verdict (r reported as 1, the gate is the ratio).
-                verdict = Some((1.0, ratio));
-            } else {
-                let mut best: Option<f32> = None;
-                for lag in (0..=CHECK_MAX_LAG).step_by(2) {
-                    let mut sum = 0.0;
-                    let mut sides = 0;
-                    for side in 0..2 {
-                        let x: Vec<f64> = self.ex[CHECK_MAX_LAG..CHECK_WINDOW]
-                            .iter()
-                            .map(|e| if side == 0 { e.0 as f64 } else { e.1 as f64 })
-                            .collect();
-                        let y: Vec<f64> = self.ey[CHECK_MAX_LAG - lag..CHECK_WINDOW - lag]
-                            .iter()
-                            .map(|e| if side == 0 { e.0 as f64 } else { e.1 as f64 })
-                            .collect();
-                        let mx = x.iter().sum::<f64>() / n as f64;
-                        let my = y.iter().sum::<f64>() / n as f64;
-                        let mut cov = 0.0;
-                        let mut vx = 0.0;
-                        let mut vy = 0.0;
-                        for (a, b) in x.iter().zip(&y) {
-                            cov += (a - mx) * (b - my);
-                            vx += (a - mx) * (a - mx);
-                            vy += (b - my) * (b - my);
-                        }
-                        if vx > 1e-12 && vy > 1e-12 {
-                            sum += cov / (vx * vy).sqrt();
-                            sides += 1;
-                        }
-                    }
-                    if sides > 0 {
-                        let r = (sum / sides as f64) as f32;
-                        best = Some(best.map_or(r, |b: f32| b.max(r)));
-                    }
-                }
-                // A structured canon with a flat shadow (best=None) is
-                // the silent-desync failure class — that IS a verdict,
-                // the worst one, not an abstention.
-                verdict = Some((best.unwrap_or(0.0), ratio));
-            }
-        }
-        self.ex.clear();
-        self.ey.clear();
-        verdict
-    }
-}
-
 /// The MP2K HLE shadow mixer. Lives on the bus; fed by the dispatch
 /// hook (`frame_hook`) and the audio grid (`render`).
 pub struct Mp2kHle {
@@ -391,9 +245,6 @@ pub struct Mp2kHle {
     /// Saw at least one valid live tick (magic OK) — the frontend
     /// substitutes only after this.
     pub engaged: bool,
-    /// Set once on revert with the reason; the frontend surfaces it
-    /// loudly (DEGRADED) and falls back to the per-channel path.
-    pub reverted: Option<String>,
     /// Diagnostics: hooks seen, ticks skipped (magic not live), voices
     /// killed by wave validation.
     pub hooks: u64,
@@ -410,27 +261,12 @@ pub struct Mp2kHle {
     dma_period: u8,
     ring: Vec<(f32, f32)>,
     ring_pos: usize,
-    check: SelfCheck,
-    /// Differentially calibrated output gain (1.0 = stock scale) and
-    /// the probation bookkeeping that derives it.
-    gain: f32,
-    calibrated: bool,
-    ratio_hist: [f32; 3],
-    ratio_n: u32,
-    /// At least one self-check window passed all gates — the frontend
-    /// substitutes only proven streams (never loud-wrong audio).
-    pub proven: bool,
-    /// Pause-and-reprobe machinery: a failing stream PAUSES (proven
-    /// cleared, substitution crossfades back to the per-channel path)
-    /// and keeps probing; each pause escalates how many consecutive
-    /// clean windows re-proving requires, so a flapper converges to
-    /// the fallback while a track change gets a fresh chance.
-    prove_need: u32,
-    consec_pass: u32,
-    pub pauses: u64,
+    /// Shared differential verification (correlation gates, auto-gain,
+    /// pause-and-reprobe).
+    pub vf: crate::shadow::Verifier,
     /// Note-on `count` semantics differ by driver revision (stale
     /// residue vs real sample offset). The oracle searches: alternate
-    /// the mode on structure-failure pauses and let correlation pick.
+    /// the mode on structure-failure windows and let correlation pick.
     count_mode: u8,
     mode_dwell: u32,
     /// Grid samples per guest mixer output sample (65536/pcmFreq).
@@ -455,7 +291,6 @@ impl Mp2kHle {
             hook_n,
             active: true,
             engaged: false,
-            reverted: None,
             hooks: 0,
             stale_ticks: 0,
             bad_waves: 0,
@@ -469,15 +304,7 @@ impl Mp2kHle {
             ring_pos: 0,
             reverb: 0,
             dma_period: 7,
-            check: SelfCheck::new(),
-            gain: 1.0,
-            calibrated: false,
-            ratio_hist: [0.0; 3],
-            ratio_n: 0,
-            proven: false,
-            prove_need: 1,
-            consec_pass: 0,
-            pauses: 0,
+            vf: crate::shadow::Verifier::new(),
             count_mode: 0,
             mode_dwell: 0,
             mix_step: 65536.0 / 13379.0,
@@ -488,19 +315,6 @@ impl Mp2kHle {
     #[inline(always)]
     pub fn hook_match(&self, key: u32) -> bool {
         self.hook_keys[..self.hook_n as usize].contains(&key)
-    }
-
-    /// Pause substitution (NOT a permanent revert): clear proven so
-    /// the frontend crossfades back to the per-channel path, escalate
-    /// the re-prove requirement, and keep rendering + self-checking —
-    /// the next track may pass, and the transitions are inaudible.
-    fn pause(&mut self, reason: String) {
-        self.proven = false;
-        self.consec_pass = 0;
-        self.check.strikes = 0;
-        self.prove_need = (self.prove_need * 2).min(16);
-        self.pauses += 1;
-        self.reverted = Some(reason);
     }
 
     /// Per-tick hook: PC just landed on SoundMainRAM, so the track
@@ -756,7 +570,7 @@ impl Mp2kHle {
     /// armed, engaged, and at least one fully passing self-check
     /// window behind it (level + structure proven on this title).
     pub fn live(&self) -> bool {
-        self.active && self.engaged && self.proven
+        self.active && self.engaged && self.vf.proven
     }
 
     /// Render one grid sample: (left, right) in the bus float scale
@@ -790,6 +604,7 @@ impl Mp2kHle {
         // under-correlates against it (a comparison-domain artifact,
         // verified by disassembling a shipping mixer).
         let (mut chk_r, mut chk_l) = (right, left);
+        let gain = self.vf.gain();
         for v in self.voices.iter_mut() {
             if !v.on {
                 continue;
@@ -805,10 +620,10 @@ impl Mp2kHle {
             }
             let gr = v.g0.0 + (v.g1.0 - v.g0.0) * t;
             let gl = v.g0.1 + (v.g1.1 - v.g0.1) * t;
-            right += s * gr * self.gain;
-            left += s * gl * self.gain;
-            chk_r += v.chk_hold * v.g0.0 * self.gain;
-            chk_l += v.chk_hold * v.g0.1 * self.gain;
+            right += s * gr * gain;
+            left += s * gl * gain;
+            chk_r += v.chk_hold * v.g0.0 * gain;
+            chk_l += v.chk_hold * v.g0.1 * gain;
         }
 
         // The guest mixer saturates its 8-bit buffer; its reverb
@@ -826,89 +641,23 @@ impl Mp2kHle {
         // programming). Sustained divergence means our shadow does not
         // match what the game's own mixer produced — revert loudly.
         let canon_rl = (canon[0] as f32 / 128.0, canon[1] as f32 / 128.0);
-        if let Some((r, ratio)) = self.check.push(canon_rl, sat) {
-            self.check.last_r = r;
-            self.check.last_ratio = ratio;
-            // Probation auto-calibration: strong structure with a
-            // stable off-band level means this driver revision scales
-            // its mixer by a constant factor (a ~2x cluster exists
-            // empirically across first-party-era titles) — measure the
-            // factor from the canon stream and adopt it, instead of
-            // striking. Trusted only because correlation already
-            // proves the structure; the normal gates keep policing the
-            // calibrated stream afterwards, and the gain is also what
-            // correct PCM/PSG balance requires (the substituted stream
-            // must sit at canon loudness relative to the LLE PSG).
-            if !self.calibrated
-                && r >= 0.7
-                && !(0.85..=1.15).contains(&ratio)
-                && (0.2..=5.0).contains(&ratio)
-                && self.ratio_n < 6
+        match self.vf.judge(canon_rl, sat) {
+            crate::shadow::Judgement::Fail { structure_at_sane_level: true }
+                if !self.vf.proven =>
             {
-                self.ratio_hist[(self.ratio_n % 3) as usize] = ratio;
-                self.ratio_n += 1;
-                if self.ratio_n >= 3 {
-                    let m =
-                        (self.ratio_hist[0] + self.ratio_hist[1] + self.ratio_hist[2]) / 3.0;
-                    if self.ratio_hist.iter().all(|x| (x / m - 1.0).abs() < 0.1) {
-                        self.gain = (self.gain / m).clamp(0.25, 4.0);
-                        self.calibrated = true;
-                        self.check.strikes = 0;
-                    }
-                }
-                return (left * 0.25, right * 0.25);
-            }
-            // Two failure axes: structure (correlation) and level
-            // (envelope ratio — scale-invariant correlation alone would
-            // bless a mixer whose volume math is wrong for this driver
-            // version). The canon's 8-bit per-voice truncation makes it
-            // genuinely quieter than the ideal mix on quiet content, so
-            // the band is asymmetric and generous.
-            // Legitimate ratio spread is narrow: canon per-voice
-            // truncation and ZOH-image energy move it ~+-30%; a 2x
-            // offset means this driver revision scales volume
-            // differently and substituting would be wrong-but-pretty.
-            let level_ok = (0.55..=1.6).contains(&ratio);
-            let window_ok = r >= CHECK_MIN_R && level_ok;
-            if self.proven {
-                // Live: police with the strike ratchet, then pause —
-                // the frontend crossfades back to the per-channel path
-                // and probing continues.
-                if window_ok {
-                    self.check.strikes = self.check.strikes.saturating_sub(1);
-                } else {
-                    self.check.strikes += 1;
-                    if self.check.strikes >= CHECK_MAX_STRIKES {
-                        self.pause(format!(
-                            "shadow/canon correlation {r:.2}, level ratio {ratio:.2} \
-                             (driver variant or unsupported feature)"
-                        ));
-                    }
-                }
-            } else if window_ok {
-                // Probing: substitution starts only after enough
-                // consecutive clean windows (escalates per pause).
-                self.consec_pass += 1;
-                if self.consec_pass >= self.prove_need {
-                    self.proven = true;
-                    self.check.strikes = 0;
-                }
-            } else {
-                self.consec_pass = 0;
-                // Structure failure at a sane level: search the known
-                // behavior axis — note-on `count` semantics split
-                // driver revisions, and the differential is the oracle
-                // that picks the right one for this image. Two failing
-                // windows per mode before flipping, so each candidate
-                // gets notes struck under it.
-                if r < CHECK_MIN_R && level_ok {
-                    self.mode_dwell += 1;
-                    if self.mode_dwell >= 2 {
-                        self.count_mode ^= 1;
-                        self.mode_dwell = 0;
-                    }
+                // Structure failure at a sane level while probing:
+                // search the known behavior axis — note-on `count`
+                // semantics split driver revisions, and the
+                // differential is the oracle that picks the right one
+                // for this image. Two failing windows per mode.
+                self.mode_dwell += 1;
+                if self.mode_dwell >= 2 {
+                    self.count_mode ^= 1;
+                    self.mode_dwell = 0;
                 }
             }
+            crate::shadow::Judgement::Pass => self.mode_dwell = 0,
+            _ => {}
         }
 
         (left * 0.25, right * 0.25)
@@ -916,12 +665,12 @@ impl Mp2kHle {
 
     /// Most recent self-check correlation and level ratio (diagnostics).
     pub fn last_correlation(&self) -> (f32, f32) {
-        (self.check.last_r, self.check.last_ratio)
+        self.vf.last()
     }
 
     /// Calibrated output gain (1.0 = stock scale).
     pub fn gain(&self) -> f32 {
-        self.gain
+        self.vf.gain()
     }
 
     /// Note-on semantics the oracle currently selects (0 = start at

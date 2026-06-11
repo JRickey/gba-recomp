@@ -252,19 +252,7 @@ fn cmd_frames(args: &[String]) -> Result<(), String> {
     let mp2k_on = std::env::var_os("RECOMP_MP2K").is_some();
     if mp2k_on {
         m.bus.tap_channels = true;
-        let sigs = gba_core::mp2k::detect(&m.bus.rom);
-        if sigs.is_empty() {
-            eprintln!("mp2k: no stock driver signature");
-        } else {
-            eprintln!(
-                "mp2k: driver detected, SoundMainRAM {}",
-                sigs.iter()
-                    .map(|s| format!("{:#010x}", s.sound_main_ram & !1))
-                    .collect::<Vec<_>>()
-                    .join("/")
-            );
-            m.bus.mp2k = Some(Box::new(gba_core::mp2k::Mp2kHle::new(&sigs)));
-        }
+        eprintln!("hle: {}", arm_audio_hle(&mut m));
     }
     for _ in 0..frames {
         if demo {
@@ -291,13 +279,31 @@ fn cmd_frames(args: &[String]) -> Result<(), String> {
             h.bad_waves,
             h.gain(),
             h.count_mode(),
-            h.pauses,
-            h.proven,
+            h.vf.pauses,
+            h.vf.proven,
             h.engaged,
             h.active,
-            h.reverted
+            h.vf.reverted
                 .as_deref()
-                .map(|m| format!(" REVERTED: {m}"))
+                .map(|m| format!(" PAUSED: {m}"))
+                .unwrap_or_default()
+        );
+    }
+    if let Some(g) = m.bus.gax.as_deref() {
+        let (corr, ratio) = g.last_correlation();
+        eprintln!(
+            "gax: hooks={} stale={} bad_waves={} corr={corr:.3} ratio={ratio:.2} gain={:.2} pauses={} proven={} engaged={} active={}{}",
+            g.hooks,
+            g.stale_ticks,
+            g.bad_waves,
+            g.gain(),
+            g.vf.pauses,
+            g.vf.proven,
+            g.engaged,
+            g.active,
+            g.vf.reverted
+                .as_deref()
+                .map(|m| format!(" PAUSED: {m}"))
                 .unwrap_or_default()
         );
     }
@@ -438,6 +444,42 @@ fn cmd_mp2k_scan(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+
+/// Arm the appropriate engine HLE shadow for this image (enhanced
+/// path). Returns a description line for diagnostics.
+fn arm_audio_hle(m: &mut Machine) -> String {
+    match gba_core::engine::classify(&m.bus.rom) {
+        gba_core::engine::Engine::M4a(sigs) => {
+            let desc = format!(
+                "M4A/MP2K — HLE shadow armed (SoundMainRAM {})",
+                sigs.iter()
+                    .map(|s| format!("{:#010x}", s.sound_main_ram & !1))
+                    .collect::<Vec<_>>()
+                    .join("/")
+            );
+            m.bus.mp2k = Some(Box::new(gba_core::mp2k::Mp2kHle::new(&sigs)));
+            desc
+        }
+        gba_core::engine::Engine::Gax(ver) => {
+            if let Some(sig) = gba_core::gax::detect_v1(&m.bus.rom) {
+                let desc = "GAX v1 lineage — HLE shadow armed (state block located at runtime)"
+                    .to_string();
+                m.bus.gax = Some(Box::new(gba_core::gax::GaxHle::new(sig)));
+                desc
+            } else {
+                format!(
+                    "GAX {} — per-channel enhancement active (this revision's HLE pending)",
+                    ver.as_deref().unwrap_or("(early)")
+                )
+            }
+        }
+        other => format!(
+            "{} — per-channel enhancement active (engine HLE not yet available)",
+            other.describe()
+        ),
+    }
+}
+
 /// Dev triage: audio-engine classification over a ROM or directory.
 fn cmd_engine_scan(args: &[String]) -> Result<(), String> {
     let target = args.first().ok_or("missing ROM or directory")?;
@@ -570,22 +612,8 @@ fn cmd_play(args: &[String]) -> Result<(), String> {
     // is present. It engages on the first live driver tick and reverts
     // loudly if its output stops matching the canon FIFO stream.
     if av.audio_enhanced {
-        match gba_core::engine::classify(&m.bus.rom) {
-            gba_core::engine::Engine::M4a(sigs) => {
-                eprintln!(
-                    "audio engine: M4A/MP2K — HLE shadow mixer armed (SoundMainRAM {})",
-                    sigs.iter()
-                        .map(|s| format!("{:#010x}", s.sound_main_ram & !1))
-                        .collect::<Vec<_>>()
-                        .join("/")
-                );
-                m.bus.mp2k = Some(Box::new(gba_core::mp2k::Mp2kHle::new(&sigs)));
-            }
-            other => eprintln!(
-                "audio engine: {} — per-channel enhancement active (engine HLE not yet available)",
-                other.describe()
-            ),
-        }
+        let desc = arm_audio_hle(&mut m);
+        eprintln!("audio engine: {desc}");
     }
     let streams = std::sync::Arc::new(std::sync::Mutex::new(AudioStreams::default()));
     let _stream = start_audio(streams.clone(), av.audio_enhanced);
@@ -771,18 +799,24 @@ fn cmd_play(args: &[String]) -> Result<(), String> {
                     // diagnostic event (the crossfade keeps it
                     // inaudible) — say so, with the reason, but don't
                     // let a hopeless variant spam the log forever.
-                    let live = m.bus.mp2k.as_deref().is_some_and(|h| h.live());
-                    if let Some(h) = m.bus.mp2k.as_deref_mut() {
-                        if let Some(msg) = h.reverted.take() {
-                            if h.pauses <= 3 {
-                                eprintln!(
-                                    "DEGRADED: MP2K HLE paused (probing continues): {msg}"
-                                );
-                            } else if h.pauses == 4 {
-                                eprintln!(
-                                    "DEGRADED: MP2K HLE paused again: {msg}                                      (further pauses unlogged)"
-                                );
-                            }
+                    let live = m.bus.mp2k.as_deref().is_some_and(|h| h.live())
+                        || m.bus.gax.as_deref().is_some_and(|g| g.live());
+                    let pause_msg = if let Some(h) = m.bus.mp2k.as_deref_mut() {
+                        h.vf.reverted.take().map(|m| (m, h.vf.pauses))
+                    } else if let Some(g) = m.bus.gax.as_deref_mut() {
+                        g.vf.reverted.take().map(|m| (m, g.vf.pauses))
+                    } else {
+                        None
+                    };
+                    if let Some((msg, pauses)) = pause_msg {
+                        if pauses <= 3 {
+                            eprintln!(
+                                "DEGRADED: engine HLE paused (probing continues): {msg}"
+                            );
+                        } else if pauses == 4 {
+                            eprintln!(
+                                "DEGRADED: engine HLE paused again: {msg} (further pauses unlogged)"
+                            );
                         }
                     }
                     // Feed the HLE ring only while live — an unproven
@@ -1631,6 +1665,11 @@ fn run_frame_native(
                 m.bus.mp2k_frame_hook(key);
             }
         }
+        if let Some(g) = m.bus.gax.as_deref() {
+            if g.hook_match(key) {
+                m.bus.gax_frame_hook();
+            }
+        }
         match table.get(key) {
             Some(f) => {
                 // Diagnostic: census of executed IWRAM natives.
@@ -1694,12 +1733,7 @@ fn cmd_runc(args: &[String]) -> Result<(), String> {
     // hook-at-block-boundary path play uses, validated headless here.
     if std::env::var_os("RECOMP_MP2K").is_some() {
         m.bus.tap_channels = true;
-        let sigs = gba_core::mp2k::detect(&m.bus.rom);
-        if sigs.is_empty() {
-            eprintln!("mp2k: no stock driver signature");
-        } else {
-            m.bus.mp2k = Some(Box::new(gba_core::mp2k::Mp2kHle::new(&sigs)));
-        }
+        eprintln!("hle: {}", arm_audio_hle(&mut m));
     }
     let mptr = &mut m as *mut Machine as *mut std::ffi::c_void;
 
@@ -1736,13 +1770,31 @@ fn cmd_runc(args: &[String]) -> Result<(), String> {
             h.bad_waves,
             h.gain(),
             h.count_mode(),
-            h.pauses,
-            h.proven,
+            h.vf.pauses,
+            h.vf.proven,
             h.engaged,
             h.active,
-            h.reverted
+            h.vf.reverted
                 .as_deref()
-                .map(|m| format!(" REVERTED: {m}"))
+                .map(|m| format!(" PAUSED: {m}"))
+                .unwrap_or_default()
+        );
+    }
+    if let Some(g) = m.bus.gax.as_deref() {
+        let (corr, ratio) = g.last_correlation();
+        eprintln!(
+            "gax: hooks={} stale={} bad_waves={} corr={corr:.3} ratio={ratio:.2} gain={:.2} pauses={} proven={} engaged={} active={}{}",
+            g.hooks,
+            g.stale_ticks,
+            g.bad_waves,
+            g.gain(),
+            g.vf.pauses,
+            g.vf.proven,
+            g.engaged,
+            g.active,
+            g.vf.reverted
+                .as_deref()
+                .map(|m| format!(" PAUSED: {m}"))
                 .unwrap_or_default()
         );
     }

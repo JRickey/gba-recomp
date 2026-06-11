@@ -183,6 +183,9 @@ pub struct MemMap {
     /// was detected and the enhanced path is on. The dispatch loops
     /// call `mp2k_frame_hook` when PC lands on `SoundMainRAM`.
     pub mp2k: Option<Box<crate::mp2k::Mp2kHle>>,
+    /// GAX v1 HLE shadow mixer (same contract as `mp2k`; at most one
+    /// engine shadow is armed per session).
+    pub gax: Option<Box<crate::gax::GaxHle>>,
     /// Shadow-mixer stereo output on the tap grid (interleaved L, R;
     /// hardware-rail units scaled to ±0.5 like the play-side floats).
     pub hle_tap: Vec<f32>,
@@ -248,6 +251,7 @@ impl MemMap {
             fifo_tap: [Vec::new(), Vec::new()],
             psg_tap: Vec::new(),
             mp2k: None,
+            gax: None,
             hle_tap: Vec::new(),
             fifo_underruns: [0; 2],
             fifo_refills: [0; 2],
@@ -334,9 +338,10 @@ impl MemMap {
     /// gap collapse into one held ledge (an audible thump per gap).
     fn pump_audio(&mut self, until: u64) {
         let until = until.min(self.clock);
-        // The shadow mixer renders on the same grid; hoisted out of
-        // `self` so it can read guest memory while we mutate the taps.
+        // The shadow mixers render on the same grid; hoisted out of
+        // `self` so they can read guest memory while we mutate the taps.
         let mut mp2k = self.mp2k.take();
+        let mut gax = self.gax.take();
         while self.audio_cursor <= until {
             // Mix Direct Sound DAC levels with the PSG channels into a
             // stereo pair, honoring the SOUNDCNT routing the hardware
@@ -393,10 +398,47 @@ impl MemMap {
                         }
                     }
                 }
+                if let Some(g) = gax.as_deref_mut() {
+                    if g.active {
+                        let mem = crate::mp2k::MemView {
+                            rom: &self.rom,
+                            ewram: &self.ewram,
+                            iwram: &self.iwram,
+                        };
+                        if !g.engaged {
+                            // The driver initializes some time into
+                            // boot; probe until its function pointers
+                            // appear and verify against the known
+                            // mixer family.
+                            g.try_engage(&mem);
+                        } else {
+                            let (hl, hr) = g.render(&mem, self.fifo_sample);
+                            if self.hle_tap.len() < 0x2_0000 {
+                                self.hle_tap.push(hl);
+                                self.hle_tap.push(hr);
+                            }
+                        }
+                    }
+                }
             }
             self.audio_cursor += AUDIO_SAMPLE_CYCLES;
         }
         self.mp2k = mp2k;
+        self.gax = gax;
+    }
+
+    /// GAX HLE per-chunk hook: dispatch loops call this when PC lands
+    /// on the commit function.
+    pub fn gax_frame_hook(&mut self) {
+        if let Some(mut g) = self.gax.take() {
+            let mem = crate::mp2k::MemView {
+                rom: &self.rom,
+                ewram: &self.ewram,
+                iwram: &self.iwram,
+            };
+            g.frame_hook(&mem, self.audio_cursor);
+            self.gax = Some(g);
+        }
     }
 
     /// MP2K HLE per-tick hook: the dispatch loops call this when PC

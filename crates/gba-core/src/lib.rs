@@ -15,12 +15,14 @@ pub mod bus;
 pub mod capi;
 pub mod cpu;
 pub mod engine;
+pub mod gax;
 pub mod exec;
 pub mod hle;
 pub mod machine;
 pub mod mem;
 pub mod mp2k;
 pub mod ppu;
+pub mod shadow;
 
 pub use bus::Bus;
 pub use cpu::{Cpu, Mode};

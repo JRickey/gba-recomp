@@ -80,6 +80,12 @@ impl Machine {
                 self.bus.mp2k_frame_hook(key);
             }
         }
+        if let Some(g) = self.bus.gax.as_deref() {
+            let key = self.cpu.regs[15] | self.cpu.thumb() as u32;
+            if g.hook_match(key) {
+                self.bus.gax_frame_hook();
+            }
+        }
 
         let region = (self.cpu.regs[15] >> 24) as usize & 0xF;
         let instr = exec::step_hle_cached(&mut self.cpu, &mut self.bus, &mut self.decode_cache);
