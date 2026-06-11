@@ -104,13 +104,24 @@ impl Square {
                 }
             }
         }
-        self.acc += cycles;
+        // Area-average the duty waveform over the sample window instead
+        // of point-sampling it: edges land with sub-sample precision, so
+        // a high square stays clean harmonics instead of gaining the
+        // edge-jitter sidebands point sampling produces ("fizzy" PSG).
         let per = self.cycles_per_step();
-        while self.acc >= per {
-            self.acc -= per;
-            self.phase = (self.phase + 1) & 7;
+        let mut area: i32 = 0;
+        let mut rem = cycles;
+        while rem > 0 {
+            let take = per.saturating_sub(self.acc).min(rem);
+            area += DUTY[self.duty][self.phase] as i32 * take as i32;
+            self.acc += take;
+            rem -= take;
+            if self.acc >= per {
+                self.acc = 0;
+                self.phase = (self.phase + 1) & 7;
+            }
         }
-        DUTY[self.duty][self.phase] * self.env.volume as i16
+        (area * self.env.volume as i32 / cycles as i32) as i16
     }
 }
 
@@ -237,17 +248,25 @@ impl Apu {
         sum += self.sq[1].sample(cycles, frames64) as i32;
 
         if self.wave_on && self.wave_shift != 0 {
-            self.wave_acc += cycles;
-            // 2097152/(2048-f) Hz, 32 samples per period.
+            // 2097152/(2048-f) Hz, 32 samples per period; area-averaged
+            // over the window like the squares.
             let per = (8 * (2048 - self.wave_freq.min(2047))).max(8);
-            while self.wave_acc >= per {
-                self.wave_acc -= per;
-                self.wave_pos = (self.wave_pos + 1) & 31;
-            }
             let bank_base = 0x90 + self.wave_bank * 0; // single-bank approx
-            let byte = io[bank_base + self.wave_pos / 2];
-            let nib = if self.wave_pos & 1 == 0 { byte >> 4 } else { byte & 0xF } as i32;
-            let centered = (nib - 8) * 16;
+            let mut area: i32 = 0;
+            let mut rem = cycles;
+            while rem > 0 {
+                let take = per.saturating_sub(self.wave_acc).min(rem);
+                let byte = io[bank_base + self.wave_pos / 2];
+                let nib = if self.wave_pos & 1 == 0 { byte >> 4 } else { byte & 0xF } as i32;
+                area += (nib - 8) * 16 * take as i32;
+                self.wave_acc += take;
+                rem -= take;
+                if self.wave_acc >= per {
+                    self.wave_acc = 0;
+                    self.wave_pos = (self.wave_pos + 1) & 31;
+                }
+            }
+            let centered = area / cycles as i32;
             sum += match self.wave_shift {
                 1 => centered,
                 2 => centered / 2,
@@ -258,19 +277,29 @@ impl Apu {
 
         if self.noise_on {
             self.noise_env.step(frames64);
-            self.noise_acc += cycles;
+            // Area-averaging doubles as the band-limiter for high LFSR
+            // clock rates: above-Nyquist noise comes out properly
+            // low-passed instead of aliasing down.
             let per = self.noise_div.max(8);
-            while self.noise_acc >= per {
-                self.noise_acc -= per;
-                let bit = (self.noise_lfsr ^ (self.noise_lfsr >> 1)) & 1;
-                self.noise_lfsr >>= 1;
-                self.noise_lfsr |= bit << 14;
-                if self.noise_width7 {
-                    self.noise_lfsr = (self.noise_lfsr & !0x40) | (bit << 6);
+            let mut area: i32 = 0;
+            let mut rem = cycles;
+            while rem > 0 {
+                let take = per.saturating_sub(self.noise_acc).min(rem);
+                let lvl = if self.noise_lfsr & 1 == 0 { 8 } else { -8 };
+                area += lvl * take as i32;
+                self.noise_acc += take;
+                rem -= take;
+                if self.noise_acc >= per {
+                    self.noise_acc = 0;
+                    let bit = (self.noise_lfsr ^ (self.noise_lfsr >> 1)) & 1;
+                    self.noise_lfsr >>= 1;
+                    self.noise_lfsr |= bit << 14;
+                    if self.noise_width7 {
+                        self.noise_lfsr = (self.noise_lfsr & !0x40) | (bit << 6);
+                    }
                 }
             }
-            let out = if self.noise_lfsr & 1 == 0 { 8 } else { -8 };
-            sum += out * self.noise_env.volume as i32;
+            sum += area / cycles as i32 * self.noise_env.volume as i32;
         }
 
         // SOUNDCNT_H PSG master volume: 25/50/100%.

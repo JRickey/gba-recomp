@@ -698,6 +698,10 @@ fn start_audio(
     let step = src / rate;
     let mut frac = 0.0f64;
     let mut last = 0i16;
+    // The hardware output is AC-coupled: DC at the DAC never reaches
+    // the speaker. Model it on the faithful path too, or PSG duty
+    // offsets thump on every note edge.
+    let mut faithful_dc = DcBlock::new(rate);
     let stream = device
         .build_output_stream(
             &cfg.into(),
@@ -725,7 +729,7 @@ fn start_audio(
                                     last = s;
                                 }
                             }
-                            last as f32 / 32768.0
+                            faithful_dc.next(last as f32 / 32768.0)
                         }
                     };
                     for ch in frame.iter_mut() {
@@ -839,39 +843,48 @@ impl SincResampler {
     }
 }
 
-/// Interpolates one Direct Sound channel from its own timer-derived
-/// rate — which can change at any DAC event — straight to the device
-/// rate, bypassing the mixed-grid zero-order hold entirely (Stage 1).
-/// The table is a pure interpolation filter (cutoff 0.45 of the source
-/// rate): correct whenever the channel runs below the device rate,
-/// which is every real driver mix rate. A channel driven *above* the
-/// device rate falls back to sample-and-hold — interpolating it would
-/// require a decimation filter retuned per rate, and games doing this
-/// are exploiting fold-down on purpose.
+/// Renders one Direct Sound channel as band-limited steps (the blip-buf
+/// idea): each DAC transition deposits a windowed-sinc impulse — the
+/// step's derivative — into a small future ring at its exact fractional
+/// output position, and a leaky integrator reconstructs the waveform.
+/// Edges land jitter-free at the channel's own timer rate (which may
+/// change at any event), and crucially the DAC staircase spectrum — the
+/// ZOH images above the mix rate's Nyquist — survives up to the device
+/// Nyquist. That brightness is part of the hardware's canon sound;
+/// smooth sample interpolation removes it and audibly dulls transients
+/// (reference-trace comparison on a square-timbre chime). Channels
+/// driven above the device rate degrade gracefully: overlapping
+/// deposits sum to a proper low-pass.
 struct FifoInterp {
+    /// Windowed-sinc impulse table (rows sum to 1 = unit step).
     table: Vec<f32>,
-    hist: [f32; SINC_TAPS],
-    /// Output position inside the current source sample, in master
-    /// cycles (the period is the unit, so rate changes are seamless).
-    frac: f64,
+    /// Future deposits, ring-indexed by output sample.
+    fut: [f32; SINC_TAPS * 2],
+    pos: usize,
+    /// Leaky integrator state. The tiny leak only bounds drift; real
+    /// output coupling is the shared DC blocker downstream.
+    y: f32,
+    /// Current DAC level, for edge deltas.
+    level: f32,
+    /// Master cycles until the next DAC event is due.
+    t_next: f64,
     /// Current source sample spacing in master cycles.
     period: f64,
     /// Master cycles per output sample.
     out_step: f64,
-    out_hz: f64,
-    hold: bool,
 }
 
 impl FifoInterp {
     fn new(out_hz: f64) -> FifoInterp {
         FifoInterp {
             table: build_sinc_table(0.45),
-            hist: [0.0; SINC_TAPS],
-            frac: 0.0,
+            fut: [0.0; SINC_TAPS * 2],
+            pos: 0,
+            y: 0.0,
+            level: 0.0,
+            t_next: 512.0,
             period: 512.0, // placeholder until the first DAC event
             out_step: (1u64 << 24) as f64 / out_hz,
-            out_hz,
-            hold: false,
         }
     }
 
@@ -879,29 +892,36 @@ impl FifoInterp {
         // Steer toward ~62 ms queued at the channel's current rate.
         let target = ((1u64 << 24) as f64 / self.period / 16.0).max(64.0);
         let err = (q.len() as f64 - target) / target;
-        self.frac += self.out_step * (1.0 + 0.01 * err.clamp(-1.0, 1.0));
-        while self.frac >= self.period {
-            self.frac -= self.period;
-            let s = match q.pop_front() {
+        let stepc = self.out_step * (1.0 + 0.01 * err.clamp(-1.0, 1.0));
+
+        self.t_next -= stepc;
+        while self.t_next <= 0.0 {
+            // The event fires inside this output sample, at fraction phi
+            // of the sample period.
+            let phi = (1.0 + self.t_next / stepc).clamp(0.0, 1.0);
+            let new_level = match q.pop_front() {
                 Some((s, p)) => {
                     self.period = (p as f64).max(1.0);
-                    self.hold = (1u64 << 24) as f64 / self.period > self.out_hz;
                     s as f32 * (64.0 / 32768.0)
                 }
-                None => self.hist[SINC_TAPS - 1], // DAC holds on underrun
+                None => self.level, // DAC holds on underrun
             };
-            self.hist.copy_within(1.., 0);
-            self.hist[SINC_TAPS - 1] = s;
+            let delta = new_level - self.level;
+            self.level = new_level;
+            if delta != 0.0 {
+                let row = &self.table
+                    [(phi * SINC_PHASES as f64) as usize * SINC_TAPS..][..SINC_TAPS];
+                for (k, c) in row.iter().enumerate() {
+                    self.fut[(self.pos + k) % (SINC_TAPS * 2)] += delta * c;
+                }
+            }
+            self.t_next += self.period;
         }
-        if self.hold {
-            return self.hist[SINC_TAPS - 1];
-        }
-        let phase = ((self.frac / self.period) * SINC_PHASES as f64) as usize;
-        self.table[phase * SINC_TAPS..][..SINC_TAPS]
-            .iter()
-            .zip(self.hist.iter())
-            .map(|(c, s)| c * s)
-            .sum()
+
+        self.y = self.y * 0.9999 + self.fut[self.pos];
+        self.fut[self.pos] = 0.0;
+        self.pos = (self.pos + 1) % (SINC_TAPS * 2);
+        self.y
     }
 }
 
