@@ -25,6 +25,7 @@ fn main() -> ExitCode {
         Some("play") => cmd_play(&args[1..]),
         Some("build") => cmd_build(&args[1..]),
         Some("mp2k-scan") => cmd_mp2k_scan(&args[1..]),
+        Some("engine-scan") => cmd_engine_scan(&args[1..]),
         Some("runc") => cmd_runc(&args[1..]),
         Some("verify") => cmd_verify(&args[1..]),
         _ => {
@@ -437,6 +438,36 @@ fn cmd_mp2k_scan(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// Dev triage: audio-engine classification over a ROM or directory.
+fn cmd_engine_scan(args: &[String]) -> Result<(), String> {
+    let target = args.first().ok_or("missing ROM or directory")?;
+    let path = Path::new(target);
+    let mut files: Vec<std::path::PathBuf> = if path.is_dir() {
+        std::fs::read_dir(path)
+            .map_err(|e| format!("{target}: {e}"))?
+            .filter_map(Result::ok)
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|x| x == "gba"))
+            .collect()
+    } else {
+        vec![path.to_path_buf()]
+    };
+    files.sort();
+    let mut tally: std::collections::BTreeMap<String, u32> = Default::default();
+    for f in &files {
+        let rom = std::fs::read(f).map_err(|e| format!("{}: {e}", f.display()))?;
+        let engine = gba_core::engine::classify(&rom);
+        let d = engine.describe();
+        *tally.entry(d.split(' ').next().unwrap_or("?").to_string()).or_default() += 1;
+        println!("{:24} {}", d, file_name(f));
+    }
+    println!();
+    for (k, v) in tally {
+        println!("{v:4}  {k}");
+    }
+    Ok(())
+}
+
 fn file_name(p: &Path) -> &str {
     p.file_name().and_then(|s| s.to_str()).unwrap_or("?")
 }
@@ -539,16 +570,21 @@ fn cmd_play(args: &[String]) -> Result<(), String> {
     // is present. It engages on the first live driver tick and reverts
     // loudly if its output stops matching the canon FIFO stream.
     if av.audio_enhanced {
-        let sigs = gba_core::mp2k::detect(&m.bus.rom);
-        if !sigs.is_empty() {
-            eprintln!(
-                "MP2K driver detected: HLE shadow mixer armed (SoundMainRAM {})",
-                sigs.iter()
-                    .map(|s| format!("{:#010x}", s.sound_main_ram & !1))
-                    .collect::<Vec<_>>()
-                    .join("/")
-            );
-            m.bus.mp2k = Some(Box::new(gba_core::mp2k::Mp2kHle::new(&sigs)));
+        match gba_core::engine::classify(&m.bus.rom) {
+            gba_core::engine::Engine::M4a(sigs) => {
+                eprintln!(
+                    "audio engine: M4A/MP2K — HLE shadow mixer armed (SoundMainRAM {})",
+                    sigs.iter()
+                        .map(|s| format!("{:#010x}", s.sound_main_ram & !1))
+                        .collect::<Vec<_>>()
+                        .join("/")
+                );
+                m.bus.mp2k = Some(Box::new(gba_core::mp2k::Mp2kHle::new(&sigs)));
+            }
+            other => eprintln!(
+                "audio engine: {} — per-channel enhancement active (engine HLE not yet available)",
+                other.describe()
+            ),
         }
     }
     let streams = std::sync::Arc::new(std::sync::Mutex::new(AudioStreams::default()));

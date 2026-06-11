@@ -14,6 +14,7 @@ pub mod backup;
 pub mod bus;
 pub mod capi;
 pub mod cpu;
+pub mod engine;
 pub mod exec;
 pub mod hle;
 pub mod machine;
