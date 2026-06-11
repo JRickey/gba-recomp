@@ -403,15 +403,29 @@ fn emit_block(out: &mut String, b: &Block, view: &crate::analyze::View) {
     if region != 8 {
         let last = b.instrs.last().unwrap();
         let len = last.addr.wrapping_add(last.size()).wrapping_sub(b.addr);
-        let bytes = view
-            .bytes(b.addr, len as usize)
-            .expect("RAM block must be inside the profiling snapshot");
-        let hash = crate::fnv64(bytes);
-        let _ = writeln!(
-            out,
-            "    if (!a->guard(m, 0x{:08x}u, {len}u, 0x{hash:016x}ull)) {{ c[15] = 0x{:08x}u; return a->interp_one(m); }}",
-            b.addr, b.addr
-        );
+        match view.bytes(b.addr, len as usize) {
+            Some(bytes) => {
+                let hash = crate::fnv64(bytes);
+                let _ = writeln!(
+                    out,
+                    "    if (!a->guard(m, 0x{:08x}u, {len}u, 0x{hash:016x}ull)) {{ c[15] = 0x{:08x}u; return a->interp_one(m); }}",
+                    b.addr, b.addr
+                );
+            }
+            None => {
+                // The block's byte range runs past the snapshot slice
+                // (e.g. decode walked to a mirror boundary): it cannot
+                // be content-guarded, so it permanently defers to the
+                // interpreter instead of running unguarded natives.
+                let _ = writeln!(
+                    out,
+                    "    c[15] = 0x{:08x}u; return a->interp_one(m);",
+                    b.addr
+                );
+                out.push_str("}\n\n");
+                return;
+            }
+        }
     }
 
     let mut cx = Ctx { out, thumb: b.thumb, cycles: 0 };

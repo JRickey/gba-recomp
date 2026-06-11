@@ -409,7 +409,9 @@ fn cmd_play(args: &[String]) -> Result<(), String> {
         WindowOptions { resize: true, ..WindowOptions::default() },
     )
     .map_err(|e| e.to_string())?;
-    window.set_target_fps(60);
+    // Pacing is audio-clock driven (below), not display driven: a 120 Hz
+    // or throttled window must not change game speed.
+    window.set_target_fps(0);
     if status {
         status_line("playing");
     }
@@ -453,6 +455,7 @@ fn cmd_play(args: &[String]) -> Result<(), String> {
     let mut native_run = 0u64;
     let mut fallback_run = 0u64;
     let mut sav_seen = m.bus.save_data().map(fnv64);
+    let mut next_frame = std::time::Instant::now();
     while window.is_open() && !window.is_key_down(Key::Escape) {
         // KEYINPUT is active-low.
         let mut keys = 0x3FFu16;
@@ -486,115 +489,152 @@ fn cmd_play(args: &[String]) -> Result<(), String> {
         }
         m.bus.keys = keys;
 
-        let emu_t0 = std::time::Instant::now();
-        match &native {
-            Some((_lib, table)) => {
-                let mptr = &mut m as *mut Machine as *mut std::ffi::c_void;
-                let (n, f) = run_frame_native(&mut m, table, mptr, 5_000_000);
-                native_run += n;
-                fallback_run += f;
+        // Audio-clock pacing: the device callback consumes at a fixed
+        // rate, so run exactly as many frames as the ring needs —
+        // production follows consumption, immune to display refresh
+        // rate (ProMotion) and window-server throttling. Without an
+        // audio device, wall-clock pace at the hardware frame rate.
+        let mut ran = 0u32;
+        while ran < 4 {
+            if _stream.is_some() {
+                let fill = {
+                    let st = streams.lock().unwrap();
+                    if av.audio_enhanced { st.psg.len() / 2 } else { st.mixed.len() / 2 }
+                };
+                if fill >= RING_TARGET {
+                    break;
+                }
+            } else if ran >= 1 {
+                break;
             }
-            None => m.run_frame(5_000_000),
-        }
-        // Realtime alarm: the frame budget is 16.7 ms. If smoothed
-        // emulation cost approaches it, the product promise is broken —
-        // say so once, with the number.
-        let dt_ms = emu_t0.elapsed().as_secs_f64() * 1e3;
-        emu_ema_ms = if frames_run == 0 { dt_ms } else { emu_ema_ms * 0.95 + dt_ms * 0.05 };
-        frames_run += 1;
-        if !slow_warned && frames_run > 120 && emu_ema_ms > 15.0 {
-            slow_warned = true;
-            eprintln!(
-                "DEGRADED: emulation averaging {emu_ema_ms:.1} ms/frame \
-                 (budget 16.7 ms) — below native speed"
-            );
-        }
+            ran += 1;
 
-        // Live perf readout in the title, once a second: emulation cost
-        // against the 16.7 ms budget and the native-dispatch share.
-        // Developer tooling — hidden from the release out-of-box
-        // experience unless explicitly requested.
-        if show_stats && frames_run % 60 == 0 {
-            let total = native_run + fallback_run;
-            let share = if total == 0 { 0.0 } else { native_run as f64 * 100.0 / total as f64 };
-            window.set_title(&format!(
-                "recomp · {emu_ema_ms:.2} ms/frame ({:.1}x headroom) · native {share:.0}%",
-                16.7 / emu_ema_ms.max(0.01),
-            ));
-            native_run = 0;
-            fallback_run = 0;
-        }
-
-        // Audio defect surfacing: ring drops and underrun holds are
-        // silent corruption — say so, with numbers, per the product bar.
-        if frames_run % 300 == 0 {
-            let (d, h) = {
-                let mut st = streams.lock().unwrap();
-                let v = (st.drops, st.holds);
-                st.drops = 0;
-                st.holds = 0;
-                v
-            };
-            if d + h > 0 {
+            let emu_t0 = std::time::Instant::now();
+            match &native {
+                Some((_lib, table)) => {
+                    let mptr = &mut m as *mut Machine as *mut std::ffi::c_void;
+                    let (n, f) = run_frame_native(&mut m, table, mptr, 5_000_000);
+                    native_run += n;
+                    fallback_run += f;
+                }
+                None => m.run_frame(5_000_000),
+            }
+            // Realtime alarm: the frame budget is 16.7 ms. If smoothed
+            // emulation cost approaches it, the product promise is broken —
+            // say so once, with the number.
+            let dt_ms = emu_t0.elapsed().as_secs_f64() * 1e3;
+            emu_ema_ms = if frames_run == 0 { dt_ms } else { emu_ema_ms * 0.95 + dt_ms * 0.05 };
+            frames_run += 1;
+            if !slow_warned && frames_run > 120 && emu_ema_ms > 15.0 {
+                slow_warned = true;
                 eprintln!(
-                    "DEGRADED: audio ring dropped {d} / held {h} sample pairs in the last 5 s"
+                    "DEGRADED: emulation averaging {emu_ema_ms:.1} ms/frame \
+                     (budget 16.7 ms) — below native speed"
                 );
             }
-        }
 
-        // Flush backup media periodically when it changed, so an external
-        // teardown (launcher exit kills us) can't lose more than ~5 s of
-        // save progress.
-        if frames_run % 300 == 0 {
-            if let Some(data) = m.bus.save_data() {
-                let h = fnv64(data);
-                if sav_seen != Some(h) {
-                    if std::fs::write(&sav_path, data).is_ok() {
-                        sav_seen = Some(h);
+            // Live perf readout in the title, once a second: emulation cost
+            // against the 16.7 ms budget and the native-dispatch share.
+            // Developer tooling — hidden from the release out-of-box
+            // experience unless explicitly requested.
+            if show_stats && frames_run % 60 == 0 {
+                let total = native_run + fallback_run;
+                let share = if total == 0 { 0.0 } else { native_run as f64 * 100.0 / total as f64 };
+                window.set_title(&format!(
+                    "recomp · {emu_ema_ms:.2} ms/frame ({:.1}x headroom) · native {share:.0}%",
+                    16.7 / emu_ema_ms.max(0.01),
+                ));
+                native_run = 0;
+                fallback_run = 0;
+            }
+
+            // Audio defect surfacing: ring drops and underrun holds are
+            // silent corruption — say so, with numbers, per the product bar.
+            if frames_run % 300 == 0 {
+                let (d, h) = {
+                    let mut st = streams.lock().unwrap();
+                    let v = (st.drops, st.holds);
+                    st.drops = 0;
+                    st.holds = 0;
+                    v
+                };
+                if d + h > 0 {
+                    eprintln!(
+                        "DEGRADED: audio ring dropped {d} / held {h} sample pairs in the last 5 s"
+                    );
+                }
+            }
+
+            // Flush backup media periodically when it changed, so an external
+            // teardown (launcher exit kills us) can't lose more than ~5 s of
+            // save progress.
+            if frames_run % 300 == 0 {
+                if let Some(data) = m.bus.save_data() {
+                    let h = fnv64(data);
+                    if sav_seen != Some(h) {
+                        if std::fs::write(&sav_path, data).is_ok() {
+                            sav_seen = Some(h);
+                        }
                     }
                 }
             }
-        }
 
-        // Hand this frame's audio to the consumer (caps ~250 ms each),
-        // refresh the routing snapshot, and count anything dropped.
-        {
-            use gba_core::Bus as _;
-            let cnt_h = m.bus.read16(0x0400_0082);
-            let mut st = streams.lock().unwrap();
-            st.route = [(cnt_h >> 8 & 3) as u8, (cnt_h >> 12 & 3) as u8];
-            st.vol_half = [cnt_h & 4 == 0, cnt_h & 8 == 0];
-            if av.audio_enhanced {
-                m.bus.audio_buf.clear();
-                for pair in m.bus.psg_tap.chunks_exact(2) {
-                    if st.psg.len() < 65536 {
-                        st.psg.push_back(pair[0]);
-                        st.psg.push_back(pair[1]);
-                    } else {
-                        st.drops += 1;
-                    }
-                }
-                m.bus.psg_tap.clear();
-                for f in 0..2 {
-                    let events = std::mem::take(&mut m.bus.fifo_tap[f]);
-                    for e in events {
-                        if st.fifo[f].len() < 32768 {
-                            st.fifo[f].push_back(e);
+            // Hand this frame's audio to the consumer (caps ~250 ms each),
+            // refresh the routing snapshot, and count anything dropped.
+            {
+                use gba_core::Bus as _;
+                let cnt_h = m.bus.read16(0x0400_0082);
+                let mut st = streams.lock().unwrap();
+                st.route = [(cnt_h >> 8 & 3) as u8, (cnt_h >> 12 & 3) as u8];
+                st.vol_half = [cnt_h & 4 == 0, cnt_h & 8 == 0];
+                if av.audio_enhanced {
+                    m.bus.audio_buf.clear();
+                    for pair in m.bus.psg_tap.chunks_exact(2) {
+                        if st.psg.len() < 65536 {
+                            st.psg.push_back(pair[0]);
+                            st.psg.push_back(pair[1]);
                         } else {
                             st.drops += 1;
                         }
                     }
-                }
-            } else {
-                for pair in m.bus.audio_buf.chunks_exact(2) {
-                    if st.mixed.len() < 65536 {
-                        st.mixed.push_back(pair[0]);
-                        st.mixed.push_back(pair[1]);
-                    } else {
-                        st.drops += 1;
+                    m.bus.psg_tap.clear();
+                    for f in 0..2 {
+                        let events = std::mem::take(&mut m.bus.fifo_tap[f]);
+                        for e in events {
+                            if st.fifo[f].len() < 32768 {
+                                st.fifo[f].push_back(e);
+                            } else {
+                                st.drops += 1;
+                            }
+                        }
                     }
+                } else {
+                    for pair in m.bus.audio_buf.chunks_exact(2) {
+                        if st.mixed.len() < 65536 {
+                            st.mixed.push_back(pair[0]);
+                            st.mixed.push_back(pair[1]);
+                        } else {
+                            st.drops += 1;
+                        }
+                    }
+                    m.bus.audio_buf.clear();
                 }
-                m.bus.audio_buf.clear();
+            }
+        }
+
+        if ran == 0 {
+            // Ring is full: let the device drain a little, pump events.
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            window.update();
+            continue;
+        }
+        if _stream.is_none() {
+            next_frame += std::time::Duration::from_nanos(16_742_706); // 59.7275 Hz
+            let now = std::time::Instant::now();
+            if next_frame > now {
+                std::thread::sleep(next_frame - now);
+            } else {
+                next_frame = now;
             }
         }
 
