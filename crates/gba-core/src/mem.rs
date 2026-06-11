@@ -401,14 +401,14 @@ impl MemMap {
 
     /// MP2K HLE per-tick hook: the dispatch loops call this when PC
     /// lands on the detected SoundMainRAM entry.
-    pub fn mp2k_frame_hook(&mut self) {
+    pub fn mp2k_frame_hook(&mut self, key: u32) {
         if let Some(mut h) = self.mp2k.take() {
             let mem = crate::mp2k::MemView {
                 rom: &self.rom,
                 ewram: &self.ewram,
                 iwram: &self.iwram,
             };
-            h.frame_hook(&mem, self.audio_cursor);
+            h.frame_hook(&mem, self.audio_cursor, key);
             self.mp2k = Some(h);
         }
     }

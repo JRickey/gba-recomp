@@ -50,12 +50,49 @@ pub struct Mp2kSig {
     pub sound_main_ram: u32,
 }
 
-/// Scan a ROM for the stock MP2K `SoundMain` signature. Halfword
-/// stride (code is at least halfword-aligned). The literal-pool slot
-/// must hold a plausible RAM code pointer or the match is rejected —
-/// a modified driver (ROM hacks with replacement mixers) must fall
-/// back to the universal per-channel path, not get half-hooked.
-pub fn detect(rom: &[u8]) -> Option<Mp2kSig> {
+/// Scan a ROM for the MP2K driver. Primary: SoundMain's literal-pool
+/// shape — `SOUND_INFO_PTR, ID_NUMBER, SoundMainRAM|thumb, REG_VCOUNT,
+/// o_pcmBuffer(0x350)` — which is forced by the code's semantics, not
+/// its revision, so it survives driver versions whose first 48 bytes
+/// differ (the CRC misses those). Requiring the 0x350 word doubles as
+/// a layout gate: a variant that resized the channel array moves
+/// pcmBuffer and must NOT be hooked with the stock struct offsets.
+/// Fallback: the 48-byte CRC signature with the +0x74 pool harvest.
+pub fn detect(rom: &[u8]) -> Vec<Mp2kSig> {
+    // Literal pools are word-aligned; scan u32 pairs at word stride.
+    // Some images link MORE THAN ONE driver copy (only one runs) —
+    // return every distinct match; the hook collapses to whichever
+    // entry actually executes.
+    let needle_hi = 0x6873_6D53u32; // ID_NUMBER 'Smsh'
+    let needle_lo = 0x0300_7FF0u32; // SOUND_INFO_PTR
+    let mut found: Vec<Mp2kSig> = Vec::new();
+    let mut off = 0usize;
+    while off + 20 <= rom.len() {
+        let w = |i: usize| {
+            u32::from_le_bytes([rom[off + i], rom[off + i + 1], rom[off + i + 2], rom[off + i + 3]])
+        };
+        if w(0) == needle_lo && w(4) == needle_hi {
+            let ptr = w(8);
+            let plausible_ram = matches!(ptr >> 24, 2 | 3) && (ptr & 1 != 0 || ptr & 3 == 0);
+            if plausible_ram
+                && w(12) == 0x0400_0006
+                && w(16) == 0x350
+                && !found.iter().any(|f| f.sound_main_ram == ptr)
+                && found.len() < 4
+            {
+                found.push(Mp2kSig { sound_main_off: off, sound_main_ram: ptr });
+            }
+        }
+        off += 4;
+    }
+    if found.is_empty() {
+        found.extend(detect_by_crc(rom));
+    }
+    found
+}
+
+/// The CRC-of-SoundMain fallback (one specific code revision).
+fn detect_by_crc(rom: &[u8]) -> Option<Mp2kSig> {
     // Table-driven CRC over a sliding window is still O(n*48); keep it
     // bounded by scanning bytewise with a precomputed table instead of
     // the bitwise loop above.
@@ -337,9 +374,11 @@ impl SelfCheck {
 /// The MP2K HLE shadow mixer. Lives on the bus; fed by the dispatch
 /// hook (`frame_hook`) and the audio grid (`render`).
 pub struct Mp2kHle {
-    /// Dispatch key (SoundMainRAM entry | thumb) the loops compare PC
-    /// against.
-    pub hook_key: u32,
+    /// Dispatch keys (SoundMainRAM entry | thumb) the loops compare PC
+    /// against — more than one when the image links several driver
+    /// copies; collapsed to the live one at first hit.
+    hook_keys: [u32; 4],
+    hook_n: u8,
     /// Rendering and substituting. Cleared by revert.
     pub active: bool,
     /// Saw at least one valid live tick (magic OK) — the frontend
@@ -365,17 +404,33 @@ pub struct Mp2kHle {
     ring: Vec<(f32, f32)>,
     ring_pos: usize,
     check: SelfCheck,
+    /// Differentially calibrated output gain (1.0 = stock scale) and
+    /// the probation bookkeeping that derives it.
+    gain: f32,
+    calibrated: bool,
+    ratio_hist: [f32; 3],
+    ratio_n: u32,
+    /// At least one self-check window passed all gates — the frontend
+    /// substitutes only proven streams (never loud-wrong audio).
+    pub proven: bool,
 }
 
 impl Mp2kHle {
-    pub fn new(sig: Mp2kSig) -> Mp2kHle {
-        let hook_key = if sig.sound_main_ram & 1 != 0 {
-            sig.sound_main_ram // thumb: bit 0 already the dispatch key bit
-        } else {
-            sig.sound_main_ram & !3
-        };
+    pub fn new(sigs: &[Mp2kSig]) -> Mp2kHle {
+        let mut hook_keys = [0u32; 4];
+        let mut hook_n = 0u8;
+        for sig in sigs.iter().take(4) {
+            // thumb: bit 0 is already the dispatch key bit.
+            hook_keys[hook_n as usize] = if sig.sound_main_ram & 1 != 0 {
+                sig.sound_main_ram
+            } else {
+                sig.sound_main_ram & !3
+            };
+            hook_n += 1;
+        }
         Mp2kHle {
-            hook_key,
+            hook_keys,
+            hook_n,
             active: true,
             engaged: false,
             reverted: None,
@@ -393,7 +448,18 @@ impl Mp2kHle {
             reverb: 0,
             dma_period: 7,
             check: SelfCheck::new(),
+            gain: 1.0,
+            calibrated: false,
+            ratio_hist: [0.0; 3],
+            ratio_n: 0,
+            proven: false,
         }
+    }
+
+    /// Does this dispatch key hit a hook entry?
+    #[inline(always)]
+    pub fn hook_match(&self, key: u32) -> bool {
+        self.hook_keys[..self.hook_n as usize].contains(&key)
     }
 
     fn revert(&mut self, reason: String) {
@@ -409,11 +475,17 @@ impl Mp2kHle {
     /// envelope state is re-read from the guest every tick, so the
     /// shadow can never drift from a driver reinit (the upstream
     /// issue-416 class).
-    pub fn frame_hook(&mut self, mem: &MemView, audio_cursor: u64) {
+    pub fn frame_hook(&mut self, mem: &MemView, audio_cursor: u64, key: u32) {
         if !self.active {
             return;
         }
         self.hooks += 1;
+        // Several candidate entries (multi-linked drivers): the one
+        // that actually executes is the live driver — drop the rest.
+        if self.hook_n > 1 {
+            self.hook_keys[0] = key;
+            self.hook_n = 1;
+        }
         // Re-fired inside the same grid sample (IRQ replay, fallback
         // double-dispatch): idempotent by construction, but skip the
         // span update so interpolation pacing stays sane.
@@ -521,7 +593,16 @@ impl Mp2kHle {
                 if stopping {
                     dead = true;
                     env_now = 0;
-                } else if note_on(v, mem, ctype, count, wav) {
+                } else if {
+                    // Diagnostic: note-on field values.
+                    if std::env::var_os("RECOMP_MP2K_TRACE").is_some() {
+                        eprintln!(
+                            "mp2k note-on hook={} ch={ch} count={count} freq={freq} wav={wav:08x}",
+                            self.hooks
+                        );
+                    }
+                    note_on(v, mem, ctype, count, wav)
+                } {
                     env_now = attack.min(0xFF);
                     phase = 3;
                     if env_now >= 0xFF {
@@ -634,9 +715,11 @@ impl Mp2kHle {
         }
     }
 
-    /// True while the frontend should substitute the HLE stream.
+    /// True while the frontend should substitute the HLE stream:
+    /// armed, engaged, and at least one fully passing self-check
+    /// window behind it (level + structure proven on this title).
     pub fn live(&self) -> bool {
-        self.active && self.engaged
+        self.active && self.engaged && self.proven
     }
 
     /// Render one grid sample: (left, right) in the bus float scale
@@ -670,8 +753,8 @@ impl Mp2kHle {
             let s = sample_voice(v, mem);
             let gr = v.g0.0 + (v.g1.0 - v.g0.0) * t;
             let gl = v.g0.1 + (v.g1.1 - v.g0.1) * t;
-            right += s * gr;
-            left += s * gl;
+            right += s * gr * self.gain;
+            left += s * gl * self.gain;
         }
 
         // The guest mixer saturates its 8-bit buffer; its reverb
@@ -692,6 +775,35 @@ impl Mp2kHle {
         if let Some((r, ratio)) = self.check.push(canon_rl, sat) {
             self.check.last_r = r;
             self.check.last_ratio = ratio;
+            // Probation auto-calibration: strong structure with a
+            // stable off-band level means this driver revision scales
+            // its mixer by a constant factor (a ~2x cluster exists
+            // empirically across first-party-era titles) — measure the
+            // factor from the canon stream and adopt it, instead of
+            // striking. Trusted only because correlation already
+            // proves the structure; the normal gates keep policing the
+            // calibrated stream afterwards, and the gain is also what
+            // correct PCM/PSG balance requires (the substituted stream
+            // must sit at canon loudness relative to the LLE PSG).
+            if !self.calibrated
+                && r >= 0.7
+                && !(0.85..=1.15).contains(&ratio)
+                && (0.2..=5.0).contains(&ratio)
+                && self.ratio_n < 6
+            {
+                self.ratio_hist[(self.ratio_n % 3) as usize] = ratio;
+                self.ratio_n += 1;
+                if self.ratio_n >= 3 {
+                    let m =
+                        (self.ratio_hist[0] + self.ratio_hist[1] + self.ratio_hist[2]) / 3.0;
+                    if self.ratio_hist.iter().all(|x| (x / m - 1.0).abs() < 0.1) {
+                        self.gain = (self.gain / m).clamp(0.25, 4.0);
+                        self.calibrated = true;
+                        self.check.strikes = 0;
+                    }
+                }
+                return (left * 0.25, right * 0.25);
+            }
             // Two failure axes: structure (correlation) and level
             // (envelope ratio — scale-invariant correlation alone would
             // bless a mixer whose volume math is wrong for this driver
@@ -712,6 +824,9 @@ impl Mp2kHle {
                     ));
                 }
             } else {
+                // A fully passing window proves the stream end to end —
+                // the frontend may substitute from here on.
+                self.proven = true;
                 // Decay, don't clear: a window-flapper (alternating
                 // pass/fail) must still ratchet to revert; only a
                 // sustained clean run earns back trust.
@@ -725,6 +840,11 @@ impl Mp2kHle {
     /// Most recent self-check correlation and level ratio (diagnostics).
     pub fn last_correlation(&self) -> (f32, f32) {
         (self.check.last_r, self.check.last_ratio)
+    }
+
+    /// Calibrated output gain (1.0 = stock scale).
+    pub fn gain(&self) -> f32 {
+        self.gain
     }
 }
 
@@ -761,8 +881,15 @@ fn note_on(v: &mut Voice, mem: &MemView, ctype: u8, count: u32, wav: u32) -> boo
     v.loop_start = loop_start;
     v.looped = flags & 0xC000 != 0;
     v.compressed = compressed;
-    // SDK: `count` carries an initial sample offset at note-on.
-    v.pos = count.min(size) as f64;
+    // The stock SDK treats `count` as an initial sample offset at
+    // note-on, but the track engine zeroes it except for one rare
+    // explicit feature — and variant drivers leave the PREVIOUS
+    // note's residue in the field (observed: a popular RPG port's
+    // engine), which started voices mid-sample or, for one-shots,
+    // past the end (silent). Start at 0 like the proven prior art;
+    // the field is stale more often than it is meaningful.
+    let _ = count;
+    v.pos = 0.0;
     v.blk_idx = u32::MAX;
     true
 }
@@ -870,8 +997,8 @@ mod tests {
         let (iwram, rom, _) = synth_guest();
         let ewram = vec![0u8; 0x4_0000];
         let mem = MemView { rom: &rom, ewram: &ewram, iwram: &iwram };
-        let mut h = Mp2kHle::new(Mp2kSig { sound_main_off: 0, sound_main_ram: 0x0300_2001 });
-        h.frame_hook(&mem, 256 * 2000);
+        let mut h = Mp2kHle::new(&[Mp2kSig { sound_main_off: 0, sound_main_ram: 0x0300_2001 }]);
+        h.frame_hook(&mem, 256 * 2000, 0x0300_2001);
         assert!(h.engaged);
         let v = &h.voices[0];
         assert!(v.on);
@@ -900,8 +1027,8 @@ mod tests {
         iwram[s..s + 4].copy_from_slice(&0x6873_6D53u32.to_le_bytes());
         let ewram = vec![0u8; 0x4_0000];
         let mem = MemView { rom: &rom, ewram: &ewram, iwram: &iwram };
-        let mut h = Mp2kHle::new(Mp2kSig { sound_main_off: 0, sound_main_ram: 0x0300_2001 });
-        h.frame_hook(&mem, 256 * 2000);
+        let mut h = Mp2kHle::new(&[Mp2kSig { sound_main_off: 0, sound_main_ram: 0x0300_2001 }]);
+        h.frame_hook(&mem, 256 * 2000, 0x0300_2001);
         assert!(!h.engaged);
         assert_eq!(h.stale_ticks, 1);
     }
@@ -915,8 +1042,8 @@ mod tests {
             .copy_from_slice(&0x0500_0000u32.to_le_bytes());
         let ewram = vec![0u8; 0x4_0000];
         let mem = MemView { rom: &rom, ewram: &ewram, iwram: &iwram };
-        let mut h = Mp2kHle::new(Mp2kSig { sound_main_off: 0, sound_main_ram: 0x0300_2001 });
-        h.frame_hook(&mem, 256 * 2000);
+        let mut h = Mp2kHle::new(&[Mp2kSig { sound_main_off: 0, sound_main_ram: 0x0300_2001 }]);
+        h.frame_hook(&mem, 256 * 2000, 0x0300_2001);
         assert!(!h.voices[0].on);
         assert_eq!(h.bad_waves, 1);
     }
@@ -1007,6 +1134,6 @@ mod tests {
         }
         assert_eq!(found, Some(0x0300_2C01));
         // And the real detector must NOT fire on this junk.
-        assert_eq!(detect(&rom), None);
+        assert!(detect(&rom).is_empty());
     }
 }

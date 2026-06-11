@@ -205,6 +205,7 @@ fn cmd_frames(args: &[String]) -> Result<(), String> {
     let mut frames = 60u64;
     let mut out: Option<String> = None;
     let mut keys = 0x3FFu16; // active-low: nothing pressed
+    let mut demo = false; // verify-style Start/A taps (menus need edges)
 
     let mut it = args.iter();
     while let Some(arg) = it.next() {
@@ -215,6 +216,7 @@ fn cmd_frames(args: &[String]) -> Result<(), String> {
             }
             "--out" => out = Some(it.next().ok_or("--out needs a value")?.to_string()),
             "--keys" => keys = parse_hex(it.next().ok_or("--keys needs a value")?)? as u16,
+            "--demo" => demo = true,
             other if rom_path.is_none() => rom_path = Some(other.to_string()),
             other => return Err(format!("unexpected argument {other:?}")),
         }
@@ -242,18 +244,24 @@ fn cmd_frames(args: &[String]) -> Result<(), String> {
     let mp2k_on = std::env::var_os("RECOMP_MP2K").is_some();
     if mp2k_on {
         m.bus.tap_channels = true;
-        match gba_core::mp2k::detect(&m.bus.rom) {
-            Some(sig) => {
-                eprintln!(
-                    "mp2k: driver detected, SoundMainRAM {:#010x}",
-                    sig.sound_main_ram & !1
-                );
-                m.bus.mp2k = Some(Box::new(gba_core::mp2k::Mp2kHle::new(sig)));
-            }
-            None => eprintln!("mp2k: no stock driver signature"),
+        let sigs = gba_core::mp2k::detect(&m.bus.rom);
+        if sigs.is_empty() {
+            eprintln!("mp2k: no stock driver signature");
+        } else {
+            eprintln!(
+                "mp2k: driver detected, SoundMainRAM {}",
+                sigs.iter()
+                    .map(|s| format!("{:#010x}", s.sound_main_ram & !1))
+                    .collect::<Vec<_>>()
+                    .join("/")
+            );
+            m.bus.mp2k = Some(Box::new(gba_core::mp2k::Mp2kHle::new(&sigs)));
         }
     }
     for _ in 0..frames {
+        if demo {
+            m.bus.keys = demo_keys(m.bus.frames);
+        }
         m.run_frame(5_000_000);
         if dump_audio.is_some() {
             mixed.extend(m.bus.audio_buf.drain(..));
@@ -269,10 +277,12 @@ fn cmd_frames(args: &[String]) -> Result<(), String> {
     if let Some(h) = m.bus.mp2k.as_deref() {
         let (corr, ratio) = h.last_correlation();
         eprintln!(
-            "mp2k: hooks={} stale={} bad_waves={} corr={corr:.3} ratio={ratio:.2} engaged={} active={}{}",
+            "mp2k: hooks={} stale={} bad_waves={} corr={corr:.3} ratio={ratio:.2} gain={:.2} proven={} engaged={} active={}{}",
             h.hooks,
             h.stale_ticks,
             h.bad_waves,
+            h.gain(),
+            h.proven,
             h.engaged,
             h.active,
             h.reverted
@@ -391,18 +401,27 @@ fn cmd_mp2k_scan(args: &[String]) -> Result<(), String> {
     for f in &files {
         let rom = std::fs::read(f).map_err(|e| format!("{}: {e}", f.display()))?;
         total += 1;
-        match gba_core::mp2k::detect(&rom) {
-            Some(sig) => {
-                hits += 1;
-                println!(
-                    "MP2K {} SoundMain@{:#08x} SoundMainRAM={:#010x} ({})",
-                    file_name(f),
-                    sig.sound_main_off,
-                    sig.sound_main_ram & !1,
-                    if sig.sound_main_ram & 1 != 0 { "thumb" } else { "arm" },
-                );
-            }
-            None => println!("---- {}", file_name(f)),
+        let sigs = gba_core::mp2k::detect(&rom);
+        if sigs.is_empty() {
+            println!("---- {}", file_name(f));
+        } else {
+            hits += 1;
+            let entries = sigs
+                .iter()
+                .map(|sig| {
+                    format!(
+                        "{:#010x} ({})",
+                        sig.sound_main_ram & !1,
+                        if sig.sound_main_ram & 1 != 0 { "thumb" } else { "arm" },
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" / ");
+            println!(
+                "MP2K {} SoundMain@{:#08x} SoundMainRAM={entries}",
+                file_name(f),
+                sigs[0].sound_main_off,
+            );
         }
     }
     println!("\n{hits}/{total} images carry the stock MP2K driver signature");
@@ -511,12 +530,16 @@ fn cmd_play(args: &[String]) -> Result<(), String> {
     // is present. It engages on the first live driver tick and reverts
     // loudly if its output stops matching the canon FIFO stream.
     if av.audio_enhanced {
-        if let Some(sig) = gba_core::mp2k::detect(&m.bus.rom) {
+        let sigs = gba_core::mp2k::detect(&m.bus.rom);
+        if !sigs.is_empty() {
             eprintln!(
-                "MP2K driver detected: HLE shadow mixer armed (SoundMainRAM {:#010x})",
-                sig.sound_main_ram & !1
+                "MP2K driver detected: HLE shadow mixer armed (SoundMainRAM {})",
+                sigs.iter()
+                    .map(|s| format!("{:#010x}", s.sound_main_ram & !1))
+                    .collect::<Vec<_>>()
+                    .join("/")
             );
-            m.bus.mp2k = Some(Box::new(gba_core::mp2k::Mp2kHle::new(sig)));
+            m.bus.mp2k = Some(Box::new(gba_core::mp2k::Mp2kHle::new(&sigs)));
         }
     }
     let streams = std::sync::Arc::new(std::sync::Mutex::new(AudioStreams::default()));
@@ -1534,8 +1557,8 @@ fn run_frame_native(
         // interpreter fallback re-checks inside step(); the hook is
         // idempotent within a tick.
         if let Some(h) = m.bus.mp2k.as_deref() {
-            if h.active && key == h.hook_key {
-                m.bus.mp2k_frame_hook();
+            if h.active && h.hook_match(key) {
+                m.bus.mp2k_frame_hook(key);
             }
         }
         match table.get(key) {
@@ -1601,12 +1624,11 @@ fn cmd_runc(args: &[String]) -> Result<(), String> {
     // hook-at-block-boundary path play uses, validated headless here.
     if std::env::var_os("RECOMP_MP2K").is_some() {
         m.bus.tap_channels = true;
-        match gba_core::mp2k::detect(&m.bus.rom) {
-            Some(sig) => {
-                eprintln!("mp2k: driver detected, SoundMainRAM {:#010x}", sig.sound_main_ram & !1);
-                m.bus.mp2k = Some(Box::new(gba_core::mp2k::Mp2kHle::new(sig)));
-            }
-            None => eprintln!("mp2k: no stock driver signature"),
+        let sigs = gba_core::mp2k::detect(&m.bus.rom);
+        if sigs.is_empty() {
+            eprintln!("mp2k: no stock driver signature");
+        } else {
+            m.bus.mp2k = Some(Box::new(gba_core::mp2k::Mp2kHle::new(&sigs)));
         }
     }
     let mptr = &mut m as *mut Machine as *mut std::ffi::c_void;
@@ -1638,10 +1660,12 @@ fn cmd_runc(args: &[String]) -> Result<(), String> {
     if let Some(h) = m.bus.mp2k.as_deref() {
         let (corr, ratio) = h.last_correlation();
         eprintln!(
-            "mp2k: hooks={} stale={} bad_waves={} corr={corr:.3} ratio={ratio:.2} engaged={} active={}{}",
+            "mp2k: hooks={} stale={} bad_waves={} corr={corr:.3} ratio={ratio:.2} gain={:.2} proven={} engaged={} active={}{}",
             h.hooks,
             h.stale_ticks,
             h.bad_waves,
+            h.gain(),
+            h.proven,
             h.engaged,
             h.active,
             h.reverted

@@ -75,8 +75,9 @@ impl Machine {
         // has finalized this tick's channel state — snapshot it for the
         // shadow mixer (read-only; the guest mixer still runs).
         if let Some(h) = self.bus.mp2k.as_deref() {
-            if h.active && (self.cpu.regs[15] | self.cpu.thumb() as u32) == h.hook_key {
-                self.bus.mp2k_frame_hook();
+            let key = self.cpu.regs[15] | self.cpu.thumb() as u32;
+            if h.active && h.hook_match(key) {
+                self.bus.mp2k_frame_hook(key);
             }
         }
 
