@@ -602,31 +602,49 @@ fn in_window_range(x1: u8, x2: u8, v: u8) -> bool {
     }
 }
 
+// Color-effect arithmetic models the hardware blend unit, not GBATEK's
+// fractional notation: per-channel multiply-accumulate rounds half-up
+// (+8 >> 4; the darken subtrahend rounds half-down, +7, so the result
+// still rounds half-up), and green passes through a 6-bit lane (the
+// real hardware LSB of that lane is PRAM bit 15, which we mask at
+// palette fetch — see pal16).
+
 fn alpha_blend(a: u16, b: u16, eva: u32, evb: u32) -> u16 {
-    let (ar, ag, ab) = split(a);
-    let (br, bg, bb) = split(b);
-    let r = ((ar * eva + br * evb) / 16).min(31);
-    let g = ((ag * eva + bg * evb) / 16).min(31);
-    let b = ((ab * eva + bb * evb) / 16).min(31);
-    join(r, g, b)
+    let (ar, ag, ab) = split6(a);
+    let (br, bg, bb) = split6(b);
+    let r = ((ar * eva + br * evb + 8) >> 4).min(31);
+    let g = ((ag * eva + bg * evb + 8) >> 4).min(63);
+    let b = ((ab * eva + bb * evb + 8) >> 4).min(31);
+    join6(r, g, b)
 }
 
 fn brighten(c: u16, evy: u32) -> u16 {
-    let (r, g, b) = split(c);
-    join(r + (31 - r) * evy / 16, g + (31 - g) * evy / 16, b + (31 - b) * evy / 16)
+    let (r, g, b) = split6(c);
+    join6(
+        r + (((31 - r) * evy + 8) >> 4),
+        g + (((63 - g) * evy + 8) >> 4),
+        b + (((31 - b) * evy + 8) >> 4),
+    )
 }
 
 fn darken(c: u16, evy: u32) -> u16 {
-    let (r, g, b) = split(c);
-    join(r - r * evy / 16, g - g * evy / 16, b - b * evy / 16)
+    let (r, g, b) = split6(c);
+    join6(
+        r - ((r * evy + 7) >> 4),
+        g - ((g * evy + 7) >> 4),
+        b - ((b * evy + 7) >> 4),
+    )
 }
 
-fn split(c: u16) -> (u32, u32, u32) {
-    ((c & 31) as u32, ((c >> 5) & 31) as u32, ((c >> 10) & 31) as u32)
+/// Channels as the blend unit sees them: 5-bit red/blue, 6-bit green
+/// lane (5-bit value doubled; hardware ORs in PRAM bit 15 as the LSB,
+/// which we strip at fetch).
+fn split6(c: u16) -> (u32, u32, u32) {
+    ((c & 31) as u32, (((c >> 5) & 31) as u32) << 1, ((c >> 10) & 31) as u32)
 }
 
-fn join(r: u32, g: u32, b: u32) -> u16 {
-    (r | (g << 5) | (b << 10)) as u16
+fn join6(r: u32, g: u32, b: u32) -> u16 {
+    (r | ((g >> 1) << 5) | (b << 10)) as u16
 }
 
 #[cfg(test)]
@@ -688,5 +706,51 @@ mod tests {
         assert_eq!(brighten(0x0000, 16), 0x7FFF);
         assert_eq!(darken(0x7FFF, 16), 0x0000);
         assert_eq!(brighten(0x0000, 0), 0x0000);
+    }
+
+    // Hardware blend-unit identities:
+    // round-half-up MAC, 6-bit green lane.
+
+    #[test]
+    fn blend_identity_and_extremes() {
+        // eva=16/evb=0 passes every color through exactly, including
+        // the green lane round-trip.
+        for c in [0x0000u16, 0x7FFF, 0x7C1F, 0x03E0, 0x1234, 0x5A5A] {
+            assert_eq!(alpha_blend(c, 0x7FFF ^ c, 16, 0), c);
+            assert_eq!(alpha_blend(0x7FFF ^ c, c, 0, 16), c);
+        }
+        // Saturation: white + white at full coefficients clamps.
+        assert_eq!(alpha_blend(0x7FFF, 0x7FFF, 16, 16), 0x7FFF);
+        // evy=0 is a no-op for both brightness directions.
+        for c in [0x7FFF, 0x1234, 0x5A5A] {
+            assert_eq!(brighten(c, 0), c);
+            assert_eq!(darken(c, 0), c);
+        }
+    }
+
+    #[test]
+    fn blend_rounds_half_up() {
+        // 50/50 of red 15 and 16: true value 15.5, hardware rounds up.
+        // (15*8 + 16*8 + 8) >> 4 = 16.
+        assert_eq!(alpha_blend(15, 16, 8, 8) & 31, 16);
+        // Red 0 with 1 at evb=8: 0.5 rounds up to 1 (truncation gave 0).
+        assert_eq!(alpha_blend(0, 1, 8, 8) & 31, 1);
+        // Green's 6-bit lane rounds up only at fraction >= 12/16:
+        // greens 15/16 at 8/8 -> S=124 in g6 (30*8+32*8=496; +8 >>4 =
+        // 31; >>1 = 15): the half-step stays DOWN on green.
+        assert_eq!((alpha_blend(15 << 5, 16 << 5, 8, 8) >> 5) & 31, 15);
+        // ...but green 15/eva=4, 16/evb=12 (true 15.75) rounds up.
+        assert_eq!((alpha_blend(15 << 5, 16 << 5, 4, 12) >> 5) & 31, 16);
+    }
+
+    #[test]
+    fn brightness_rounds() {
+        // Brighten red 0 by 1/16: (31*1 + 8) >> 4 = 2 (truncation: 1).
+        assert_eq!(brighten(0, 1) & 31, 2);
+        // Darken red 31 by 1/16: 31 - ((31 + 7) >> 4) = 29.
+        assert_eq!(darken(31, 1) & 31, 29);
+        // Green lane: brighten green 0 by 1/16 -> g6 = (63+8)>>4 = 4,
+        // back to 5-bit = 2.
+        assert_eq!((brighten(0, 1) >> 5) & 31, 2);
     }
 }
