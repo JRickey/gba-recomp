@@ -88,6 +88,20 @@ everything below is covered once, in [Legal](#legal).
 | `crates/screen` | Screen simulation: per-revision panel color, temporal response, GPU pixel-grid present path |
 | `crates/launcher` | `gba-launcher` frontend: cartridge selection/launch, input rebinding, A/V settings — procedural theme, no bundled assets |
 
+## Building
+
+```sh
+cargo build --release
+./target/release/recomp play path/to/your.gba    # translate (first launch) and play
+./target/release/gba-launcher                     # graphical frontend
+```
+
+You need stable Rust and a C compiler on `PATH` as `cc` — translation
+emits C11 and compiles it locally. See **[BUILDING.md](BUILDING.md)** for
+platform-specific dependencies (macOS / Linux / Windows / Android), build
+profiles and parallelism, the full CLI command reference, the translation
+cache, and how to run the tests.
+
 ## Legal
 
 **No proprietary content ships here.** This repository contains no first-party

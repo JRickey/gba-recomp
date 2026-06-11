@@ -17,6 +17,16 @@ const ROM_BASE: u32 = 0x0800_0000;
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // `recomp help [cmd]`, `recomp <cmd> --help`, and bare `--help`/`-h`
+    // all land in help; the first non-help token names the topic.
+    if args.iter().any(|a| a == "--help" || a == "-h") || args.first().map(String::as_str) == Some("help") {
+        let topic = args
+            .iter()
+            .find(|a| *a != "--help" && *a != "-h" && *a != "help")
+            .map(String::as_str);
+        print_help(topic);
+        return ExitCode::SUCCESS;
+    }
     let result = match args.first().map(String::as_str) {
         Some("dis") => cmd_dis(&args[1..]),
         Some("entry-scan") => cmd_entry_scan(&args[1..]),
@@ -29,11 +39,7 @@ fn main() -> ExitCode {
         Some("runc") => cmd_runc(&args[1..]),
         Some("verify") => cmd_verify(&args[1..]),
         _ => {
-            eprintln!("usage: recomp dis <rom> [--addr HEX] [--count N] [--thumb]");
-            eprintln!("       recomp entry-scan <dir>");
-            eprintln!("       recomp run <rom> [--max-steps N] [--trace]");
-            eprintln!("       recomp frames <rom> [--frames N] [--out img.ppm] [--keys MASK]");
-            eprintln!("       recomp play <rom> [--interp] [--stats] [--status]");
+            print_help(None);
             return ExitCode::FAILURE;
         }
     };
@@ -42,6 +48,127 @@ fn main() -> ExitCode {
         Err(e) => {
             eprintln!("error: {e}");
             ExitCode::FAILURE
+        }
+    }
+}
+
+/// `(name, synopsis, flag lines, description)` per command — the single
+/// source for both the overview listing and per-command help.
+const HELP: &[(&str, &str, &[&str], &str)] = &[
+    ("build", "recomp build <rom> [--ram]", &[
+        "--ram    profile a short interpreter run first, translating the RAM-resident \
+code and computed-branch targets it discovers (recommended; play's cache builds use it)",
+    ], "Translate a ROM image to a native shared library at out/<stem>.dylib. \
+Emits C11 in bounded chunks and compiles them with cc."),
+    ("play", "recomp play <rom> [--interp] [--stats] [--status]", &[
+        "--interp    force the interpreter (skip/ignore native translation)",
+        "--stats     print performance readouts (frame time, native vs fallback)",
+        "--status    emit machine-readable lifecycle lines on stdout (used by the launcher)",
+    ], "Windowed play. First launch translates the image into the per-user cache \
+(one-time, progress printed); later launches load it instantly. Reads input.cfg/av.cfg \
+from the shared config directory."),
+    ("runc", "recomp runc <rom> [--frames N] [--out img.ppm] [--input file]", &[
+        "--frames N      frames to run (default 600)",
+        "--out PATH      write the final frame as a PPM",
+        "--input FILE    replay a recorded input script (see play's RECOMP_RECORD_INPUT)",
+    ], "Run the recompiled output from out/<stem>.dylib headless (build first); \
+prints frame hash and native/fallback counts."),
+    ("verify", "recomp verify <rom> [--frames N] [--reuse] [--dump prefix] [--input file]", &[
+        "--frames N       frames to compare (default 600)",
+        "--reuse          skip the rebuild if out/<stem>.dylib exists",
+        "--dump PREFIX    write both final frames as PREFIX.interp.ppm / PREFIX.recomp.ppm",
+        "--input FILE     replay a recorded input script on both sides (instead of demo taps)",
+    ], "Differential check: run the interpreter and the recompiled output, compare \
+frame hashes, print MATCH or MISMATCH (exit code follows)."),
+    ("run", "recomp run <rom> [--max-steps N] [--trace] [--hist]", &[
+        "--max-steps N    stop after N interpreter steps",
+        "--trace          disassemble every executed instruction to stderr",
+        "--hist           print a hot-PC histogram at exit",
+    ], "Headless interpreter run; the conformance-suite driver (a pass parks with r12=0)."),
+    ("frames", "recomp frames <rom> [--frames N] [--out img.ppm] [--keys MASK] [--demo] [--input file] [--sav file]", &[
+        "--frames N      frames to run (default 600)",
+        "--out PATH      write the final frame as a PPM",
+        "--keys MASK     hold a KEYINPUT mask for the whole run (hex)",
+        "--demo          deterministic demo input: periodic Start, then A taps",
+        "--input FILE    replay a recorded input script (see play's RECOMP_RECORD_INPUT)",
+        "--sav FILE      preload a save file",
+    ], "Headless boot to frame N on the interpreter; prints the frame hash plus \
+boot diagnostics (DISPCNT/PC/SWI and live disassembly at PC)."),
+    ("dis", "recomp dis <rom> [--addr HEX] [--count N] [--thumb]", &[
+        "--addr HEX    start address (default ROM base)",
+        "--count N     instructions to print (default 16)",
+        "--thumb       decode as Thumb",
+    ], "Disassemble ROM bytes at an address."),
+    ("entry-scan", "recomp entry-scan <dir>", &[],
+     "Decode the entry branch of every image in a directory — a corpus sanity check."),
+    ("mp2k-scan", "recomp mp2k-scan <rom|dir>", &[],
+     "Report MP2K/M4A audio-driver detection (signatures, hook addresses) for one image or a directory."),
+    ("engine-scan", "recomp engine-scan <rom|dir>", &[],
+     "Classify the audio engine (MP2K, GAX lineage, others) for one image or a directory."),
+];
+
+/// `recomp help` / `recomp help <cmd>` / `recomp <cmd> --help`.
+fn print_help(topic: Option<&str>) {
+    if let Some(name) = topic {
+        if let Some((_, synopsis, flags, desc)) = HELP.iter().find(|(n, ..)| *n == name) {
+            eprintln!("usage: {synopsis}");
+            eprintln!();
+            eprintln!("{desc}");
+            if !flags.is_empty() {
+                eprintln!();
+                for f in *flags {
+                    eprintln!("  {f}");
+                }
+            }
+            return;
+        }
+        eprintln!("unknown command {name:?}");
+        eprintln!();
+    }
+    eprintln!("usage: recomp <command> [args]");
+    eprintln!();
+    for (_, synopsis, _, _) in HELP {
+        eprintln!("  {synopsis}");
+    }
+    eprintln!();
+    eprintln!("'recomp help <command>' for details; BUILDING.md for the full reference");
+}
+
+/// Recorded input script: header line `gba-input v1`, then one
+/// `<frame> <hexmask>` line per key-state change (KEYINPUT-style,
+/// active-low). Keys hold their value between change points; before the
+/// first point everything is released. Recorded by play under
+/// RECOMP_RECORD_INPUT=<path>, replayed by frames/runc/verify --input —
+/// the bridge from a live repro to a deterministic headless one.
+struct InputScript(Vec<(u64, u16)>);
+
+impl InputScript {
+    fn load(path: &str) -> Result<InputScript, String> {
+        let text = std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
+        let mut lines = text.lines();
+        if lines.next().map(str::trim) != Some("gba-input v1") {
+            return Err(format!("{path}: not a gba-input v1 file"));
+        }
+        let mut points = Vec::new();
+        for l in lines {
+            let l = l.trim();
+            if l.is_empty() {
+                continue;
+            }
+            let (f, k) = l.split_once(' ').ok_or_else(|| format!("{path}: bad line {l:?}"))?;
+            points.push((
+                f.parse().map_err(|e| format!("{path}: bad frame in {l:?}: {e}"))?,
+                u16::from_str_radix(k, 16).map_err(|e| format!("{path}: bad mask in {l:?}: {e}"))?,
+            ));
+        }
+        points.sort();
+        Ok(InputScript(points))
+    }
+
+    fn keys_at(&self, frame: u64) -> u16 {
+        match self.0.partition_point(|&(f, _)| f <= frame) {
+            0 => 0x3FF,
+            n => self.0[n - 1].1,
         }
     }
 }
@@ -207,6 +334,7 @@ fn cmd_frames(args: &[String]) -> Result<(), String> {
     let mut out: Option<String> = None;
     let mut keys = 0x3FFu16; // active-low: nothing pressed
     let mut demo = false; // verify-style Start/A taps (menus need edges)
+    let mut input: Option<InputScript> = None; // recorded-session replay
     let mut sav: Option<String> = None; // load backup media before boot
 
     let mut it = args.iter();
@@ -219,6 +347,9 @@ fn cmd_frames(args: &[String]) -> Result<(), String> {
             "--out" => out = Some(it.next().ok_or("--out needs a value")?.to_string()),
             "--keys" => keys = parse_hex(it.next().ok_or("--keys needs a value")?)? as u16,
             "--demo" => demo = true,
+            "--input" => {
+                input = Some(InputScript::load(it.next().ok_or("--input needs a value")?)?)
+            }
             "--sav" => sav = Some(it.next().ok_or("--sav needs a value")?.to_string()),
             other if rom_path.is_none() => rom_path = Some(other.to_string()),
             other => return Err(format!("unexpected argument {other:?}")),
@@ -258,9 +389,27 @@ fn cmd_frames(args: &[String]) -> Result<(), String> {
     // cycles to the PC that incurred them; dump the histogram at exit.
     let cost_from: Option<u64> = std::env::var("RECOMP_COST_FROM").ok().and_then(|v| v.parse().ok());
     let mut cost: std::collections::HashMap<u32, u64> = std::collections::HashMap::new();
+    // Triage (RECOMP_WATCH=hexaddr): print a guest word at every frame
+    // where it changes — pairs with the reference harness's REF_WATCH
+    // for state-timeline diffs.
+    let watch: Option<u32> = std::env::var("RECOMP_WATCH")
+        .ok()
+        .and_then(|v| u32::from_str_radix(v.trim_start_matches("0x"), 16).ok());
+    let mut watch_last: Option<u32> = None;
     for _ in 0..frames {
         if demo {
             m.bus.keys = demo_keys(m.bus.frames);
+        }
+        if let Some(s) = &input {
+            m.bus.keys = s.keys_at(m.bus.frames);
+        }
+        if let Some(a) = watch {
+            use gba_core::Bus as _;
+            let v = m.bus.read32(a);
+            if watch_last != Some(v) {
+                eprintln!("WATCH f={} [{a:08x}]={v:08x}", m.bus.frames);
+                watch_last = Some(v);
+            }
         }
         if cost_from.is_some_and(|n| m.bus.frames >= n) {
             m.bus.frame_ready = false;
@@ -369,6 +518,16 @@ fn cmd_frames(args: &[String]) -> Result<(), String> {
     if let Some(p) = std::env::var_os("RECOMP_DUMP_IWRAM") {
         std::fs::write(&p, &m.bus.iwram).map_err(|e| e.to_string())?;
         eprintln!("dumped iwram to {}", p.to_string_lossy());
+    }
+    // Triage: dump PPU state (<prefix>.{oam,vram,pal,io}) for offline
+    // sprite/tile decoding.
+    if let Some(p) = std::env::var_os("RECOMP_DUMP_PPU") {
+        let p = p.to_string_lossy();
+        std::fs::write(format!("{p}.oam"), &m.bus.oam).map_err(|e| e.to_string())?;
+        std::fs::write(format!("{p}.vram"), &m.bus.vram).map_err(|e| e.to_string())?;
+        std::fs::write(format!("{p}.pal"), &m.bus.palette).map_err(|e| e.to_string())?;
+        std::fs::write(format!("{p}.io"), &m.bus.io).map_err(|e| e.to_string())?;
+        eprintln!("dumped ppu state to {p}.*");
     }
 
     // FNV-1a over the framebuffer for cheap regression hashing.
@@ -611,6 +770,25 @@ fn cmd_play(args: &[String]) -> Result<(), String> {
         eprintln!("loaded {sav_path}");
     }
 
+    // Triage (RECOMP_RECORD_INPUT=<path>): record this session's input as
+    // a replayable script (frames/runc/verify --input). The save state at
+    // session start is snapshotted next to it so the replay boots from
+    // identical backup media.
+    let mut record: Option<(std::fs::File, u16)> = match std::env::var_os("RECOMP_RECORD_INPUT") {
+        None => None,
+        Some(p) => {
+            use std::io::Write;
+            let p = p.to_string_lossy().into_owned();
+            if std::path::Path::new(&sav_path).is_file() {
+                let _ = std::fs::copy(&sav_path, format!("{p}.sav"));
+            }
+            let mut f = std::fs::File::create(&p).map_err(|e| format!("{p}: {e}"))?;
+            writeln!(f, "gba-input v1").map_err(|e| e.to_string())?;
+            eprintln!("recording input to {p}");
+            Some((f, 0x3FF))
+        }
+    };
+
     let title = Path::new(&rom_path)
         .file_stem()
         .and_then(|s| s.to_str())
@@ -756,6 +934,13 @@ fn cmd_play(args: &[String]) -> Result<(), String> {
             }
         }
         m.bus.keys = keys;
+        if let Some((f, last)) = &mut record {
+            if keys != *last {
+                use std::io::Write;
+                let _ = writeln!(f, "{} {keys:03x}", m.bus.frames);
+                *last = keys;
+            }
+        }
 
         // Audio-clock pacing: the device callback consumes at a fixed
         // rate, so run exactly as many frames as the ring needs —
@@ -991,6 +1176,7 @@ fn cmd_play(args: &[String]) -> Result<(), String> {
         std::fs::write(&sav_path, data).map_err(|e| format!("{sav_path}: {e}"))?;
         eprintln!("saved {sav_path}");
     }
+    print_fallback_census();
     Ok(())
 }
 
@@ -1047,7 +1233,10 @@ fn ensure_native(
         }
     }
     std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-    let lib_path = dir.join(format!("{sha}.dylib"));
+    // Experimental EWRAM translations get their own cache entry so they
+    // can never be loaded by (or shadow) a normal run.
+    let suffix = if std::env::var_os("RECOMP_EWRAM").is_some() { "-e" } else { "" };
+    let lib_path = dir.join(format!("{sha}{suffix}.dylib"));
     let lib_str = lib_path.to_str().ok_or("non-UTF8 cache path")?;
     if !lib_path.is_file() {
         eprintln!("first launch: translating image (one-time)...");
@@ -1539,6 +1728,11 @@ fn build_dylib(
     // control-transfer targets in EWRAM/IWRAM, then translate the observed
     // RAM-resident code from the end-of-run snapshot (content-guarded at
     // execution time).
+    // RECOMP_EWRAM=1 (experimental): seed and translate EWRAM-resident
+    // code too, under the same whole-block content guards as IWRAM.
+    // Default-off pending the resident-vs-streamed-overlay measurements
+    // for the labels design.
+    let ewram_xlat = std::env::var_os("RECOMP_EWRAM").is_some();
     let (seeds, ewram, iwram) = if !ram {
         (Vec::new(), Vec::new(), Vec::new())
     } else {
@@ -1559,10 +1753,16 @@ fn build_dylib(
             // ROM targets recover code static traversal can't reach
             // (computed branches, handlers installed by RAM code) and
             // need no guard — ROM is immutable. IWRAM blocks are
-            // content-guarded at execution time. EWRAM stays excluded:
-            // it commonly holds streamed overlays, which defeat entry
-            // guards; that needs write-watch invalidation first.
-            let seedable = |pc: u32| pc >> 24 == 3 || (0x08..=0x0D).contains(&(pc >> 24));
+            // content-guarded at execution time. EWRAM stays excluded
+            // by default: it commonly holds streamed overlays, where
+            // entry guards detect the swap but the hash-then-interpret
+            // cycle is pure overhead; RECOMP_EWRAM opts in (resident
+            // EWRAM engines, where the guard always passes).
+            let seedable = |pc: u32| {
+                pc >> 24 == 3
+                    || (ewram_xlat && pc >> 24 == 2)
+                    || (0x08..=0x0D).contains(&(pc >> 24))
+            };
             match m.step() {
                 StepEvent::Instr(instr) => {
                     let pc = m.cpu.regs[15];
@@ -1583,10 +1783,9 @@ fn build_dylib(
         (seeds.into_iter().collect::<Vec<u32>>(), m.bus.ewram.clone(), m.bus.iwram.clone())
     };
 
-    let _ = &ewram;
     let view = analyze::View {
         rom: &rom,
-        ewram: None,
+        ewram: if ram && ewram_xlat { Some(&ewram) } else { None },
         iwram: if ram { Some(&iwram) } else { None },
     };
     let analysis = analyze::analyze(&view, &seeds);
@@ -1652,11 +1851,15 @@ type BlockFn = extern "C" fn(*const gba_core::capi::RtApi, *mut std::ffi::c_void
 struct BlockTable {
     rom: Vec<Option<BlockFn>>,
     iwram: Vec<Option<BlockFn>>,
+    /// Dense EWRAM table, allocated only when an EWRAM block exists
+    /// (experimental RECOMP_EWRAM builds).
+    ewram: Vec<Option<BlockFn>>,
     other: std::collections::HashMap<u32, BlockFn>,
     len: usize,
 }
 
 const IWRAM_BASE: u32 = 0x0300_0000;
+const EWRAM_BASE: u32 = 0x0200_0000;
 
 impl BlockTable {
     fn load(lib: &libloading::Library) -> Result<BlockTable, String> {
@@ -1675,9 +1878,13 @@ impl BlockTable {
                 rom_max = rom_max.max(r + 1);
             }
         }
+        let any_ewram = blocks
+            .iter()
+            .any(|b| (b.key.wrapping_sub(EWRAM_BASE) as usize) < 0x4_0000);
         let mut t = BlockTable {
             rom: vec![None; rom_max],
             iwram: vec![None; 0x8000],
+            ewram: vec![None; if any_ewram { 0x4_0000 } else { 0 }],
             other: std::collections::HashMap::new(),
             len: blocks.len(),
         };
@@ -1699,7 +1906,12 @@ impl BlockTable {
                 }
                 t.iwram[w] = Some(b.func);
             } else {
-                t.other.insert(b.key, b.func);
+                let e = b.key.wrapping_sub(EWRAM_BASE) as usize;
+                if e < t.ewram.len() {
+                    t.ewram[e] = Some(b.func);
+                } else {
+                    t.other.insert(b.key, b.func);
+                }
             }
         }
         Ok(t)
@@ -1714,6 +1926,10 @@ impl BlockTable {
         let w = key.wrapping_sub(IWRAM_BASE) as usize;
         if w < self.iwram.len() {
             return self.iwram[w];
+        }
+        let e = key.wrapping_sub(EWRAM_BASE) as usize;
+        if e < self.ewram.len() {
+            return self.ewram[e];
         }
         if self.other.is_empty() {
             None
@@ -1740,6 +1956,10 @@ fn run_frame_native(
     let mut native = 0u64;
     let mut fallback = 0u64;
     let mut steps = 0u64;
+    // Fallback-entry detection state (RECOMP_TRACE_FALLBACK): end address
+    // of the previous fallback instruction; MAX = last step wasn't a
+    // straight-line fallback continuation.
+    let mut fb_prev_end = u32::MAX;
     while !m.bus.frame_ready && steps < max_steps {
         steps += 1;
         // Interrupt machinery and sleep states go through Machine::step.
@@ -1775,9 +1995,26 @@ fn run_frame_native(
                 }
                 f(&RT_API, mptr);
                 native += 1;
+                fb_prev_end = u32::MAX;
             }
             None => {
-                m.step();
+                // Diagnostic (RECOMP_TRACE_FALLBACK): census of fallback
+                // *entries* — the dispatch keys that would be labels.
+                // Straight-line continuation inside a fallback run is not
+                // an entry; the same discontinuity filter as the build
+                // profiler applies.
+                if trace_fallback() {
+                    if key & !1 != fb_prev_end {
+                        FALLBACK_ENTRIES
+                            .with(|h| *h.borrow_mut().entry(key).or_insert(0u64) += 1);
+                    }
+                    fb_prev_end = match m.step() {
+                        StepEvent::Instr(i) => i.addr.wrapping_add(i.size()),
+                        StepEvent::Idle => u32::MAX,
+                    };
+                } else {
+                    m.step();
+                }
                 fallback += 1;
             }
         }
@@ -1793,6 +2030,56 @@ thread_local! {
     /// Diagnostic (RECOMP_TRACE_IWRAM): executed-IWRAM-native census.
     static IWRAM_HITS: std::cell::RefCell<std::collections::HashMap<u32, u64>> =
         std::cell::RefCell::new(std::collections::HashMap::new());
+
+    /// Diagnostic (RECOMP_TRACE_FALLBACK): fallback-entry census —
+    /// dispatch keys (addr | thumb) that missed the block table, with
+    /// hit counts. Entries only, not straight-line continuations.
+    static FALLBACK_ENTRIES: std::cell::RefCell<std::collections::HashMap<u32, u64>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+fn trace_fallback() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("RECOMP_TRACE_FALLBACK").is_some())
+}
+
+/// Dump the fallback-entry census: per-region totals plus the hottest
+/// entries. Resident code shows as few entries with huge counts;
+/// streamed overlays as many entries with small counts.
+fn print_fallback_census() {
+    if !trace_fallback() {
+        return;
+    }
+    let region_name = |key: u32| match key >> 24 {
+        0 => "bios",
+        2 => "ewram",
+        3 => "iwram",
+        8..=0xD => "rom",
+        _ => "other",
+    };
+    FALLBACK_ENTRIES.with(|h| {
+        let h = h.borrow();
+        let mut per: std::collections::BTreeMap<&str, (u64, u64)> = Default::default();
+        for (&k, &n) in h.iter() {
+            let e = per.entry(region_name(k)).or_insert((0, 0));
+            e.0 += 1;
+            e.1 += n;
+        }
+        eprintln!("FALLBACK census: {} distinct entries", h.len());
+        for (r, (distinct, hits)) in &per {
+            eprintln!("  {r:>5}: {distinct} entries, {hits} hits");
+        }
+        let mut v: Vec<(u32, u64)> = h.iter().map(|(&k, &n)| (k, n)).collect();
+        v.sort_by_key(|&(_, n)| std::cmp::Reverse(n));
+        for (k, n) in v.iter().take(25) {
+            eprintln!(
+                "  {} {:08x} {} {n}",
+                region_name(*k),
+                k & !1,
+                if k & 1 != 0 { "t" } else { "a" }
+            );
+        }
+    });
 }
 
 /// Run a recompiled image: translated blocks where available, interpreter
@@ -1802,6 +2089,7 @@ fn cmd_runc(args: &[String]) -> Result<(), String> {
     let mut rom_path = None;
     let mut frames = 600u64;
     let mut out: Option<String> = None;
+    let mut input: Option<InputScript> = None;
     let mut it = args.iter();
     while let Some(arg) = it.next() {
         match arg.as_str() {
@@ -1810,6 +2098,9 @@ fn cmd_runc(args: &[String]) -> Result<(), String> {
                     .parse().map_err(|e| format!("bad frames: {e}"))?
             }
             "--out" => out = Some(it.next().ok_or("--out needs a value")?.to_string()),
+            "--input" => {
+                input = Some(InputScript::load(it.next().ok_or("--input needs a value")?)?)
+            }
             other if rom_path.is_none() => rom_path = Some(other.to_string()),
             other => return Err(format!("unexpected argument {other:?}")),
         }
@@ -1843,6 +2134,9 @@ fn cmd_runc(args: &[String]) -> Result<(), String> {
     let mut cost: std::collections::HashMap<u32, u64> = std::collections::HashMap::new();
     while m.bus.frames < frames {
         let before = m.bus.frames;
+        if let Some(s) = &input {
+            m.bus.keys = s.keys_at(before);
+        }
         if cost_from.is_some_and(|n| m.bus.frames >= n) {
             use gba_core::capi::RT_API;
             m.bus.frame_ready = false;
@@ -1951,6 +2245,7 @@ fn cmd_runc(args: &[String]) -> Result<(), String> {
             println!("iwram natives executed: {}", v.len());
         });
     }
+    print_fallback_census();
     dump_frame(&m, out)?;
     Ok(())
 }
@@ -1962,6 +2257,7 @@ fn cmd_verify(args: &[String]) -> Result<(), String> {
     let mut frames = 600u64;
     let mut reuse = false;
     let mut dump: Option<String> = None;
+    let mut input: Option<String> = None;
     let mut it = args.iter();
     while let Some(arg) = it.next() {
         match arg.as_str() {
@@ -1974,6 +2270,9 @@ fn cmd_verify(args: &[String]) -> Result<(), String> {
             // <prefix>.interp.ppm / <prefix>.recomp.ppm.
             "--reuse" => reuse = true,
             "--dump" => dump = Some(it.next().ok_or("--dump needs a value")?.to_string()),
+            "--input" => {
+                input = Some(it.next().ok_or("--input needs a value")?.to_string())
+            }
             other if rom_path.is_none() => rom_path = Some(other.to_string()),
             other => return Err(format!("unexpected argument {other:?}")),
         }
@@ -1985,9 +2284,10 @@ fn cmd_verify(args: &[String]) -> Result<(), String> {
     if !(reuse && Path::new(&format!("out/{stem}.dylib")).is_file()) {
         cmd_build(&[rom_path.clone()])?;
     }
-    let interp = run_hash(&rom_path, frames, false,
+    let script = input.as_deref().map(InputScript::load).transpose()?;
+    let interp = run_hash(&rom_path, frames, false, script.as_ref(),
         dump.as_ref().map(|p| format!("{p}.interp.ppm")))?;
-    let recomp = run_hash(&rom_path, frames, true,
+    let recomp = run_hash(&rom_path, frames, true, script.as_ref(),
         dump.as_ref().map(|p| format!("{p}.recomp.ppm")))?;
     let verdict = if interp == recomp { "MATCH" } else { "MISMATCH" };
     println!("verify {verdict} interp={interp:016x} recomp={recomp:016x}");
@@ -2035,13 +2335,18 @@ fn run_hash(
     rom_path: &str,
     frames: u64,
     recompiled: bool,
+    input: Option<&InputScript>,
     dump: Option<String>,
 ) -> Result<u64, String> {
     let rom = std::fs::read(rom_path).map_err(|e| format!("{rom_path}: {e}"))?;
     let mut m = Machine::new(rom);
+    let keys_at = |frame: u64| match input {
+        Some(s) => s.keys_at(frame),
+        None => demo_keys(frame),
+    };
     if !recompiled {
         for _ in 0..frames {
-            m.bus.keys = demo_keys(m.bus.frames);
+            m.bus.keys = keys_at(m.bus.frames);
             m.run_frame(5_000_000);
         }
         dump_frame(&m, dump)?;
@@ -2056,7 +2361,7 @@ fn run_hash(
     let mptr = &mut m as *mut Machine as *mut std::ffi::c_void;
     while m.bus.frames < frames {
         let before = m.bus.frames;
-        m.bus.keys = demo_keys(before);
+        m.bus.keys = keys_at(before);
         run_frame_native(&mut m, &table, mptr, FRAME_STEP_GUARD);
         if m.bus.frames == before {
             return Err("step guard exceeded".into());

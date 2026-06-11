@@ -800,7 +800,10 @@ impl MemMap {
         {
             static TRACE_IOW: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
             if *TRACE_IOW.get_or_init(|| std::env::var_os("RECOMP_TRACE_IOW").is_some())
-                && ((0x10..0x20).contains(&off) || (0x50..0x56).contains(&off))
+                && (off < 2
+                    || (0x10..0x20).contains(&off)
+                    || (0x40..0x4C).contains(&off)
+                    || (0x50..0x56).contains(&off))
             {
                 eprintln!(
                     "IOW f={} line={} lcyc={} off={:02x} val={:02x}",

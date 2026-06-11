@@ -73,8 +73,14 @@ extern "C" fn rt_guard(m: *mut core::ffi::c_void, addr: u32, len: u32, expect: u
     let bus = &mut mach!(m).bus;
     let mut h = 0xcbf2_9ce4_8422_2325u64;
     let off = (addr & 0x7FFF) as usize;
+    let eoff = (addr & 0x3_FFFF) as usize;
     if addr >> 24 == 3 && off + len as usize <= bus.iwram.len() {
         for &b in &bus.iwram[off..off + len as usize] {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x1_0000_01b3);
+        }
+    } else if addr >> 24 == 2 && eoff + len as usize <= bus.ewram.len() {
+        for &b in &bus.ewram[eoff..eoff + len as usize] {
             h ^= b as u64;
             h = h.wrapping_mul(0x1_0000_01b3);
         }
