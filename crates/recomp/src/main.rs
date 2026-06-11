@@ -596,8 +596,9 @@ fn status_line(s: &str) {
 /// semantics — `--ram` builds bake interpreter-profiled state (seeds +
 /// RAM snapshots) into the translation, so HLE/core fixes count too.
 /// Rev history: 1 = initial; 2 = HuffUnComp HLE, whole-block RAM
-/// guards, conditional-BL link fix.
-const TRANSLATION_REV: u32 = 2;
+/// guards, conditional-BL link fix; 3 = MidiKey2Freq HLE + sound
+/// FIFO/DMA timing fixes (profiled state shifts).
+const TRANSLATION_REV: u32 = 3;
 
 /// Locate (or build) the cached native translation for this image.
 /// Cache key is the ROM's SHA-256 under the `TRANSLATION_REV` directory,
