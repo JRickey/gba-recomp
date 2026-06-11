@@ -1,0 +1,681 @@
+//! In-house (R) sound-driver HLE shadow mixer (the engine that ships
+//! its "AUDIO ERROR" diagnostics — see `engine::Engine::Rdiag`).
+//!
+//! The driver is a MONO software mixer: once per frame its tick runs
+//! sequencer → ADSR → **mix** (224 samples @ 13379 Hz of s8 voices into
+//! an s16 IWRAM accumulator, saturated to s8 into a double buffer) →
+//! **advance** (positions committed in place in the voice structs).
+//! Every VBlank the front buffer is re-armed on DMA1 → FIFO A (the only
+//! FIFO used; routed to both speakers).
+//!
+//! The whole driver core is one ARM blob copied raw to IWRAM at init,
+//! which makes the shadow surface ideal: a byte-signature scan finds the
+//! blob, the mix/advance entries are found by opcode-shape signatures,
+//! and every global the mixer touches is harvested from the blob's own
+//! pc-relative literals — no per-title constants anywhere.
+//!
+//! Resync model (GAX-style, zero drift): the mix-entry hook snapshots
+//! voice state while it is final-for-the-chunk and untouched; the
+//! advance-entry hooks then pick up each voice's **step cache** (+0x08,
+//! written by the guest mixer with the exact 9.23 step it used, consumed
+//! and zeroed by the guest advance pass right after our hook). A nonzero
+//! cache also marks exactly the voices the guest rendered, so the
+//! 8-voice mix budget and revision-specific voice-stealing come along
+//! for free. The guest owns all struct updates — the shadow only reads.
+
+use crate::mp2k::MemView;
+use crate::shadow::Verifier;
+
+/// ARM prologue of the blob's note-on routine — the blob base. Present
+/// in ROM (copy source) and IWRAM (live) in every known build.
+const NOTE_ON_SIG: [u8; 16] = [
+    0x00, 0x40, 0x2D, 0xE9, 0x03, 0x30, 0xC5, 0xE5, 0x24, 0x10, 0x85, 0xE5, 0x01, 0x70,
+    0xC5, 0xE5,
+];
+
+/// Voice struct layout (stride 0x28), identical across the family.
+const V_STATE: u32 = 0x00;
+const V_MODE: u32 = 0x01;
+const V_VOL: u32 = 0x03;
+const V_GRP: u32 = 0x06;
+const V_STEP: u32 = 0x08;
+const V_POS: u32 = 0x0C;
+const V_FRAC: u32 = 0x10;
+const V_ENV: u32 = 0x14;
+const V_INSTR: u32 = 0x20;
+const V_STRIDE: u32 = 0x28;
+/// Instrument header fields the mixer path reads.
+const I_LOOP_LEN: u32 = 0x14;
+const I_END: u32 = 0x18;
+
+const MAX_VOICES: usize = 128;
+
+/// Detection result: blob source located in ROM (the IWRAM copy is
+/// found again at runtime — same bytes, possibly any base).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RdrvSig {
+    pub blob_rom_off: usize,
+}
+
+pub fn detect(rom: &[u8]) -> Option<RdrvSig> {
+    find(rom, &NOTE_ON_SIG).map(|pos| RdrvSig { blob_rom_off: pos })
+}
+
+fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    if hay.len() < needle.len() {
+        return None;
+    }
+    let first = needle[0];
+    let mut i = 0;
+    while i + needle.len() <= hay.len() {
+        match hay[i..].iter().position(|&b| b == first) {
+            Some(o) => {
+                i += o;
+                if i + needle.len() > hay.len() {
+                    return None;
+                }
+                if &hay[i..i + needle.len()] == needle {
+                    return Some(i);
+                }
+                i += 1;
+            }
+            None => return None,
+        }
+    }
+    None
+}
+
+/// One shadowed voice. `pos` is an absolute guest byte address (s8 PCM,
+/// usually ROM) plus the 23-bit fraction; `step` is the guest's own
+/// effective step for this chunk (from the +0x08 cache).
+#[derive(Clone, Copy)]
+struct Voice {
+    on: bool,
+    /// Struct address, for the step pickup at the advance hook.
+    addr: u32,
+    pos: f64,
+    end: f64,
+    loop_len: u32,
+    /// One-shot (1/3) vs loop (2/4) per the sample mode byte.
+    looping: bool,
+    /// Source samples per guest output sample.
+    step: f64,
+    /// Integer gain chain result (0..~0x80) over 128.
+    gain: f32,
+    dead: bool,
+}
+
+impl Default for Voice {
+    fn default() -> Voice {
+        Voice {
+            on: false,
+            addr: 0,
+            pos: 0.0,
+            end: 0.0,
+            loop_len: 0,
+            looping: false,
+            step: 0.0,
+            gain: 0.0,
+            dead: false,
+        }
+    }
+}
+
+/// Globals harvested from the blob's literals at engage time.
+#[derive(Default, Clone, Copy)]
+struct Layout {
+    /// Hook PCs (ARM, IWRAM): mix entry, advance_music, advance_fx.
+    mix_all: u32,
+    adv_music: u32,
+    adv_fx: u32,
+    /// Voice arrays: base + count (counts deref'd from ROM words).
+    fx_base: u32,
+    fx_count: u32,
+    music_base: u32,
+    music_count: u32,
+    /// Music-mute gate (u32; ==1 skips the music array entirely).
+    gate: u32,
+    /// Chunk sample count global (0xE0 on the shipped rate).
+    chunk_ptr: u32,
+    /// Gain globals: FX master, tune master, channel volume table, and
+    /// the later revision's extra per-channel table (0 = absent).
+    fxvol: u32,
+    tunevol: u32,
+    chanvol: u32,
+    chanvol2: u32,
+}
+
+pub struct RdrvHle {
+    pub active: bool,
+    pub engaged: bool,
+    pub vf: Verifier,
+    pub hooks: u64,
+    pub stale_ticks: u64,
+    pub bad_waves: u64,
+    lay: Layout,
+    /// Snapshot taken at the mix hook; activated by the step pickup.
+    pending: [Voice; MAX_VOICES],
+    voices: [Voice; MAX_VOICES],
+    count: usize,
+    /// Grid samples per guest output sample (65536 / mix rate).
+    mix_step: f64,
+    /// Stream-level canon-domain ZOH (mono).
+    chk_hold: f32,
+    chk_acc: f64,
+    engage_backoff: u32,
+    last_hook_cursor: u64,
+    /// Cursor of the last step pickup, so the fx-advance hook only
+    /// commits when the music pass didn't (music paused).
+    steps_cursor: u64,
+}
+
+impl RdrvHle {
+    pub fn new(_sig: RdrvSig) -> RdrvHle {
+        RdrvHle {
+            active: true,
+            engaged: false,
+            vf: Verifier::new(),
+            hooks: 0,
+            stale_ticks: 0,
+            bad_waves: 0,
+            lay: Layout::default(),
+            pending: [Voice::default(); MAX_VOICES],
+            voices: [Voice::default(); MAX_VOICES],
+            count: 0,
+            mix_step: 65536.0 / 13379.0,
+            chk_hold: 0.0,
+            chk_acc: 0.0,
+            engage_backoff: 0,
+            last_hook_cursor: 0,
+            steps_cursor: 0,
+        }
+    }
+
+    #[inline(always)]
+    pub fn hook_match(&self, key: u32) -> bool {
+        self.engaged
+            && (key == self.lay.mix_all || key == self.lay.adv_music || key == self.lay.adv_fx)
+    }
+
+    /// Periodic pre-engage probe (driven from the audio pump): find the
+    /// live IWRAM copy of the driver blob and harvest every global from
+    /// its own code. Cheap: a byte scan a few times per second until the
+    /// guest's init has run.
+    pub fn try_engage(&mut self, mem: &MemView) {
+        if self.engaged || !self.active {
+            return;
+        }
+        self.engage_backoff = self.engage_backoff.wrapping_add(1);
+        if self.engage_backoff % 16 != 0 {
+            return;
+        }
+        let Some(off) = find(mem.iwram, &NOTE_ON_SIG) else { return };
+        let blob = 0x0300_0000 + off as u32;
+        if let Some(lay) = harvest(mem, blob) {
+            self.lay = lay;
+            self.engaged = true;
+        }
+    }
+
+    /// Mix-entry hook: every voice's state for the upcoming chunk is
+    /// final (sequencer + envelopes already ran; positions are
+    /// chunk-start; the guest's advance pass commits them after mixing).
+    fn mix_hook(&mut self, mem: &MemView, audio_cursor: u64) {
+        // Re-fired inside the same grid sample (fallback double
+        // dispatch): idempotent by construction — skip entirely so the
+        // diagnostics and cadence stay sane.
+        let gap =
+            audio_cursor.saturating_sub(self.last_hook_cursor) / crate::mem::AUDIO_SAMPLE_CYCLES;
+        if gap < 8 && self.hooks > 0 {
+            return;
+        }
+        self.hooks += 1;
+        // Liveness: the blob is copied once and stays put, but the hook
+        // word is one load away — verify and rescan on any rebuild.
+        if mem.u32(self.lay.mix_all).map(|w| w & 0xFFFF_F000) != Some(0xE24D_D000) {
+            self.stale_ticks += 1;
+            self.engaged = false;
+            return;
+        }
+        // Hook cadence is the tick rate; chunk count makes it the mix
+        // rate (self-calibrating; the engine has a 4-row rate table).
+        let chunk = self.lay.chunk_ptr_deref(mem).unwrap_or(224).clamp(64, 512) as f64;
+        self.last_hook_cursor = audio_cursor;
+        if (256..=4096).contains(&gap) {
+            let step = gap as f64 / chunk;
+            self.mix_step =
+                if self.hooks < 8 { step } else { self.mix_step * 0.9 + step * 0.1 };
+        }
+
+        let gate_music = mem.u32(self.lay.gate) == Some(1);
+        let fxvol = mem.u8(self.lay.fxvol).unwrap_or(0) as u32;
+        let tunevol = mem.u8(self.lay.tunevol).unwrap_or(0) as u32;
+
+        let mut n = 0usize;
+        let groups: [(u32, u32, bool); 2] = [
+            (self.lay.fx_base, self.lay.fx_count, false),
+            (self.lay.music_base, self.lay.music_count, true),
+        ];
+        for (base, cnt, is_music) in groups {
+            for i in 0..cnt {
+                if n >= MAX_VOICES {
+                    break;
+                }
+                let va = base + i * V_STRIDE;
+                let v = &mut self.pending[n];
+                n += 1;
+                *v = Voice { addr: va, ..Voice::default() };
+                let Some(state) = mem.u8(va + V_STATE) else { continue };
+                if state != 0x11 && state != 0x12 {
+                    continue;
+                }
+                if is_music && gate_music {
+                    continue;
+                }
+                let grp = mem.u8(va + V_GRP).unwrap_or(0xFF) as i8;
+                let mode = mem.u8(va + V_MODE).unwrap_or(0);
+                let vol = mem.u8(va + V_VOL).unwrap_or(0) as u32;
+                let env = mem.u32(va + V_ENV).unwrap_or(0);
+                let pos = mem.u32(va + V_POS).unwrap_or(0);
+                let frac = mem.u32(va + V_FRAC).unwrap_or(0) & 0x7F_FFFF;
+                let Some(instr) = mem.u32(va + V_INSTR) else { continue };
+                let (Some(end), Some(loop_len)) =
+                    (mem.u32(instr + I_END), mem.u32(instr + I_LOOP_LEN))
+                else {
+                    self.bad_waves += 1;
+                    continue;
+                };
+                // Sample data must be addressable; hostile pointers are
+                // skipped, not followed.
+                if mem.u8(pos).is_none() || end < pos {
+                    self.bad_waves += 1;
+                    continue;
+                }
+                // Gain chain (integer-exact mirror of the guest mixer):
+                // master → channel volume (+1 bias) → optional second
+                // channel table (later revision) → velocity → ADSR.
+                let mut g = if grp < 0 {
+                    fxvol
+                } else {
+                    let ch = (grp as u32) & 0xF;
+                    let cv = mem.u8(self.lay.chanvol + ch).unwrap_or(0) as u32;
+                    let mut g = tunevol * (cv + 1) >> 7;
+                    if self.lay.chanvol2 != 0 {
+                        let cv2 = mem.u8(self.lay.chanvol2 + ch).unwrap_or(0x80) as u32;
+                        g = g * cv2 >> 7;
+                    }
+                    g
+                };
+                g = g * vol >> 7;
+                g = ((g as u64 * env as u64) >> 19) as u32;
+                v.pos = pos as f64 + frac as f64 / 8388608.0;
+                v.end = end as f64;
+                v.loop_len = loop_len;
+                v.looping = matches!(mode, 2 | 4);
+                v.gain = g as f32 / 128.0;
+                v.on = true;
+            }
+        }
+        self.count = n;
+    }
+
+    /// Advance-entry hook: the guest mixer cached each rendered voice's
+    /// effective 9.23 step at +0x08 (the advance pass consumes and
+    /// zeroes it right after this PC). Nonzero cache ⇔ the voice was
+    /// actually mixed this chunk — budget and stealing included.
+    fn steps_hook(&mut self, mem: &MemView, audio_cursor: u64, key: u32) {
+        // The music pass runs first and sees both arrays intact; the fx
+        // pass only commits when music didn't run this tick (paused).
+        if key == self.lay.adv_fx
+            && audio_cursor.saturating_sub(self.steps_cursor)
+                < crate::mem::AUDIO_SAMPLE_CYCLES * 64
+        {
+            return;
+        }
+        self.steps_cursor = audio_cursor;
+        for i in 0..self.count {
+            let v = &mut self.pending[i];
+            if v.on {
+                let step = mem.u32(v.addr + V_STEP).unwrap_or(0);
+                v.step = step as f64 / 8388608.0;
+                v.on = step != 0;
+            }
+        }
+        self.voices[..self.count].copy_from_slice(&self.pending[..self.count]);
+    }
+
+    /// Dispatch-loop entry: PC landed on one of the hook keys.
+    pub fn frame_hook(&mut self, mem: &MemView, audio_cursor: u64, key: u32) {
+        if !self.active || !self.engaged {
+            return;
+        }
+        if key == self.lay.mix_all {
+            self.mix_hook(mem, audio_cursor);
+        } else {
+            self.steps_hook(mem, audio_cursor, key);
+        }
+    }
+
+    pub fn live(&self) -> bool {
+        self.active && self.engaged && self.vf.proven
+    }
+
+    pub fn gain(&self) -> f32 {
+        self.vf.gain()
+    }
+
+    pub fn last_correlation(&self) -> (f32, f32) {
+        self.vf.last()
+    }
+
+    /// Render one grid sample: mono sum routed to both sides, bus float
+    /// scale (one full-scale FIFO DAC = 0.25). `canon` is the live FIFO
+    /// DAC pair — this family feeds FIFO A only.
+    pub fn render(&mut self, mem: &MemView, canon: [i8; 2], audio_cursor: u64) -> (f32, f32) {
+        // Starvation watchdog: ticks stopped (IWRAM rebuild, driver
+        // shutdown) — disengage and let the probe rescan.
+        if audio_cursor.saturating_sub(self.last_hook_cursor) / crate::mem::AUDIO_SAMPLE_CYCLES
+            > 3 * 1100
+        {
+            self.engaged = false;
+            self.count = 0;
+            for v in self.voices.iter_mut() {
+                v.on = false;
+            }
+            return (0.0, 0.0);
+        }
+        let gain = self.vf.gain();
+        let step_scale = 1.0 / self.mix_step;
+        let mut sum = 0.0f32;
+        for v in self.voices[..self.count].iter_mut() {
+            if !v.on || v.dead {
+                continue;
+            }
+            sum += sample_voice(v, mem, step_scale) * v.gain * gain;
+        }
+        // Canon-domain check copy: the guest mixes on its own grid and
+        // saturates the SUM to s8 — one stream-level ZOH at the guest
+        // rate, clamped, against FIFO A (FIFO B stays silent on both
+        // sides of the comparison).
+        self.chk_acc -= 1.0;
+        if self.chk_acc <= 0.0 {
+            self.chk_hold = sum.clamp(-1.0, 127.0 / 128.0);
+            self.chk_acc += self.mix_step;
+        }
+        let canon_ab = (canon[0] as f32 / 128.0, canon[1] as f32 / 128.0);
+        let _ = self.vf.judge(canon_ab, (self.chk_hold, 0.0));
+        let m = sum * 0.25;
+        (m, m)
+    }
+}
+
+impl Layout {
+    fn chunk_ptr_deref(&self, mem: &MemView) -> Option<u32> {
+        mem.u32(self.chunk_ptr)
+    }
+}
+
+fn in_iwram(v: u32) -> bool {
+    (0x0300_0000..0x0300_8000).contains(&v)
+}
+fn in_rom(v: u32) -> bool {
+    matches!(v >> 24, 0x08..=0x0D)
+}
+
+/// Decode `ldr rd, [pc, #±imm]` literals over [start, end) and return
+/// their dereferenced pool values in instruction order.
+fn pc_literals(mem: &MemView, start: u32, end: u32) -> Vec<u32> {
+    let mut out = Vec::new();
+    let mut a = start;
+    while a + 4 <= end {
+        if let Some(w) = mem.u32(a) {
+            if w & 0xFF7F_0000 == 0xE51F_0000 {
+                let imm = w & 0xFFF;
+                let lit = if w & 0x0080_0000 != 0 { a + 8 + imm } else { a + 8 - imm };
+                if let Some(v) = mem.u32(lit) {
+                    out.push(v);
+                }
+            }
+        }
+        a += 4;
+    }
+    out
+}
+
+/// Locate the mixer entries and harvest every global from the live
+/// blob's own pc-relative literals. Returns None unless every required
+/// piece is found and validates — a partial match never engages.
+fn harvest(mem: &MemView, blob: u32) -> Option<Layout> {
+    // Mix entry: `sub sp, #imm; str lr, [sp, #8]; ldr r5, [pc, ...]`.
+    let mut mix_all = 0u32;
+    let mut a = blob;
+    while a < blob + 0x200 {
+        let (Some(w0), Some(w1), Some(w2)) = (mem.u32(a), mem.u32(a + 4), mem.u32(a + 8))
+        else {
+            return None;
+        };
+        if w0 & 0xFFFF_F000 == 0xE24D_D000 && w1 == 0xE58D_E008 && w2 & 0xFFFF_F000 == 0xE59F_5000
+        {
+            mix_all = a;
+            break;
+        }
+        a += 4;
+    }
+    if mix_all == 0 {
+        return None;
+    }
+    // Advance/env entries share a 5-word prologue; exactly four hits in
+    // order advance_fx, advance_music, env_fx, env_music.
+    let mut adv = Vec::new();
+    let mut a = blob;
+    while a + 20 <= blob + 0x1800 && adv.len() < 4 {
+        if mem.u32(a) == Some(0xE92D_4000)
+            && mem.u32(a + 4).map(|w| w & 0xFFFF_F000) == Some(0xE59F_B000)
+            && mem.u32(a + 8) == Some(0xE59B_B000)
+            && mem.u32(a + 12).map(|w| w & 0xFFFF_F000) == Some(0xE59F_A000)
+            && mem.u32(a + 16) == Some(0xE08A_A00B)
+        {
+            adv.push(a);
+        }
+        a += 4;
+    }
+    if adv.len() < 2 {
+        return None;
+    }
+    let (adv_fx, adv_music) = (adv[0], adv[1]);
+
+    // Globals from the mix entry's literal sequence: mixbuf, budget,
+    // fxcount(ROM), fx_base, gate, musiccount(ROM), music_base, ...,
+    // mixbuf again, chunk count. Identified by value class + the
+    // repeated-mixbuf anchor rather than raw indices.
+    let lits = pc_literals(mem, mix_all, adv_fx);
+    if lits.len() < 8 || !in_iwram(lits[0]) {
+        return None;
+    }
+    let mixbuf = lits[0];
+    let fx_i = lits.iter().position(|&v| in_rom(v))?;
+    let fx_cnt_ptr = lits[fx_i];
+    let fx_base = *lits[fx_i + 1..].iter().find(|&&v| in_iwram(v))?;
+    let mus_i =
+        fx_i + 1 + lits[fx_i + 1..].iter().position(|&v| in_rom(v) && v != fx_cnt_ptr)?;
+    let mus_cnt_ptr = lits[mus_i];
+    let music_base = *lits[mus_i + 1..].iter().find(|&&v| in_iwram(v))?;
+    let gate = *lits[fx_i + 1..mus_i]
+        .iter()
+        .rev()
+        .find(|&&v| in_iwram(v) && v != fx_base)?;
+    let rep = 1 + lits[1..].iter().position(|&v| v == mixbuf)?;
+    let chunk_ptr = *lits.get(rep + 1).filter(|&&v| in_iwram(v))?;
+    let fx_count = mem.u32(fx_cnt_ptr).filter(|c| c % V_STRIDE == 0)? / V_STRIDE;
+    let music_count = mem.u32(mus_cnt_ptr).filter(|c| c % V_STRIDE == 0)? / V_STRIDE;
+    if fx_count == 0 || fx_count > 16 || music_count == 0 || music_count > 112 {
+        return None;
+    }
+    if !(64..=512).contains(&mem.u32(chunk_ptr)?) {
+        return None;
+    }
+
+    // The per-voice routine is the single bl inside the mix entry; its
+    // first literals are FX master, tune master, channel volume table —
+    // and on the later revision (two `ldrb _, [_, r6]` loads instead of
+    // one) a fourth: the extra channel table.
+    let mut mix_voice = 0u32;
+    let mut a = mix_all;
+    while a < adv_fx {
+        if let Some(w) = mem.u32(a) {
+            if w & 0xFF00_0000 == 0xEB00_0000 {
+                let imm = ((w & 0x00FF_FFFF) << 8) as i32 >> 8;
+                let t = a.wrapping_add(8).wrapping_add((imm * 4) as u32);
+                if t > blob && t < blob + 0x1800 {
+                    mix_voice = t;
+                    break;
+                }
+            }
+        }
+        a += 4;
+    }
+    if mix_voice == 0 {
+        return None;
+    }
+    let mv_lits = pc_literals(mem, mix_voice, mix_voice + 0x80);
+    if mv_lits.len() < 3 || !mv_lits[..3].iter().all(|&v| in_iwram(v)) {
+        return None;
+    }
+    let mut ldrb_r6 = 0;
+    let mut a = mix_voice;
+    while a < mix_voice + 0x100 {
+        if mem.u32(a).map(|w| w & 0xFFF0_0FFF) == Some(0xE7D0_0006) {
+            ldrb_r6 += 1;
+        }
+        a += 4;
+    }
+    let chanvol2 = if ldrb_r6 >= 2 { *mv_lits.get(3).filter(|&&v| in_iwram(v))? } else { 0 };
+
+    // Inner-loop sanity: the interp/accumulate opcode run must appear
+    // (store + accumulate variants) or this is not the family we know.
+    let mut inner = 0;
+    let mut a = blob;
+    while a + 16 <= blob + 0x1800 {
+        if mem.u32(a) == Some(0xE1D0_10D0)
+            && mem.u32(a + 4) == Some(0xE1D0_20D1)
+            && mem.u32(a + 8) == Some(0xE042_2001)
+            && mem.u32(a + 12) == Some(0xE003_0296)
+        {
+            inner += 1;
+        }
+        a += 4;
+    }
+    if inner < 2 {
+        return None;
+    }
+
+    Some(Layout {
+        mix_all,
+        adv_music,
+        adv_fx,
+        fx_base,
+        fx_count,
+        music_base,
+        music_count,
+        gate,
+        chunk_ptr,
+        fxvol: mv_lits[0],
+        tunevol: mv_lits[1],
+        chanvol: mv_lits[2],
+        chanvol2,
+    })
+}
+
+/// Advance and fetch one voice sample (s8/128 units) with linear
+/// interpolation, mirroring the guest inner loop: loop modes rewind by
+/// the loop length at the end address; one-shots die there. Per-chunk
+/// resync bounds any drift to one chunk.
+fn sample_voice(v: &mut Voice, mem: &MemView, step_scale: f64) -> f32 {
+    let mut guard = 0;
+    while v.pos >= v.end {
+        guard += 1;
+        if !v.looping || v.loop_len == 0 || guard > 8 {
+            v.dead = true;
+            return 0.0;
+        }
+        v.pos -= v.loop_len as f64;
+    }
+    let base = v.pos.floor();
+    let frac = (v.pos - base) as f32;
+    let a0 = base as i64 as u32;
+    let s0 = mem.u8(a0).map(|b| b as i8 as f32);
+    let s1 = mem.u8(a0.wrapping_add(1)).map(|b| b as i8 as f32);
+    let s = match (s0, s1) {
+        (Some(x), Some(y)) => (x + (y - x) * frac) / 128.0,
+        (Some(x), None) => x / 128.0,
+        _ => {
+            v.dead = true;
+            return 0.0;
+        }
+    };
+    v.pos += v.step * step_scale;
+    s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detect_gates_on_blob_signature() {
+        let mut rom = vec![0u8; 0x1000];
+        assert!(detect(&rom).is_none());
+        rom[0x200..0x210].copy_from_slice(&NOTE_ON_SIG);
+        assert_eq!(detect(&rom).unwrap().blob_rom_off, 0x200);
+    }
+
+    #[test]
+    fn voice_loop_rewind_and_one_shot() {
+        let ewram = vec![0u8; 4];
+        let iwram = vec![0u8; 4];
+        let mut rom = vec![0u8; 0x100];
+        for (i, b) in rom.iter_mut().enumerate() {
+            *b = (i as u8) & 0x3F;
+        }
+        let mem = MemView { rom: &rom, ewram: &ewram, iwram: &iwram };
+        let mut v = Voice {
+            on: true,
+            pos: 0x0800_0000u32 as f64,
+            end: 0x0800_0010u32 as f64,
+            loop_len: 8,
+            looping: true,
+            step: 3.0,
+            gain: 1.0,
+            ..Voice::default()
+        };
+        // Loop: rewinds by loop_len at end, stays alive and in range.
+        for _ in 0..64 {
+            let s = sample_voice(&mut v, &mem, 1.0) * 128.0;
+            assert!((0.0..16.0).contains(&s), "sample {s}");
+        }
+        assert!(!v.dead);
+        // One-shot: dies at the end address.
+        let mut v2 = Voice { looping: false, ..v };
+        v2.pos = 0x0800_000Eu32 as f64;
+        v2.end = 0x0800_0010u32 as f64;
+        for _ in 0..4 {
+            sample_voice(&mut v2, &mem, 1.0);
+        }
+        assert!(v2.dead);
+    }
+
+    #[test]
+    fn literal_decoder_reads_pool_values() {
+        // ldr r0,[pc,#4] at IWRAM+0 → pool at +12; ldr r1,[pc,#-8]
+        // U=0 at +4 → pool at +4 (self-referential word, value below).
+        let mut iwram = vec![0u8; 0x40];
+        iwram[0..4].copy_from_slice(&0xE59F_0004u32.to_le_bytes());
+        iwram[4..8].copy_from_slice(&0xE51F_1008u32.to_le_bytes());
+        iwram[12..16].copy_from_slice(&0xDEAD_BEEFu32.to_le_bytes());
+        let rom = vec![0u8; 4];
+        let ewram = vec![0u8; 4];
+        let mem = MemView { rom: &rom, ewram: &ewram, iwram: &iwram };
+        let lits = pc_literals(&mem, 0x0300_0000, 0x0300_0008);
+        assert_eq!(lits, vec![0xDEAD_BEEF, 0xE51F_1008]);
+    }
+}

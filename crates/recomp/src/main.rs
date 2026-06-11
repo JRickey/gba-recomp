@@ -332,6 +332,24 @@ fn cmd_frames(args: &[String]) -> Result<(), String> {
                 .unwrap_or_default()
         );
     }
+    if let Some(r) = m.bus.rdrv.as_deref() {
+        let (corr, ratio) = r.last_correlation();
+        eprintln!(
+            "rdrv: hooks={} stale={} bad_waves={} corr={corr:.3} ratio={ratio:.2} gain={:.2} pauses={} proven={} engaged={} active={}{}",
+            r.hooks,
+            r.stale_ticks,
+            r.bad_waves,
+            r.gain(),
+            r.vf.pauses,
+            r.vf.proven,
+            r.engaged,
+            r.active,
+            r.vf.reverted
+                .as_deref()
+                .map(|m| format!(" PAUSED: {m}"))
+                .unwrap_or_default()
+        );
+    }
     if let Some(prefix) = &dump_audio {
         write_wav(&format!("{prefix}.mixed.wav"), &mixed, gba_core::mem::AUDIO_RATE_HZ, 2)?;
         write_wav(&format!("{prefix}.psg.wav"), &psg, gba_core::mem::AUDIO_RATE_HZ, 2)?;
@@ -501,6 +519,14 @@ fn arm_audio_hle(m: &mut Machine) -> String {
                 )
             } else {
                 "GAX (early, unrecognized revision) — per-channel enhancement active".into()
+            }
+        }
+        gba_core::engine::Engine::Rdiag => {
+            if let Some(sig) = gba_core::rdrv::detect(&m.bus.rom) {
+                m.bus.rdrv = Some(Box::new(gba_core::rdrv::RdrvHle::new(sig)));
+                "in-house (R) — HLE shadow armed (mixer blob located at runtime)".into()
+            } else {
+                "in-house (R, unrecognized revision) — per-channel enhancement active".into()
             }
         }
         other => format!(
@@ -881,11 +907,14 @@ fn cmd_play(args: &[String]) -> Result<(), String> {
                     // inaudible) — say so, with the reason, but don't
                     // let a hopeless variant spam the log forever.
                     let live = m.bus.mp2k.as_deref().is_some_and(|h| h.live())
-                        || m.bus.gax.as_deref().is_some_and(|g| g.live());
+                        || m.bus.gax.as_deref().is_some_and(|g| g.live())
+                        || m.bus.rdrv.as_deref().is_some_and(|r| r.live());
                     let pause_msg = if let Some(h) = m.bus.mp2k.as_deref_mut() {
                         h.vf.reverted.take().map(|m| (m, h.vf.pauses))
                     } else if let Some(g) = m.bus.gax.as_deref_mut() {
                         g.vf.reverted.take().map(|m| (m, g.vf.pauses))
+                    } else if let Some(r) = m.bus.rdrv.as_deref_mut() {
+                        r.vf.reverted.take().map(|m| (m, r.vf.pauses))
                     } else {
                         None
                     };
@@ -1767,6 +1796,11 @@ fn run_frame_native(
                 m.bus.gax_frame_hook(key, r0);
             }
         }
+        if let Some(rr) = m.bus.rdrv.as_deref() {
+            if rr.hook_match(key) {
+                m.bus.rdrv_frame_hook(key);
+            }
+        }
         match table.get(key) {
             Some(f) => {
                 // Diagnostic: census of executed IWRAM natives.
@@ -1936,6 +1970,24 @@ fn cmd_runc(args: &[String]) -> Result<(), String> {
             g.engaged,
             g.active,
             g.vf.reverted
+                .as_deref()
+                .map(|m| format!(" PAUSED: {m}"))
+                .unwrap_or_default()
+        );
+    }
+    if let Some(r) = m.bus.rdrv.as_deref() {
+        let (corr, ratio) = r.last_correlation();
+        eprintln!(
+            "rdrv: hooks={} stale={} bad_waves={} corr={corr:.3} ratio={ratio:.2} gain={:.2} pauses={} proven={} engaged={} active={}{}",
+            r.hooks,
+            r.stale_ticks,
+            r.bad_waves,
+            r.gain(),
+            r.vf.pauses,
+            r.vf.proven,
+            r.engaged,
+            r.active,
+            r.vf.reverted
                 .as_deref()
                 .map(|m| format!(" PAUSED: {m}"))
                 .unwrap_or_default()

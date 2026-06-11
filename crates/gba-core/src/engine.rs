@@ -18,7 +18,7 @@ pub enum Engine {
     /// Krawall XM/S3M tracker middleware.
     Krawall,
     /// A UK studio's in-house driver (ships "AUDIO ERROR" strings).
-    RareDiag,
+    Rdiag,
     /// MusyX (string-tagged).
     MusyX,
     Unknown,
@@ -31,7 +31,7 @@ impl Engine {
             Engine::Gax(Some(v)) => format!("GAX {v}"),
             Engine::Gax(None) => "GAX (early, bannerless)".into(),
             Engine::Krawall => "Krawall".into(),
-            Engine::RareDiag => "in-house (R)".into(),
+            Engine::Rdiag => "in-house (R)".into(),
             Engine::MusyX => "MusyX".into(),
             Engine::Unknown => "unknown".into(),
         }
@@ -144,7 +144,7 @@ pub fn classify(rom: &[u8]) -> Engine {
     while let Some(i) = k {
         hits += 1;
         if hits >= 2 {
-            return Engine::RareDiag;
+            return Engine::Rdiag;
         }
         k = find(rom, b"AUDIO ERROR, ", i + 13);
     }
@@ -174,7 +174,7 @@ mod tests {
         let mut rom3 = vec![0u8; 0x4000];
         rom3[0x80..0x8D].copy_from_slice(b"AUDIO ERROR, ");
         rom3[0x200..0x20D].copy_from_slice(b"AUDIO ERROR, ");
-        assert_eq!(classify(&rom3), Engine::RareDiag);
+        assert_eq!(classify(&rom3), Engine::Rdiag);
 
         // Four-table conjunction (bannerless lineage).
         let mut rom4 = vec![0u8; 0x4000];
