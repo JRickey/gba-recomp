@@ -163,7 +163,50 @@ impl Echo {
     }
 }
 
+/// One v3 voice, snapshot of the transient 7-word mixer arg block
+/// (everything precomputed by the guest: window, 21.11 position and
+/// step, composite volume). Mono.
+#[derive(Clone, Copy, Default)]
+struct V3Voice {
+    on: bool,
+    /// Absolute byte position (u8 PCM) and window end.
+    pos: f64,
+    end: f64,
+    /// Loop length in samples; 0 = one-shot.
+    loop_len: f64,
+    /// Source samples per guest output sample.
+    step: f64,
+    /// Composite volume /256.
+    vol: f32,
+    fx: bool,
+    dead: bool,
+}
+
+/// Per-stream (music / fx) v3 state: guest mix rate and the
+/// stream-level canon-domain ZOH.
+#[derive(Clone, Copy)]
+struct V3Stream {
+    rate: f64,
+    chk_hold: f32,
+    chk_acc: f64,
+    /// Two cascaded leaky integrators (the guest's optional LPF).
+    lpf: [f32; 2],
+}
+
+impl Default for V3Stream {
+    fn default() -> V3Stream {
+        V3Stream { rate: 15769.0, chk_hold: 0.0, chk_acc: 0.0, lpf: [0.0; 2] }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Mode {
+    V1,
+    V3,
+}
+
 pub struct GaxHle {
+    mode: Mode,
     /// Guest address of the live SoundSystem block (found by scan).
     ss: u32,
     /// Dispatch key of the commit function (ARM) once engaged.
@@ -183,11 +226,23 @@ pub struct GaxHle {
     echo: Echo,
     engage_backoff: u32,
     last_hook_cursor: u64,
+    // --- v3 state ---
+    /// Work block base; hook PCs: mixer normal, mixer ping-pong,
+    /// quantizer (frame edge + canon compare point).
+    v3_work: u32,
+    v3_hooks: [u32; 3],
+    v3_pending: Vec<V3Voice>,
+    v3_voices: Vec<V3Voice>,
+    v3_music: V3Stream,
+    v3_fx: V3Stream,
+    v3_lpf_depth: f32,
+    v3_last_frame_cursor: u64,
 }
 
 impl GaxHle {
     pub fn new(_sig: GaxV1Sig) -> GaxHle {
         GaxHle {
+            mode: Mode::V1,
             ss: 0,
             hook_key: 0,
             active: true,
@@ -204,12 +259,32 @@ impl GaxHle {
             echo: Echo::new(),
             engage_backoff: 0,
             last_hook_cursor: 0,
+            v3_work: 0,
+            v3_hooks: [0; 3],
+            v3_pending: Vec::new(),
+            v3_voices: Vec::new(),
+            v3_music: V3Stream::default(),
+            v3_fx: V3Stream::default(),
+            v3_lpf_depth: 0.0,
+            v3_last_frame_cursor: 0,
         }
+    }
+
+    /// A v3-family shadow (banner-era driver): the work block is found
+    /// at runtime by its 'GAX3' magic; mode/hooks resolve at engage.
+    pub fn new_v3() -> GaxHle {
+        let mut g = GaxHle::new(GaxV1Sig { calc_note_off: 0 });
+        g.mode = Mode::V3;
+        g
     }
 
     #[inline(always)]
     pub fn hook_match(&self, key: u32) -> bool {
-        self.engaged && key == self.hook_key
+        self.engaged
+            && match self.mode {
+                Mode::V1 => key == self.hook_key,
+                Mode::V3 => self.v3_hooks.contains(&key),
+            }
     }
 
     /// Periodic pre-engage probe (driven from the audio pump): once
@@ -224,6 +299,10 @@ impl GaxHle {
         // Cheap backoff: the driver may init seconds into boot.
         self.engage_backoff = self.engage_backoff.wrapping_add(1);
         if self.engage_backoff % 16 != 0 {
+            return;
+        }
+        if self.mode == Mode::V3 {
+            self.try_engage_v3(mem);
             return;
         }
         // Scan IWRAM for the state block's self-verifying shape: the
@@ -284,12 +363,127 @@ impl GaxHle {
         true
     }
 
+    /// v3 engage: scan guest RAM for the work block's 'GAX3' magic,
+    /// then validate the structural invariants and read the three
+    /// RAM-resident code pointers (mixer normal/ping-pong, quantizer)
+    /// — discovery, magic check, and hook PCs in one (the v1 trick).
+    fn try_engage_v3(&mut self, mem: &MemView) {
+        let magic = 0x4741_5833u32;
+        let regions: [(u32, u32); 2] = [(0x0300_0000, 0x8000), (0x0200_0000, 0x4_0000)];
+        for (base, len) in regions {
+            let mut off = 0u32;
+            while off + 0x80 <= len {
+                let w = base + off;
+                if mem.u32(w) == Some(magic) && self.v3_validate(mem, w) {
+                    return;
+                }
+                off += 4;
+            }
+        }
+    }
+
+    fn v3_validate(&mut self, mem: &MemView, work: u32) -> bool {
+        // irq_state in {1,2}; the three code pointers RAM-resident and
+        // word-aligned; a sane mix rate in the active buffer header.
+        let irq_state = mem.u32(work + 0x54).unwrap_or(0);
+        if !(1..=2).contains(&irq_state) {
+            return false;
+        }
+        let mut hooks = [0u32; 3];
+        for (i, o) in [(0usize, 0x60u32), (1, 0x64), (2, 0x68)] {
+            let Some(p) = mem.u32(work + o) else { return false };
+            if p & 3 != 0 || !matches!(p >> 24, 2 | 3) {
+                return false;
+            }
+            hooks[i] = p & !3;
+        }
+        let rate_of = |hdr: u32| -> Option<f64> {
+            let h = mem.u32(hdr)?;
+            let r = mem.slice(h + 2, 2).map(|b| u16::from_le_bytes([b[0], b[1]]))?;
+            ((4000..=48000).contains(&r)).then_some(r as f64)
+        };
+        let Some(music_rate) = rate_of(work + 0x24) else { return false };
+        self.v3_music.rate = music_rate;
+        self.v3_fx.rate = rate_of(work + 0x28).unwrap_or(music_rate);
+        self.v3_work = work;
+        self.v3_hooks = hooks;
+        self.engaged = true;
+        true
+    }
+
+    /// v3 per-voice hook (mixer-loop entry): r0 points at the guest's
+    /// transient arg block — window-end ptr, mix ptr, sample count,
+    /// position (21.11, negative from window end), loop length (21.11),
+    /// composite volume, step (21.11). Everything final, nothing to
+    /// re-derive.
+    fn v3_mix_hook(&mut self, mem: &MemView, r0: u32) {
+        let Some(b) = mem.slice(r0, 28) else {
+            self.stale_ticks += 1;
+            return;
+        };
+        let w = |i: usize| u32::from_le_bytes([b[i * 4], b[i * 4 + 1], b[i * 4 + 2], b[i * 4 + 3]]);
+        let end_ptr = w(0);
+        let pos_neg = w(3) as i32;
+        let loop_len = w(4);
+        let vol = w(5);
+        let step = w(6);
+        if !matches!(end_ptr >> 24, 2 | 3 | 8..=0x0D) || step == 0 || vol == 0 {
+            return;
+        }
+        // Music or fx pass, per the work block's render-pass id (0 =
+        // single-rate/music, 2 = fx).
+        let fx = mem.u8(self.v3_work + 0x5e) == Some(2);
+        if self.v3_pending.len() < 32 {
+            self.v3_pending.push(V3Voice {
+                on: true,
+                pos: end_ptr as f64 + pos_neg as f64 / 2048.0,
+                end: end_ptr as f64,
+                loop_len: loop_len as f64 / 2048.0,
+                step: step as f64 / 2048.0,
+                vol: (vol.min(1024) as f32) / 256.0,
+                fx,
+                dead: false,
+            });
+        }
+    }
+
+    /// v3 frame edge (quantizer entry): the pass's voices are all
+    /// collected — swap them live and refresh rates/LPF depth.
+    fn v3_frame_hook(&mut self, mem: &MemView, audio_cursor: u64) {
+        self.hooks += 1;
+        self.v3_last_frame_cursor = audio_cursor;
+        // Keep the other stream's voices: passes alternate music/fx.
+        let pass_fx = mem.u8(self.v3_work + 0x5e) == Some(2);
+        self.v3_voices.retain(|v| v.fx != pass_fx);
+        self.v3_voices.append(&mut self.v3_pending);
+        self.v3_lpf_depth = mem
+            .slice(self.v3_work + 0x74, 2)
+            .map(|b| u16::from_le_bytes([b[0], b[1]]) as f32 / 256.0)
+            .unwrap_or(0.0)
+            .min(1.0);
+        // Liveness: magic still present, else rescan.
+        if mem.u32(self.v3_work) != Some(0x4741_5833) {
+            self.engaged = false;
+            self.v3_voices.clear();
+            self.v3_pending.clear();
+        }
+    }
+
     /// Per-chunk hook (commit-function entry): every mix entry is
     /// final and positions are the guest's own — resync everything.
-    pub fn frame_hook(&mut self, mem: &MemView, audio_cursor: u64) {
+    pub fn frame_hook(&mut self, mem: &MemView, audio_cursor: u64, key: u32, r0: u32) {
         if !self.active || !self.engaged {
             return;
         }
+        if self.mode == Mode::V3 {
+            if key == self.v3_hooks[2] {
+                self.v3_frame_hook(mem, audio_cursor);
+            } else {
+                self.v3_mix_hook(mem, r0);
+            }
+            return;
+        }
+        let _ = (key, r0);
         self.hooks += 1;
         // The guest renders exactly 128 samples per hook, so the hook
         // cadence IS the mix rate — self-calibrating, no timer-reload
@@ -419,10 +613,89 @@ impl GaxHle {
         self.vf.last()
     }
 
+    /// v3 render: two mono streams (music -> FIFO A, fx -> FIFO B,
+    /// both routed to both speakers by the driver's SOUNDCNT_H). The
+    /// self-check pairs each stream with its own FIFO.
+    fn render_v3(&mut self, mem: &MemView, canon: [i8; 2], audio_cursor: u64) -> (f32, f32) {
+        // Hook starvation: the driver rebuilds its RAM mixer code on
+        // song/section changes, moving the hook PCs. The work block
+        // still holds the live pointers — refresh from it; if even the
+        // magic is gone, fall back to a full rescan.
+        let starved = audio_cursor.saturating_sub(self.v3_last_frame_cursor)
+            / crate::mem::AUDIO_SAMPLE_CYCLES
+            > 3 * 1100;
+        if starved {
+            self.v3_last_frame_cursor = audio_cursor;
+            self.v3_voices.clear();
+            self.v3_pending.clear();
+            if mem.u32(self.v3_work) == Some(0x4741_5833) {
+                let mut ok = true;
+                let mut hooks = [0u32; 3];
+                for (i, o) in [(0usize, 0x60u32), (1, 0x64), (2, 0x68)] {
+                    match mem.u32(self.v3_work + o) {
+                        Some(p) if p & 3 == 0 && matches!(p >> 24, 2 | 3) => hooks[i] = p & !3,
+                        _ => ok = false,
+                    }
+                }
+                if ok {
+                    self.v3_hooks = hooks;
+                }
+            } else {
+                self.engaged = false;
+            }
+        }
+        let gain = self.vf.gain();
+        let (mut music, mut fx) = (0.0f32, 0.0f32);
+        let m_scale = self.v3_music.rate / 65536.0;
+        let f_scale = self.v3_fx.rate / 65536.0;
+        for v in self.v3_voices.iter_mut() {
+            if !v.on || v.dead {
+                continue;
+            }
+            let s = v3_sample(v, mem, if v.fx { f_scale } else { m_scale });
+            if v.fx {
+                fx += s * v.vol * gain;
+            } else {
+                music += s * v.vol * gain;
+            }
+        }
+        // Optional guest low-pass (two cascaded leaky integrators);
+        // the canon stream includes it, so ours and the check must.
+        if self.v3_lpf_depth > 0.0 {
+            let a = (self.v3_lpf_depth * (0x334 as f32 / 256.0)).min(1.0);
+            for (st, val) in
+                [(&mut self.v3_music, &mut music), (&mut self.v3_fx, &mut fx)]
+            {
+                st.lpf[0] += (*val - st.lpf[0]) * a;
+                st.lpf[1] += (st.lpf[0] - st.lpf[1]) * a;
+                *val = st.lpf[1];
+            }
+        }
+        // Stream-level canon-domain ZOH at each stream's guest rate.
+        for (st, val) in [(&mut self.v3_music, music), (&mut self.v3_fx, fx)] {
+            st.chk_acc -= 1.0;
+            if st.chk_acc <= 0.0 {
+                st.chk_hold = val;
+                st.chk_acc += 65536.0 / st.rate;
+            }
+        }
+        let sat = (
+            self.v3_music.chk_hold.clamp(-1.0, 127.0 / 128.0),
+            self.v3_fx.chk_hold.clamp(-1.0, 127.0 / 128.0),
+        );
+        let canon_ab = (canon[0] as f32 / 128.0, canon[1] as f32 / 128.0);
+        let _ = self.vf.judge(canon_ab, sat);
+        let m = (music + fx) * 0.25;
+        (m, m)
+    }
+
     /// Render one grid sample: (left, right) in bus float scale (one
     /// full-scale FIFO DAC = 0.25, matching the canon path). `canon`
     /// is the live FIFO DAC pair — v1 maps FIFO A = LEFT.
-    pub fn render(&mut self, mem: &MemView, canon: [i8; 2]) -> (f32, f32) {
+    pub fn render(&mut self, mem: &MemView, canon: [i8; 2], audio_cursor: u64) -> (f32, f32) {
+        if self.mode == Mode::V3 {
+            return self.render_v3(mem, canon, audio_cursor);
+        }
         let gain = self.vf.gain();
         let (mut l, mut r) = (0.0f32, 0.0f32);
         let (mut chk_l, mut chk_r) = (0.0f32, 0.0f32);
@@ -550,6 +823,39 @@ fn sample_voice(v: &mut Voice, mem: &MemView, step_scale: f64) -> f32 {
     };
     v.pos += v.dir * v.step * step_scale;
     s
+}
+
+/// Advance and fetch one v3 voice sample (unsigned 8-bit PCM,
+/// centered; window ends at `end`, loops back by `loop_len` samples or
+/// dies). Linear interpolation; per-frame resync bounds drift.
+fn v3_sample(v: &mut V3Voice, mem: &MemView, scale: f64) -> f32 {
+    let mut guard = 0;
+    while v.pos >= v.end {
+        guard += 1;
+        if v.loop_len <= 0.0 || guard > 8 {
+            v.dead = true;
+            return 0.0;
+        }
+        v.pos -= v.loop_len;
+    }
+    let base = v.pos.floor();
+    let frac = (v.pos - base) as f32;
+    let a0 = base as i64 as u32;
+    let s0 = mem.u8(a0);
+    let s1 = mem.u8(a0.wrapping_add(1)).or(s0);
+    let out = match (s0, s1) {
+        (Some(x), Some(y)) => {
+            let x = x as f32 - 128.0;
+            let y = y as f32 - 128.0;
+            (x + (y - x) * frac) / 128.0
+        }
+        _ => {
+            v.dead = true;
+            return 0.0;
+        }
+    };
+    v.pos += v.step * scale;
+    out
 }
 
 #[cfg(test)]

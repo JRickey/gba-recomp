@@ -83,7 +83,8 @@ impl Machine {
         if let Some(g) = self.bus.gax.as_deref() {
             let key = self.cpu.regs[15] | self.cpu.thumb() as u32;
             if g.hook_match(key) {
-                self.bus.gax_frame_hook();
+                let r0 = self.cpu.regs[0];
+                self.bus.gax_frame_hook(key, r0);
             }
         }
 

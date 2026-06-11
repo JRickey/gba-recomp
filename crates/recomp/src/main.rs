@@ -466,11 +466,16 @@ fn arm_audio_hle(m: &mut Machine) -> String {
                     .to_string();
                 m.bus.gax = Some(Box::new(gba_core::gax::GaxHle::new(sig)));
                 desc
-            } else {
+            } else if ver.is_some() {
+                // Banner era (v2/v3): the work block self-identifies at
+                // runtime ('GAX3' magic + structural validation).
+                m.bus.gax = Some(Box::new(gba_core::gax::GaxHle::new_v3()));
                 format!(
-                    "GAX {} — per-channel enhancement active (this revision's HLE pending)",
-                    ver.as_deref().unwrap_or("(early)")
+                    "GAX {} — HLE shadow armed (work block located at runtime)",
+                    ver.as_deref().unwrap_or("?")
                 )
+            } else {
+                "GAX (early, unrecognized revision) — per-channel enhancement active".into()
             }
         }
         other => format!(
@@ -1667,7 +1672,8 @@ fn run_frame_native(
         }
         if let Some(g) = m.bus.gax.as_deref() {
             if g.hook_match(key) {
-                m.bus.gax_frame_hook();
+                let r0 = m.cpu.regs[0];
+                m.bus.gax_frame_hook(key, r0);
             }
         }
         match table.get(key) {

@@ -412,7 +412,7 @@ impl MemMap {
                             // mixer family.
                             g.try_engage(&mem);
                         } else {
-                            let (hl, hr) = g.render(&mem, self.fifo_sample);
+                            let (hl, hr) = g.render(&mem, self.fifo_sample, self.audio_cursor);
                             if self.hle_tap.len() < 0x2_0000 {
                                 self.hle_tap.push(hl);
                                 self.hle_tap.push(hr);
@@ -427,16 +427,17 @@ impl MemMap {
         self.gax = gax;
     }
 
-    /// GAX HLE per-chunk hook: dispatch loops call this when PC lands
-    /// on the commit function.
-    pub fn gax_frame_hook(&mut self) {
+    /// GAX HLE hook: dispatch loops call this when PC lands on one of
+    /// the shadow's hook keys. `r0` is the guest's first argument
+    /// register (the v3 mixer receives its arg block there).
+    pub fn gax_frame_hook(&mut self, key: u32, r0: u32) {
         if let Some(mut g) = self.gax.take() {
             let mem = crate::mp2k::MemView {
                 rom: &self.rom,
                 ewram: &self.ewram,
                 iwram: &self.iwram,
             };
-            g.frame_hook(&mem, self.audio_cursor);
+            g.frame_hook(&mem, self.audio_cursor, key, r0);
             self.gax = Some(g);
         }
     }
