@@ -551,17 +551,23 @@ fn cmd_play(args: &[String]) -> Result<(), String> {
             // Audio defect surfacing: ring drops and underrun holds are
             // silent corruption — say so, with numbers, per the product bar.
             if frames_run % 300 == 0 {
-                let (d, h) = {
+                let (d, h, c) = {
                     let mut st = streams.lock().unwrap();
-                    let v = (st.drops, st.holds);
+                    let v = (st.drops, st.holds, st.clipped);
                     st.drops = 0;
                     st.holds = 0;
+                    st.clipped = 0;
                     v
                 };
                 if d + h > 0 {
                     eprintln!(
                         "DEGRADED: audio ring dropped {d} / held {h} sample pairs in the last 5 s"
                     );
+                }
+                // Soft-knee engagement is canon clipping handled better,
+                // not a defect — visible only in developer stats.
+                if show_stats && c > 0 {
+                    eprintln!("audio: soft clip engaged on {c} sample pairs in the last 5 s");
                 }
             }
 
@@ -744,6 +750,10 @@ struct AudioStreams {
     /// play loop surfaces nonzero deltas as DEGRADED.
     drops: u64,
     holds: u64,
+    /// Sample pairs that crossed the hardware rail (soft-knee engaged)
+    /// since the last report. Expected behavior on hot mixes, not a
+    /// defect — surfaced as a stats line, never DEGRADED.
+    clipped: u64,
 }
 
 /// The premium path's consumer state: one interpolator per Direct Sound
@@ -812,7 +822,17 @@ fn start_audio(
                             if st.route[1] & 1 != 0 {
                                 r += b;
                             }
-                            (e.dc[0].next(l), e.dc[1].next(r))
+                            // Stage 2: where the hardware would hard-clip
+                            // the over-rail sum, saturate it softly
+                            // instead — before the DC block, matching the
+                            // hardware order (rail precedes the output
+                            // coupling). Below the rail this is exact
+                            // identity, so unclipped material is
+                            // bit-identical to the pre-Stage-2 path.
+                            if l.abs() > RAIL || r.abs() > RAIL {
+                                st.clipped += 1;
+                            }
+                            (e.dc[0].next(soft_clip(l)), e.dc[1].next(soft_clip(r)))
                         }
                         None => {
                             // The emulated DAC runs on the 59.73 Hz frame
@@ -836,9 +856,14 @@ fn start_audio(
                         }
                     };
                     // Calibrate the hardware rail (±0x200 units = ±0.5
-                    // here) to device full scale, and clamp.
-                    let l = (l * 2.0).clamp(-1.0, 1.0);
-                    let r = (r * 2.0).clamp(-1.0, 1.0);
+                    // here) toward device full scale. Both paths share
+                    // the gain so the A/V toggle stays level-matched;
+                    // it leaves ~2 dB above the rail for the enhanced
+                    // path's soft knee. The clamp is a safety net for
+                    // DC-block overshoot — faithful content was already
+                    // rail-clipped at the mix (the canon hard clip).
+                    let l = (l * OUT_GAIN).clamp(-1.0, 1.0);
+                    let r = (r * OUT_GAIN).clamp(-1.0, 1.0);
                     match frame {
                         [m] => *m = (l + r) * 0.5,
                         [fl, fr, rest @ ..] => {
@@ -864,6 +889,27 @@ const SINC_TAPS: usize = 24;
 const SINC_PHASES: usize = 128;
 /// Ring fill the rate control steers toward (~62 ms at the 65536 Hz tap).
 const RING_TARGET: usize = 4096;
+/// Hardware clip rail in the float mix domain (±0x200 units = ±0.5).
+const RAIL: f32 = 0.5;
+/// Output gain calibrating the rail toward device full scale. 1.6 puts
+/// the rail ~2 dB under full scale — the headroom the enhanced path's
+/// soft knee lands over-rail peaks in.
+const OUT_GAIN: f32 = 1.6;
+
+/// Stage-2 soft-knee saturator (enhanced path only): exact identity
+/// through the hardware rail, then a tanh knee compressing the over-rail
+/// region (the six-channel sum can reach 3x the rail) into the headroom
+/// above it, asymptoting at full scale after OUT_GAIN. C1 at the knee.
+/// Faithful mode keeps the hard rail — clipping is sometimes the
+/// intended texture (the research note's "GBA speaker" mono examples).
+fn soft_clip(x: f32) -> f32 {
+    let a = x.abs();
+    if a <= RAIL {
+        return x;
+    }
+    let h = 1.0 / OUT_GAIN - RAIL; // headroom above the rail
+    (RAIL + h * ((a - RAIL) / h).tanh()).copysign(x)
+}
 
 /// Polyphase interpolation table: (SINC_PHASES + 1) rows of SINC_TAPS
 /// coefficients, Hann-windowed sinc at cutoff `fc` (cycles per source
@@ -1654,5 +1700,31 @@ mod tests {
         let mut q = fifo_sine(256, 1000.0, 16384);
         let out: Vec<f32> = (0..8000).map(|_| f.next(&mut q)).collect();
         assert!(out.iter().all(|v| v.abs() < 0.5));
+    }
+
+    #[test]
+    fn soft_clip_identity_below_rail_knee_above() {
+        // Bit-exact identity through the rail: unclipped material must
+        // be untouched (the Stage-2 fidelity guarantee).
+        for i in -1000..=1000i32 {
+            let x = i as f32 * (RAIL / 1000.0);
+            assert_eq!(soft_clip(x), x);
+        }
+        // Above the rail: monotonic, odd-symmetric, and bounded so that
+        // post-OUT_GAIN output never exceeds device full scale.
+        let mut prev = soft_clip(RAIL);
+        for i in 1..=300 {
+            let x = RAIL + i as f32 * 0.005;
+            let y = soft_clip(x);
+            assert!(y >= prev, "not monotonic at {x}");
+            assert!(y * OUT_GAIN <= 1.0 + 1e-4, "exceeds full scale at {x}: {y}");
+            assert_eq!(soft_clip(-x), -y);
+            prev = y;
+        }
+        // C1 at the knee: slope just above the rail stays ~1.
+        let d = (soft_clip(RAIL + 1e-3) - soft_clip(RAIL - 1e-3)) / 2e-3;
+        assert!((d - 1.0).abs() < 0.02, "knee slope {d}");
+        // The hardware's worst case (3x rail) lands just under full scale.
+        assert!(soft_clip(3.0 * RAIL) * OUT_GAIN > 0.99);
     }
 }
