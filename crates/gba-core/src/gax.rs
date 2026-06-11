@@ -305,19 +305,26 @@ impl GaxHle {
             self.try_engage_v3(mem);
             return;
         }
-        // Scan IWRAM for the state block's self-verifying shape: the
-        // four installed mixer-function pointers at +0xd0. A 32 KB
-        // scan with a one-word fast reject is microseconds, runs a few
-        // times per second until the driver initializes, and cannot
-        // false-positive past the code-byte checks.
-        for base in (0..0x8000u32 - 0xf4).step_by(4) {
-            let ss = 0x0300_0000 + base;
-            let Some(p0) = mem.u32(ss + 0xd0) else { continue };
-            if p0 & 3 != 0 || !matches!(p0 >> 24, 2 | 3 | 8) {
-                continue;
-            }
-            if self.try_engage_block(mem, ss) {
-                return;
+        // Scan RAM for the state block's self-verifying shape: the
+        // installed mixer-function pointers at +0xd0. A one-word fast
+        // reject makes the sweep microseconds; it runs a few times per
+        // second until the driver initializes, and cannot
+        // false-positive past the code-byte checks. IWRAM every probe,
+        // EWRAM (builds may allocate the block there) every fourth.
+        let mut regions: Vec<(u32, u32)> = vec![(0x0300_0000, 0x8000)];
+        if self.engage_backoff % 64 == 0 {
+            regions.push((0x0200_0000, 0x4_0000));
+        }
+        for (base, len) in regions {
+            for off in (0..len - 0xf4).step_by(4) {
+                let ss = base + off;
+                let Some(p0) = mem.u32(ss + 0xd0) else { continue };
+                if p0 & 3 != 0 || !matches!(p0 >> 24, 2 | 3 | 8) {
+                    continue;
+                }
+                if self.try_engage_block(mem, ss) {
+                    return;
+                }
             }
         }
     }
