@@ -158,6 +158,12 @@ pub struct MemMap {
     pub aff_dirty: [bool; 2],
     /// Bitmask of SWI numbers that were called but not HLE'd (triage aid).
     pub unhandled_swis: u64,
+    /// BIOS read-protection value: reads of 0x0000_0000..0x4000 from
+    /// outside the BIOS return the last-fetched BIOS opcode. Under HLE
+    /// the guest never executes BIOS code, so this is a four-state
+    /// machine stepped at the HLE seams (hardware values per the
+    /// hardware reference): startup, after-SWI, in-IRQ, after-IRQ.
+    pub bios_open: u32,
     /// Detected backup medium (drives 0x0D/0x0E region behavior).
     pub backup: BackupKind,
     pub flash: Option<Flash>,
@@ -241,6 +247,7 @@ impl MemMap {
             aff_ref: [0; 4],
             aff_dirty: [true; 2],
             unhandled_swis: 0,
+            bios_open: 0xE129_F000, // after startup
             backup,
             flash,
             eeprom,
@@ -982,7 +989,10 @@ impl Bus for MemMap {
         match addr >> 24 {
             0x00 => {
                 if addr < 0x4000 {
-                    self.bios[addr as usize]
+                    // BIOS read protection: the guest (HLE, never
+                    // executing from BIOS) sees the last-fetched BIOS
+                    // opcode, byte-laned by address.
+                    (self.bios_open >> ((addr & 3) * 8)) as u8
                 } else {
                     0 // open bus (unmodeled)
                 }
@@ -1064,9 +1074,9 @@ impl Bus for MemMap {
     fn read16(&mut self, addr: u32) -> u16 {
         match addr >> 24 {
             0x00 => {
-                let a = addr as usize;
-                if a + 2 <= 0x4000 {
-                    u16::from_le_bytes([self.bios[a], self.bios[a + 1]])
+                if addr < 0x4000 {
+                    // BIOS read protection (see read8).
+                    (self.bios_open >> ((addr & 2) * 8)) as u16
                 } else {
                     self.rd16_bytes(addr)
                 }
@@ -1130,9 +1140,9 @@ impl Bus for MemMap {
     fn read32(&mut self, addr: u32) -> u32 {
         match addr >> 24 {
             0x00 => {
-                let a = addr as usize;
-                if a + 4 <= 0x4000 {
-                    u32::from_le_bytes(self.bios[a..a + 4].try_into().unwrap())
+                if addr < 0x4000 {
+                    // BIOS read protection (see read8).
+                    self.bios_open
                 } else {
                     self.rd32_halves(addr)
                 }
@@ -1321,11 +1331,28 @@ impl Bus for MemMap {
         self.unhandled_swis |= 1u64 << (num & 63);
         true
     }
+
+    fn note_swi_returned(&mut self) {
+        self.bios_open = 0xE3A0_2004; // after SWI
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bios_region_reads_return_protection_value() {
+        // Reads of 0x0..0x4000 from outside the BIOS return the
+        // last-fetched BIOS opcode, byte-laned by address; the value
+        // steps at the HLE seams (startup / after-SWI).
+        let mut mem = MemMap::new(vec![]);
+        assert_eq!(mem.read32(0x0), 0xE129_F000);
+        assert_eq!(mem.read8(0xC3), 0xE1);
+        assert_eq!(mem.read16(0x2), 0xE129);
+        mem.note_swi_returned();
+        assert_eq!(mem.read32(0x10), 0xE3A0_2004);
+    }
 
     #[test]
     fn fifo_tap_records_samples_with_timer_period() {

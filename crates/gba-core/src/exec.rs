@@ -113,7 +113,11 @@ fn step_inner<B: Bus>(
         let handled = if hle {
             if let Op::Swi { imm } = instr.op {
                 let num = if instr.thumb { imm } else { imm >> 16 };
-                crate::hle::bios_call(cpu, bus, num) || bus.note_unhandled_swi(num)
+                let handled = crate::hle::bios_call(cpu, bus, num) || bus.note_unhandled_swi(num);
+                if handled {
+                    bus.note_swi_returned();
+                }
+                handled
             } else {
                 false
             }

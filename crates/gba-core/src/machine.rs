@@ -141,6 +141,7 @@ impl Machine {
         // mov r0, #0x04000000 ; the handler observably receives this.
         self.cpu.regs[0] = 0x0400_0000;
         self.cpu.regs[14] = IRQ_RETURN_ADDR;
+        self.bus.bios_open = 0xE25E_F004; // BIOS protection: during IRQ
         let handler = self.bus.read32(HANDLER_PTR);
         self.cpu.regs[15] = handler & !3;
         self.bus.tick(24); // rough dispatch cost
@@ -167,6 +168,7 @@ impl Machine {
         cpu.set_cpsr(spsr);
         let mask = if cpu.thumb() { !1u32 } else { !3u32 };
         cpu.regs[15] = target & mask;
+        self.bus.bios_open = 0xE55E_C002; // BIOS protection: after IRQ
         self.bus.tick(16);
     }
 }

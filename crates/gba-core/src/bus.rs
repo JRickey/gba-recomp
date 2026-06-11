@@ -53,4 +53,8 @@ pub trait Bus {
     fn note_unhandled_swi(&mut self, _num: u32) -> bool {
         false
     }
+
+    /// Called after an HLE'd SWI completes — steps the BIOS
+    /// read-protection value on buses that model it.
+    fn note_swi_returned(&mut self) {}
 }
