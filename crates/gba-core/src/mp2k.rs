@@ -413,6 +413,19 @@ pub struct Mp2kHle {
     /// At least one self-check window passed all gates — the frontend
     /// substitutes only proven streams (never loud-wrong audio).
     pub proven: bool,
+    /// Pause-and-reprobe machinery: a failing stream PAUSES (proven
+    /// cleared, substitution crossfades back to the per-channel path)
+    /// and keeps probing; each pause escalates how many consecutive
+    /// clean windows re-proving requires, so a flapper converges to
+    /// the fallback while a track change gets a fresh chance.
+    prove_need: u32,
+    consec_pass: u32,
+    pub pauses: u64,
+    /// Note-on `count` semantics differ by driver revision (stale
+    /// residue vs real sample offset). The oracle searches: alternate
+    /// the mode on structure-failure pauses and let correlation pick.
+    count_mode: u8,
+    mode_dwell: u32,
 }
 
 impl Mp2kHle {
@@ -453,6 +466,11 @@ impl Mp2kHle {
             ratio_hist: [0.0; 3],
             ratio_n: 0,
             proven: false,
+            prove_need: 1,
+            consec_pass: 0,
+            pauses: 0,
+            count_mode: 0,
+            mode_dwell: 0,
         }
     }
 
@@ -462,8 +480,16 @@ impl Mp2kHle {
         self.hook_keys[..self.hook_n as usize].contains(&key)
     }
 
-    fn revert(&mut self, reason: String) {
-        self.active = false;
+    /// Pause substitution (NOT a permanent revert): clear proven so
+    /// the frontend crossfades back to the per-channel path, escalate
+    /// the re-prove requirement, and keep rendering + self-checking —
+    /// the next track may pass, and the transitions are inaudible.
+    fn pause(&mut self, reason: String) {
+        self.proven = false;
+        self.consec_pass = 0;
+        self.check.strikes = 0;
+        self.prove_need = (self.prove_need * 2).min(16);
+        self.pauses += 1;
         self.reverted = Some(reason);
     }
 
@@ -601,7 +627,7 @@ impl Mp2kHle {
                             self.hooks
                         );
                     }
-                    note_on(v, mem, ctype, count, wav)
+                    note_on(v, mem, ctype, count, wav, self.count_mode)
                 } {
                     env_now = attack.min(0xFF);
                     phase = 3;
@@ -815,22 +841,45 @@ impl Mp2kHle {
             // offset means this driver revision scales volume
             // differently and substituting would be wrong-but-pretty.
             let level_ok = (0.55..=1.6).contains(&ratio);
-            if r < CHECK_MIN_R || !level_ok {
-                self.check.strikes += 1;
-                if self.check.strikes >= CHECK_MAX_STRIKES {
-                    self.revert(format!(
-                        "shadow/canon correlation {r:.2}, level ratio {ratio:.2} \
-                         (driver variant or unsupported feature)"
-                    ));
+            let window_ok = r >= CHECK_MIN_R && level_ok;
+            if self.proven {
+                // Live: police with the strike ratchet, then pause —
+                // the frontend crossfades back to the per-channel path
+                // and probing continues.
+                if window_ok {
+                    self.check.strikes = self.check.strikes.saturating_sub(1);
+                } else {
+                    self.check.strikes += 1;
+                    if self.check.strikes >= CHECK_MAX_STRIKES {
+                        self.pause(format!(
+                            "shadow/canon correlation {r:.2}, level ratio {ratio:.2} \
+                             (driver variant or unsupported feature)"
+                        ));
+                    }
+                }
+            } else if window_ok {
+                // Probing: substitution starts only after enough
+                // consecutive clean windows (escalates per pause).
+                self.consec_pass += 1;
+                if self.consec_pass >= self.prove_need {
+                    self.proven = true;
+                    self.check.strikes = 0;
                 }
             } else {
-                // A fully passing window proves the stream end to end —
-                // the frontend may substitute from here on.
-                self.proven = true;
-                // Decay, don't clear: a window-flapper (alternating
-                // pass/fail) must still ratchet to revert; only a
-                // sustained clean run earns back trust.
-                self.check.strikes = self.check.strikes.saturating_sub(1);
+                self.consec_pass = 0;
+                // Structure failure at a sane level: search the known
+                // behavior axis — note-on `count` semantics split
+                // driver revisions, and the differential is the oracle
+                // that picks the right one for this image. Two failing
+                // windows per mode before flipping, so each candidate
+                // gets notes struck under it.
+                if r < CHECK_MIN_R && level_ok {
+                    self.mode_dwell += 1;
+                    if self.mode_dwell >= 2 {
+                        self.count_mode ^= 1;
+                        self.mode_dwell = 0;
+                    }
+                }
             }
         }
 
@@ -846,13 +895,19 @@ impl Mp2kHle {
     pub fn gain(&self) -> f32 {
         self.gain
     }
+
+    /// Note-on semantics the oracle currently selects (0 = start at
+    /// sample 0, 1 = honor the count offset).
+    pub fn count_mode(&self) -> u8 {
+        self.count_mode
+    }
 }
 
 /// Note-on: validate the wave and reset the sampler. Returns false
 /// (voice killed) on a hostile/garbage wave pointer — validation is
 /// per-voice and per-note (the upstream v1.8.1 hardening lesson).
 /// Free function: the caller holds a split borrow of `voices[ch]`.
-fn note_on(v: &mut Voice, mem: &MemView, ctype: u8, count: u32, wav: u32) -> bool {
+fn note_on(v: &mut Voice, mem: &MemView, ctype: u8, count: u32, wav: u32, count_mode: u8) -> bool {
     let Some(h) = mem.slice(wav, 16) else { return false };
     let hdr_type = u16::from_le_bytes([h[0], h[1]]);
     let flags = u16::from_le_bytes([h[2], h[3]]);
@@ -881,15 +936,14 @@ fn note_on(v: &mut Voice, mem: &MemView, ctype: u8, count: u32, wav: u32) -> boo
     v.loop_start = loop_start;
     v.looped = flags & 0xC000 != 0;
     v.compressed = compressed;
-    // The stock SDK treats `count` as an initial sample offset at
-    // note-on, but the track engine zeroes it except for one rare
-    // explicit feature — and variant drivers leave the PREVIOUS
-    // note's residue in the field (observed: a popular RPG port's
-    // engine), which started voices mid-sample or, for one-shots,
-    // past the end (silent). Start at 0 like the proven prior art;
-    // the field is stale more often than it is meaningful.
-    let _ = count;
-    v.pos = 0.0;
+    // Note-on `count` semantics split driver revisions: the stock SDK
+    // treats it as an initial sample offset (track engine zeroes it
+    // except for one explicit feature), while variant engines leave
+    // the previous note's residue there — offsets from residue start
+    // voices mid-sample or silence one-shots. Mode 0 (default) starts
+    // at 0; mode 1 honors the offset. The differential self-check
+    // searches the axis per image and correlation picks the winner.
+    v.pos = if count_mode == 1 { count.min(size) as f64 } else { 0.0 };
     v.blk_idx = u32::MAX;
     true
 }

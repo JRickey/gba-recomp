@@ -206,6 +206,7 @@ fn cmd_frames(args: &[String]) -> Result<(), String> {
     let mut out: Option<String> = None;
     let mut keys = 0x3FFu16; // active-low: nothing pressed
     let mut demo = false; // verify-style Start/A taps (menus need edges)
+    let mut sav: Option<String> = None; // load backup media before boot
 
     let mut it = args.iter();
     while let Some(arg) = it.next() {
@@ -217,6 +218,7 @@ fn cmd_frames(args: &[String]) -> Result<(), String> {
             "--out" => out = Some(it.next().ok_or("--out needs a value")?.to_string()),
             "--keys" => keys = parse_hex(it.next().ok_or("--keys needs a value")?)? as u16,
             "--demo" => demo = true,
+            "--sav" => sav = Some(it.next().ok_or("--sav needs a value")?.to_string()),
             other if rom_path.is_none() => rom_path = Some(other.to_string()),
             other => return Err(format!("unexpected argument {other:?}")),
         }
@@ -226,6 +228,11 @@ fn cmd_frames(args: &[String]) -> Result<(), String> {
 
     let mut m = Machine::new(rom);
     m.bus.keys = keys;
+    if let Some(p) = &sav {
+        let data = std::fs::read(p).map_err(|e| format!("{p}: {e}"))?;
+        m.bus.load_save_data(&data);
+        eprintln!("loaded {p}");
+    }
 
     // Diagnostic (RECOMP_DUMP_AUDIO=<prefix>): capture the full audio taps
     // headless — <prefix>.mixed.wav / .psg.wav (PCM16 mono @ tap rate)
@@ -277,11 +284,13 @@ fn cmd_frames(args: &[String]) -> Result<(), String> {
     if let Some(h) = m.bus.mp2k.as_deref() {
         let (corr, ratio) = h.last_correlation();
         eprintln!(
-            "mp2k: hooks={} stale={} bad_waves={} corr={corr:.3} ratio={ratio:.2} gain={:.2} proven={} engaged={} active={}{}",
+            "mp2k: hooks={} stale={} bad_waves={} corr={corr:.3} ratio={ratio:.2} gain={:.2} mode={} pauses={} proven={} engaged={} active={}{}",
             h.hooks,
             h.stale_ticks,
             h.bad_waves,
             h.gain(),
+            h.count_mode(),
+            h.pauses,
             h.proven,
             h.engaged,
             h.active,
@@ -722,28 +731,43 @@ fn cmd_play(args: &[String]) -> Result<(), String> {
                         }
                     }
                     m.bus.psg_tap.clear();
-                    // MP2K HLE stream and liveness. A revert is a
-                    // product-bar event: say so, with the reason.
+                    // MP2K HLE stream and liveness. A pause is a
+                    // diagnostic event (the crossfade keeps it
+                    // inaudible) — say so, with the reason, but don't
+                    // let a hopeless variant spam the log forever.
                     let live = m.bus.mp2k.as_deref().is_some_and(|h| h.live());
                     if let Some(h) = m.bus.mp2k.as_deref_mut() {
                         if let Some(msg) = h.reverted.take() {
-                            eprintln!(
-                                "DEGRADED: MP2K HLE reverted to per-channel path: {msg}"
-                            );
+                            if h.pauses <= 3 {
+                                eprintln!(
+                                    "DEGRADED: MP2K HLE paused (probing continues): {msg}"
+                                );
+                            } else if h.pauses == 4 {
+                                eprintln!(
+                                    "DEGRADED: MP2K HLE paused again: {msg}                                      (further pauses unlogged)"
+                                );
+                            }
                         }
                     }
-                    for pair in m.bus.hle_tap.chunks_exact(2) {
-                        if st.hle.len() < 65536 {
-                            st.hle.push_back(pair[0]);
-                            st.hle.push_back(pair[1]);
-                        } else {
-                            st.drops += 1;
+                    // Feed the HLE ring only while live — an unproven
+                    // stream must neither pile up (drop spam) nor leave
+                    // stale audio for the switchover.
+                    if live {
+                        for pair in m.bus.hle_tap.chunks_exact(2) {
+                            if st.hle.len() < 65536 {
+                                st.hle.push_back(pair[0]);
+                                st.hle.push_back(pair[1]);
+                            } else {
+                                st.drops += 1;
+                            }
                         }
+                    } else {
+                        st.hle.clear();
                     }
                     m.bus.hle_tap.clear();
-                    // Switch over only once the HLE ring is primed, so
-                    // the engage moment cannot gap; revert switches back
-                    // immediately (the FIFO interpolators self-prime).
+                    // Switch over only once the HLE ring is primed; the
+                    // callback crossfades both directions, and the
+                    // per-channel path stays warm below.
                     if !live {
                         st.hle_on = false;
                     } else if st.hle.len() / 2 >= RING_TARGET / 2 {
@@ -751,13 +775,11 @@ fn cmd_play(args: &[String]) -> Result<(), String> {
                     }
                     for f in 0..2 {
                         let events = std::mem::take(&mut m.bus.fifo_tap[f]);
-                        if !st.hle_on {
-                            for e in events {
-                                if st.fifo[f].len() < 32768 {
-                                    st.fifo[f].push_back(e);
-                                } else {
-                                    st.drops += 1;
-                                }
+                        for e in events {
+                            if st.fifo[f].len() < 32768 {
+                                st.fifo[f].push_back(e);
+                            } else {
+                                st.drops += 1;
                             }
                         }
                     }
@@ -915,9 +937,13 @@ struct AudioStreams {
 struct Enhanced {
     psg: SincResampler,
     fifo: [FifoInterp; 2],
-    /// MP2K HLE stream resampler — consulted instead of `fifo` while
-    /// the shadow mixer is live.
+    /// MP2K HLE stream resampler — crossfaded against `fifo` as the
+    /// shadow mixer proves/pauses.
     hle: SincResampler,
+    /// Crossfade position (0 = per-channel path, 1 = HLE) and its
+    /// per-sample slew (~40 ms time constant).
+    xfade: f32,
+    xfade_k: f32,
     dc: [DcBlock; 2],
 }
 
@@ -940,6 +966,8 @@ fn start_audio(
             psg: SincResampler::new(src, rate),
             fifo: [FifoInterp::new(rate), FifoInterp::new(rate)],
             hle: SincResampler::new(src, rate),
+            xfade: 0.0,
+            xfade_k: (1.0 / (0.040 * rate)) as f32,
             dc: [DcBlock::new(rate), DcBlock::new(rate)],
         })
     } else {
@@ -963,40 +991,46 @@ fn start_audio(
                             let (pl, pr) = e.psg.next(&mut st.psg);
                             let mut l = pl;
                             let mut r = pr;
-                            if st.hle_on {
-                                // MP2K shadow mixer live: its stereo
-                                // already carries the driver's per-voice
-                                // pan and master volume; the SOUNDCNT
-                                // side enables and 50% bits still gate
-                                // the DAC path (FIFO A carries the right
-                                // mix half, B the left, per stock init).
-                                let (hl, hr) = e.hle.next(&mut st.hle);
-                                let hr = hr * if st.vol_half[0] { 0.5 } else { 1.0 };
-                                let hl = hl * if st.vol_half[1] { 0.5 } else { 1.0 };
-                                if st.route[0] & 2 != 0 || st.route[1] & 2 != 0 {
-                                    l += hl;
-                                }
-                                if st.route[0] & 1 != 0 || st.route[1] & 1 != 0 {
-                                    r += hr;
-                                }
-                            } else {
-                                let a = e.fifo[0].next(&mut st.fifo[0])
-                                    * if st.vol_half[0] { 0.5 } else { 1.0 };
-                                let b = e.fifo[1].next(&mut st.fifo[1])
-                                    * if st.vol_half[1] { 0.5 } else { 1.0 };
-                                if st.route[0] & 2 != 0 {
-                                    l += a;
-                                }
-                                if st.route[0] & 1 != 0 {
-                                    r += a;
-                                }
-                                if st.route[1] & 2 != 0 {
-                                    l += b;
-                                }
-                                if st.route[1] & 1 != 0 {
-                                    r += b;
-                                }
+                            // BOTH Direct Sound paths stay warm — the
+                            // per-channel interpolators and the MP2K
+                            // shadow stream — and a short equal-power-
+                            // ish crossfade moves between them, so an
+                            // HLE engage or pause is never an audible
+                            // seam (both render the same music).
+                            let a = e.fifo[0].next(&mut st.fifo[0])
+                                * if st.vol_half[0] { 0.5 } else { 1.0 };
+                            let b = e.fifo[1].next(&mut st.fifo[1])
+                                * if st.vol_half[1] { 0.5 } else { 1.0 };
+                            let (hl, hr) = e.hle.next(&mut st.hle);
+                            let hr = hr * if st.vol_half[0] { 0.5 } else { 1.0 };
+                            let hl = hl * if st.vol_half[1] { 0.5 } else { 1.0 };
+                            let target = if st.hle_on { 1.0 } else { 0.0 };
+                            e.xfade += (target - e.xfade) * e.xfade_k;
+                            let xf = e.xfade;
+                            let mut fl = 0.0;
+                            let mut fr = 0.0;
+                            if st.route[0] & 2 != 0 {
+                                fl += a;
                             }
+                            if st.route[0] & 1 != 0 {
+                                fr += a;
+                            }
+                            if st.route[1] & 2 != 0 {
+                                fl += b;
+                            }
+                            if st.route[1] & 1 != 0 {
+                                fr += b;
+                            }
+                            let mut gl = 0.0;
+                            let mut gr = 0.0;
+                            if st.route[0] & 2 != 0 || st.route[1] & 2 != 0 {
+                                gl = hl;
+                            }
+                            if st.route[0] & 1 != 0 || st.route[1] & 1 != 0 {
+                                gr = hr;
+                            }
+                            l += fl * (1.0 - xf) + gl * xf;
+                            r += fr * (1.0 - xf) + gr * xf;
                             // Stage 2: where the hardware would hard-clip
                             // the over-rail sum, saturate it softly
                             // instead — before the DC block, matching the
@@ -1660,11 +1694,13 @@ fn cmd_runc(args: &[String]) -> Result<(), String> {
     if let Some(h) = m.bus.mp2k.as_deref() {
         let (corr, ratio) = h.last_correlation();
         eprintln!(
-            "mp2k: hooks={} stale={} bad_waves={} corr={corr:.3} ratio={ratio:.2} gain={:.2} proven={} engaged={} active={}{}",
+            "mp2k: hooks={} stale={} bad_waves={} corr={corr:.3} ratio={ratio:.2} gain={:.2} mode={} pauses={} proven={} engaged={} active={}{}",
             h.hooks,
             h.stale_ticks,
             h.bad_waves,
             h.gain(),
+            h.count_mode(),
+            h.pauses,
             h.proven,
             h.engaged,
             h.active,
