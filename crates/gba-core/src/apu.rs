@@ -1,6 +1,6 @@
 //! PSG channels 1-4 (hardware reference, "Sound Channel 1-4").
 //!
-//! State advances lazily at the audio sample grid (~32768 Hz), which is
+//! State advances lazily at the audio sample grid (65536 Hz), which is
 //! comfortably finer than envelope (64 Hz), sweep (128 Hz), and length
 //! (256 Hz) timers, and fine enough for pitch (square top frequency
 //! ~131 kHz folds; audible range reproduces correctly).

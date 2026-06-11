@@ -175,8 +175,11 @@ pub struct MemMap {
     next_event: u64,
 }
 
-/// ~32768 Hz on the 16.78 MHz master clock.
-pub const AUDIO_SAMPLE_CYCLES: u64 = 512;
+/// 65536 Hz on the 16.78 MHz master clock — the PWM grid most games
+/// select via SOUNDBIAS, so the tap loses nothing the hardware kept.
+pub const AUDIO_SAMPLE_CYCLES: u64 = 256;
+/// The tap rate in Hz (master clock is exactly 2^24).
+pub const AUDIO_RATE_HZ: u32 = ((1u64 << 24) / AUDIO_SAMPLE_CYCLES) as u32;
 
 impl MemMap {
     pub fn new(rom: Vec<u8>) -> MemMap {

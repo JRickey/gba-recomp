@@ -184,6 +184,64 @@ pub fn button_by_name(name: &str) -> Option<Button> {
     Button::ALL.into_iter().find(|b| b.name() == name)
 }
 
+/// Audio/video settings, launcher-edited, honored by the play runtime.
+/// Lives in its own file (`av.cfg`) so input and A/V concerns stay
+/// independently versionable.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct AvConfig {
+    /// The premium audio path (final name TBD): band-limited sinc
+    /// resampling, DC blocking, and buffer rate control instead of the
+    /// hardware-faithful nearest-neighbor output. Off until the feature
+    /// is complete enough to name and ship on by default.
+    pub audio_enhanced: bool,
+}
+
+impl Default for AvConfig {
+    fn default() -> Self {
+        Self { audio_enhanced: false }
+    }
+}
+
+impl AvConfig {
+    pub fn parse(text: &str) -> Self {
+        let mut cfg = Self::default();
+        for line in text.lines() {
+            let line = line.split('#').next().unwrap_or("").trim();
+            let Some((k, v)) = line.split_once('=') else { continue };
+            if k.trim() == "audio.enhanced" {
+                cfg.audio_enhanced = v.trim().eq_ignore_ascii_case("true");
+            }
+        }
+        cfg
+    }
+
+    pub fn serialize(&self) -> String {
+        format!("# gba-recomp a/v settings\naudio.enhanced = {}\n", self.audio_enhanced)
+    }
+
+    /// Load from the default path; missing or unreadable = defaults.
+    pub fn load() -> Self {
+        av_path()
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .map(|t| Self::parse(&t))
+            .unwrap_or_default()
+    }
+
+    /// Persist to the default path (creating the directory).
+    pub fn save(&self) -> Result<(), String> {
+        let path = av_path().ok_or("no config directory")?;
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+        }
+        std::fs::write(&path, self.serialize()).map_err(|e| e.to_string())
+    }
+}
+
+/// `<config dir>/gba-recomp/av.cfg`.
+pub fn av_path() -> Option<PathBuf> {
+    Some(default_path()?.with_file_name("av.cfg"))
+}
+
 /// `<config dir>/gba-recomp/input.cfg`, resolved per-platform without
 /// pulling in a dependency.
 pub fn default_path() -> Option<PathBuf> {
@@ -220,5 +278,13 @@ mod tests {
         assert_eq!(cfg.keys[Button::A.index()], "Q");
         assert_eq!(cfg.device, Device::Gamepad);
         assert_eq!(cfg.keys[Button::B.index()], "X"); // untouched default
+    }
+
+    #[test]
+    fn av_roundtrip_and_default_off() {
+        assert!(!AvConfig::default().audio_enhanced);
+        let cfg = AvConfig { audio_enhanced: true };
+        assert_eq!(AvConfig::parse(&cfg.serialize()), cfg);
+        assert_eq!(AvConfig::parse("junk\naudio.enhanced = TRUE # ok\n"), cfg);
     }
 }

@@ -366,54 +366,14 @@ fn cmd_play(args: &[String]) -> Result<(), String> {
     }
 
 
-    // Audio: cpal output stream fed from a shared ring of 32768 Hz mono
-    // samples, nearest-neighbor resampled to the device rate.
+    // Audio: cpal output stream fed from a shared ring of mono samples
+    // tapped at the emulated DAC grid (65536 Hz). The A/V config selects
+    // the output path: hardware-faithful zero-order hold, or the premium
+    // path (final product name TBD) — windowed-sinc resampling, DC
+    // blocking, and buffer-fill rate control.
+    let av = input_config::AvConfig::load();
     let ring = std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::<i16>::new()));
-    let _stream = {
-        use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-        let host = cpal::default_host();
-        match host.default_output_device() {
-            Some(device) => match device.default_output_config() {
-                Ok(cfg) => {
-                    let rate = cfg.sample_rate().0 as f64;
-                    let channels = cfg.channels() as usize;
-                    let step = 32768.0 / rate;
-                    let ring2 = ring.clone();
-                    let mut frac = 0.0f64;
-                    let mut last = 0i16;
-                    let stream = device
-                        .build_output_stream(
-                            &cfg.into(),
-                            move |out: &mut [f32], _| {
-                                let mut q = ring2.lock().unwrap();
-                                for frame in out.chunks_mut(channels) {
-                                    frac += step;
-                                    while frac >= 1.0 {
-                                        frac -= 1.0;
-                                        if let Some(s) = q.pop_front() {
-                                            last = s;
-                                        }
-                                    }
-                                    let v = last as f32 / 32768.0;
-                                    for ch in frame.iter_mut() {
-                                        *ch = v;
-                                    }
-                                }
-                            },
-                            |e| eprintln!("audio error: {e}"),
-                            None,
-                        )
-                        .ok();
-                    if let Some(s) = &stream {
-                        let _ = s.play();
-                    }
-                    stream
-                }
-                Err(_) => None,
-            },
-            None => None,
-        }
-    };
+    let _stream = start_audio(ring.clone(), av.audio_enhanced);
 
     // Bindings come from the launcher-managed config (defaults match the
     // historical hardcoded map). Keyboard always works; a configured
@@ -533,7 +493,7 @@ fn cmd_play(args: &[String]) -> Result<(), String> {
         {
             let mut q = ring.lock().unwrap();
             for s in m.bus.audio_buf.drain(..) {
-                if q.len() < 8192 {
+                if q.len() < 16384 {
                     q.push_back(s);
                 }
             }
@@ -602,6 +562,141 @@ fn ensure_native(
     let table = BlockTable::load(&lib)?;
     eprintln!("native translation: {} blocks", table.len);
     Ok((lib, table))
+}
+
+/// Build the cpal output stream over the shared sample ring. `enhanced`
+/// selects the premium output path; off reproduces the original
+/// zero-order-hold behavior exactly.
+fn start_audio(
+    ring: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<i16>>>,
+    enhanced: bool,
+) -> Option<cpal::Stream> {
+    use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+    let device = cpal::default_host().default_output_device()?;
+    let cfg = device.default_output_config().ok()?;
+    let rate = cfg.sample_rate().0 as f64;
+    let channels = cfg.channels() as usize;
+    let src = gba_core::mem::AUDIO_RATE_HZ as f64;
+
+    let mut resampler = if enhanced { Some(SincResampler::new(src, rate)) } else { None };
+    let step = src / rate;
+    let mut frac = 0.0f64;
+    let mut last = 0i16;
+    let stream = device
+        .build_output_stream(
+            &cfg.into(),
+            move |out: &mut [f32], _| {
+                let mut q = ring.lock().unwrap();
+                for frame in out.chunks_mut(channels) {
+                    let v = match resampler.as_mut() {
+                        Some(r) => r.next(&mut q),
+                        None => {
+                            frac += step;
+                            while frac >= 1.0 {
+                                frac -= 1.0;
+                                if let Some(s) = q.pop_front() {
+                                    last = s;
+                                }
+                            }
+                            last as f32 / 32768.0
+                        }
+                    };
+                    for ch in frame.iter_mut() {
+                        *ch = v;
+                    }
+                }
+            },
+            |e| eprintln!("audio error: {e}"),
+            None,
+        )
+        .ok()?;
+    let _ = stream.play();
+    Some(stream)
+}
+
+const SINC_TAPS: usize = 24;
+const SINC_PHASES: usize = 128;
+/// Ring fill the rate control steers toward (~62 ms at the 65536 Hz tap).
+const RING_TARGET: usize = 4096;
+
+/// Polyphase windowed-sinc resampler with a one-pole DC blocker and
+/// gentle (max ±0.5%) consumption-rate control against the ring fill —
+/// the premium audio output path. Band-limits to the narrower of the
+/// two Nyquists, so downsampling to a 44.1/48 kHz device does not fold
+/// images the way the zero-order-hold path does.
+struct SincResampler {
+    /// (SINC_PHASES + 1) rows of SINC_TAPS coefficients; each row has
+    /// unity DC gain.
+    table: Vec<f32>,
+    /// Last SINC_TAPS source samples, oldest first.
+    hist: [f32; SINC_TAPS],
+    ratio: f64,
+    frac: f64,
+    // DC blocker: y[n] = x[n] - x[n-1] + r*y[n-1], fc ~ 10 Hz.
+    dc_r: f32,
+    dc_x1: f32,
+    dc_y1: f32,
+}
+
+impl SincResampler {
+    fn new(src_hz: f64, out_hz: f64) -> SincResampler {
+        use std::f64::consts::PI;
+        // Cutoff in cycles per source sample, 10% under the narrower
+        // Nyquist to leave the window transition band room.
+        let fc = 0.45 * (out_hz / src_hz).min(1.0);
+        let center = (SINC_TAPS / 2 - 1) as f64;
+        let half = SINC_TAPS as f64 / 2.0;
+        let mut table = Vec::with_capacity((SINC_PHASES + 1) * SINC_TAPS);
+        for p in 0..=SINC_PHASES {
+            let phi = p as f64 / SINC_PHASES as f64;
+            let mut row = [0.0f64; SINC_TAPS];
+            let mut sum = 0.0;
+            for (k, c) in row.iter_mut().enumerate() {
+                let t = k as f64 - center - phi;
+                let sinc = if t.abs() < 1e-9 {
+                    2.0 * fc
+                } else {
+                    (2.0 * PI * fc * t).sin() / (PI * t)
+                };
+                let win = if t.abs() < half { 0.5 * (1.0 + (PI * t / half).cos()) } else { 0.0 };
+                *c = sinc * win;
+                sum += *c;
+            }
+            // Unity DC gain per phase row.
+            table.extend(row.iter().map(|c| (c / sum) as f32));
+        }
+        SincResampler {
+            table,
+            hist: [0.0; SINC_TAPS],
+            ratio: src_hz / out_hz,
+            frac: 0.0,
+            dc_r: 1.0 - (2.0 * PI * 10.0 / out_hz) as f32,
+            dc_x1: 0.0,
+            dc_y1: 0.0,
+        }
+    }
+
+    fn next(&mut self, q: &mut std::collections::VecDeque<i16>) -> f32 {
+        // Steer consumption toward the target fill; an underrun repeats
+        // the newest sample (a one-sample ZOH the DC blocker smooths).
+        let err = (q.len() as f64 - RING_TARGET as f64) / RING_TARGET as f64;
+        self.frac += self.ratio * (1.0 + 0.005 * err.clamp(-1.0, 1.0));
+        while self.frac >= 1.0 {
+            self.frac -= 1.0;
+            let s = match q.pop_front() {
+                Some(s) => s as f32 / 32768.0,
+                None => self.hist[SINC_TAPS - 1],
+            };
+            self.hist.copy_within(1.., 0);
+            self.hist[SINC_TAPS - 1] = s;
+        }
+        let row = &self.table[(self.frac * SINC_PHASES as f64) as usize * SINC_TAPS..][..SINC_TAPS];
+        let x: f32 = row.iter().zip(self.hist.iter()).map(|(c, s)| c * s).sum();
+        let y = x - self.dc_x1 + self.dc_r * self.dc_y1;
+        self.dc_x1 = x;
+        self.dc_y1 = y;
+        y
+    }
 }
 
 /// Canonical key name (see input-config) to minifb key.
@@ -1073,4 +1168,37 @@ fn dump_frame(m: &Machine, path: Option<String>) -> Result<(), String> {
         ppm.extend_from_slice(&[r << 3 | r >> 2, g << 3 | g >> 2, b << 3 | b >> 2]);
     }
     std::fs::write(&path, ppm).map_err(|e| format!("{path}: {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sinc_rows_have_unity_dc_gain() {
+        let r = SincResampler::new(65536.0, 48000.0);
+        for p in 0..=SINC_PHASES {
+            let sum: f32 = r.table[p * SINC_TAPS..][..SINC_TAPS].iter().sum();
+            assert!((sum - 1.0).abs() < 1e-4, "phase {p}: sum {sum}");
+        }
+    }
+
+    #[test]
+    fn sinc_preserves_audible_sine() {
+        // 1 kHz at the 65536 Hz tap, resampled to 48 kHz: RMS must come
+        // through within a few percent (DC blocker barely touches 1 kHz).
+        let mut r = SincResampler::new(65536.0, 48000.0);
+        let mut q = std::collections::VecDeque::new();
+        for n in 0..65536 {
+            let s = (2.0 * std::f64::consts::PI * 1000.0 * n as f64 / 65536.0).sin();
+            q.push_back((s * 16384.0) as i16);
+        }
+        let out: Vec<f32> = (0..40000).map(|_| r.next(&mut q)).collect();
+        let rms = (out[2000..38000].iter().map(|v| v * v).sum::<f32>() / 36000.0).sqrt();
+        let expect = 0.5 / 2f32.sqrt(); // amplitude 0.5 sine
+        assert!(
+            (rms - expect).abs() / expect < 0.03,
+            "rms {rms} vs {expect}"
+        );
+    }
 }
