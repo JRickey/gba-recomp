@@ -301,9 +301,33 @@ fn check_entry(path: &Path) -> Result<String, String> {
 fn cmd_play(args: &[String]) -> Result<(), String> {
     use minifb::{Key, Window, WindowOptions};
 
-    let rom_path = args.first().ok_or("missing ROM path")?.clone();
+    let mut rom_path = None;
+    let mut interp_only = false;
+    for arg in args {
+        match arg.as_str() {
+            "--interp" => interp_only = true,
+            other if rom_path.is_none() => rom_path = Some(other.to_string()),
+            other => return Err(format!("unexpected argument {other:?}")),
+        }
+    }
+    let rom_path = rom_path.ok_or("missing ROM path")?;
     let rom = std::fs::read(&rom_path).map_err(|e| format!("{rom_path}: {e}"))?;
     let sav_path = format!("{}.sav", rom_path.trim_end_matches(".gba"));
+
+    // Native translation: load from the per-user cache, building it on
+    // first launch. Any failure falls back to the interpreter — playing
+    // slower beats not playing.
+    let native = if interp_only {
+        None
+    } else {
+        match ensure_native(&rom_path, &rom) {
+            Ok(v) => Some(v),
+            Err(e) => {
+                eprintln!("native translation unavailable ({e}); using interpreter");
+                None
+            }
+        }
+    };
 
     let mut m = Machine::new(rom);
     if let Ok(sav) = std::fs::read(&sav_path) {
@@ -425,7 +449,13 @@ fn cmd_play(args: &[String]) -> Result<(), String> {
         }
         m.bus.keys = keys;
 
-        m.run_frame(5_000_000);
+        match &native {
+            Some((_lib, table)) => {
+                let mptr = &mut m as *mut Machine as *mut std::ffi::c_void;
+                run_frame_native(&mut m, table, mptr, 5_000_000);
+            }
+            None => m.run_frame(5_000_000),
+        }
 
         // Hand this frame's audio to the output ring (cap ~250 ms).
         {
@@ -451,6 +481,36 @@ fn cmd_play(args: &[String]) -> Result<(), String> {
         eprintln!("saved {sav_path}");
     }
     Ok(())
+}
+
+/// Locate (or build) the cached native translation for this image.
+/// Cache key is the ROM's SHA-256 under a translation-format revision
+/// directory, so a future emitter change can't load stale natives.
+fn ensure_native(
+    rom_path: &str,
+    rom: &[u8],
+) -> Result<(libloading::Library, BlockTable), String> {
+    use sha2::{Digest, Sha256};
+    let sha = Sha256::digest(rom)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+    let dir = dirs::cache_dir()
+        .unwrap_or_else(std::env::temp_dir)
+        .join("gba-recomp")
+        .join("t1");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let lib_path = dir.join(format!("{sha}.dylib"));
+    let lib_str = lib_path.to_str().ok_or("non-UTF8 cache path")?;
+    if !lib_path.is_file() {
+        eprintln!("first launch: translating image (one-time)...");
+        build_dylib(rom_path, true, lib_str)?;
+    }
+    let lib = unsafe { libloading::Library::new(&lib_path) }
+        .map_err(|e| format!("{}: {e}", lib_path.display()))?;
+    let table = BlockTable::load(&lib)?;
+    eprintln!("native translation: {} blocks", table.len);
+    Ok((lib, table))
 }
 
 /// Canonical key name (see input-config) to minifb key.
@@ -501,6 +561,16 @@ fn cmd_build(args: &[String]) -> Result<(), String> {
         }
     }
     let rom_path = &rom_path.ok_or("missing ROM path")?;
+    std::fs::create_dir_all("out").map_err(|e| e.to_string())?;
+    let stem = Path::new(rom_path)
+        .file_stem().and_then(|s| s.to_str()).unwrap_or("game").to_string();
+    build_dylib(rom_path, ram, &format!("out/{stem}.dylib"))
+}
+
+/// The build pipeline behind `cmd_build`, parameterized on the output
+/// path so the play runtime can target its own translation cache.
+/// Intermediates land next to `lib_path` as `<stem>.<i>.{c,o}`.
+fn build_dylib(rom_path: &str, ram: bool, lib_path: &str) -> Result<(), String> {
     let rom = std::fs::read(rom_path).map_err(|e| format!("{rom_path}: {e}"))?;
 
     // Profile-guided RAM discovery: run the interpreter briefly, recording
@@ -554,10 +624,7 @@ fn cmd_build(args: &[String]) -> Result<(), String> {
     let n_instrs: usize = analysis.blocks.iter().map(|b| b.instrs.len()).sum();
     println!("blocks: {} instructions: {n_instrs}", analysis.blocks.len());
 
-    std::fs::create_dir_all("out").map_err(|e| e.to_string())?;
-    let stem = Path::new(rom_path)
-        .file_stem().and_then(|s| s.to_str()).unwrap_or("game").to_string();
-    let lib_path = format!("out/{stem}.dylib");
+    let prefix = lib_path.strip_suffix(".dylib").unwrap_or(lib_path);
 
     // Bounded translation units, compiled one at a time: full-image
     // translations can exceed the source image a hundredfold, and a single
@@ -567,8 +634,8 @@ fn cmd_build(args: &[String]) -> Result<(), String> {
     let mut objs: Vec<String> = Vec::new();
     let chunks = emit::emit_c_chunked(&analysis, &view, MAX_UNIT, |c| {
         let i = objs.len();
-        let c_path = format!("out/{stem}.{i}.c");
-        let o_path = format!("out/{stem}.{i}.o");
+        let c_path = format!("{prefix}.{i}.c");
+        let o_path = format!("{prefix}.{i}.o");
         std::fs::write(&c_path, c).map_err(|e| e.to_string())?;
         let status = std::process::Command::new("cc")
             .args(["-O1", "-c", "-o", &o_path, &c_path])
@@ -669,10 +736,56 @@ impl BlockTable {
     }
 }
 
+/// Drive the machine to the next completed frame using translated blocks
+/// where available and the interpreter elsewhere, with interrupt
+/// machinery serviced at block boundaries — the same execution sequence
+/// as the original whole-run dispatch loop, bounded per frame. Returns
+/// (native blocks run, fallback steps); the frame is incomplete only if
+/// `max_steps` was exhausted (the caller's stall guard).
+fn run_frame_native(
+    m: &mut Machine,
+    table: &BlockTable,
+    mptr: *mut std::ffi::c_void,
+    max_steps: u64,
+) -> (u64, u64) {
+    use gba_core::capi::RT_API;
+    m.bus.frame_ready = false;
+    let mut native = 0u64;
+    let mut fallback = 0u64;
+    let mut steps = 0u64;
+    while !m.bus.frame_ready && steps < max_steps {
+        steps += 1;
+        // Interrupt machinery and sleep states go through Machine::step.
+        if m.bus.halted
+            || (m.cpu.regs[15] == gba_core::machine::IRQ_RETURN_ADDR
+                && m.cpu.mode() == gba_core::Mode::Irq)
+            || (m.bus.irq_pending() && !m.cpu.flag(gba_core::cpu::FLAG_I))
+        {
+            m.step();
+            continue;
+        }
+        let key = m.cpu.regs[15] | m.cpu.thumb() as u32;
+        match table.get(key) {
+            Some(f) => {
+                f(&RT_API, mptr);
+                native += 1;
+            }
+            None => {
+                m.step();
+                fallback += 1;
+            }
+        }
+    }
+    (native, fallback)
+}
+
+/// Per-frame stall guard for the native loop: generous beyond any real
+/// frame (a frame is ~280K cycles) while still bounding a wedged run.
+const FRAME_STEP_GUARD: u64 = 200_000_000;
+
 /// Run a recompiled image: translated blocks where available, interpreter
 /// fallback elsewhere, interrupt machinery at block boundaries.
 fn cmd_runc(args: &[String]) -> Result<(), String> {
-    use gba_core::capi::RT_API;
 
     let mut rom_path = None;
     let mut frames = 600u64;
@@ -703,31 +816,13 @@ fn cmd_runc(args: &[String]) -> Result<(), String> {
 
     let mut native_blocks = 0u64;
     let mut fallback_steps = 0u64;
-    let mut guard = 0u64;
     while m.bus.frames < frames {
-        guard += 1;
-        if guard > 4_000_000_000 {
+        let before = m.bus.frames;
+        let (n, f) = run_frame_native(&mut m, &table, mptr, FRAME_STEP_GUARD);
+        native_blocks += n;
+        fallback_steps += f;
+        if m.bus.frames == before {
             return Err("step guard exceeded".into());
-        }
-        // Interrupt machinery and sleep states go through Machine::step.
-        if m.bus.halted
-            || (m.cpu.regs[15] == gba_core::machine::IRQ_RETURN_ADDR
-                && m.cpu.mode() == gba_core::Mode::Irq)
-            || (m.bus.irq_pending() && !m.cpu.flag(gba_core::cpu::FLAG_I))
-        {
-            m.step();
-            continue;
-        }
-        let key = m.cpu.regs[15] | m.cpu.thumb() as u32;
-        match table.get(key) {
-            Some(f) => {
-                f(&RT_API, mptr);
-                native_blocks += 1;
-            }
-            None => {
-                m.step();
-                fallback_steps += 1;
-            }
         }
     }
 
@@ -800,7 +895,6 @@ fn fb_hash(m: &Machine) -> u64 {
 }
 
 fn run_hash(rom_path: &str, frames: u64, recompiled: bool) -> Result<u64, String> {
-    use gba_core::capi::RT_API;
     let rom = std::fs::read(rom_path).map_err(|e| format!("{rom_path}: {e}"))?;
     let mut m = Machine::new(rom);
     if !recompiled {
@@ -817,33 +911,12 @@ fn run_hash(rom_path: &str, frames: u64, recompiled: bool) -> Result<u64, String
         .map_err(|e| format!("{lib_path}: {e}"))?;
     let table = BlockTable::load(&lib)?;
     let mptr = &mut m as *mut Machine as *mut std::ffi::c_void;
-    let mut guard = 0u64;
-    let mut keyed_frame = u64::MAX;
     while m.bus.frames < frames {
-        guard += 1;
-        if guard > 4_000_000_000 {
+        let before = m.bus.frames;
+        m.bus.keys = demo_keys(before);
+        run_frame_native(&mut m, &table, mptr, FRAME_STEP_GUARD);
+        if m.bus.frames == before {
             return Err("step guard exceeded".into());
-        }
-        if keyed_frame != m.bus.frames {
-            keyed_frame = m.bus.frames;
-            m.bus.keys = demo_keys(keyed_frame);
-        }
-        if m.bus.halted
-            || (m.cpu.regs[15] == gba_core::machine::IRQ_RETURN_ADDR
-                && m.cpu.mode() == gba_core::Mode::Irq)
-            || (m.bus.irq_pending() && !m.cpu.flag(gba_core::cpu::FLAG_I))
-        {
-            m.step();
-            continue;
-        }
-        let key = m.cpu.regs[15] | m.cpu.thumb() as u32;
-        match table.get(key) {
-            Some(f) => {
-                f(&RT_API, mptr);
-            }
-            None => {
-                m.step();
-            }
         }
     }
     Ok(fb_hash(&m))
