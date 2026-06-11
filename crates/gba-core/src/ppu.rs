@@ -376,10 +376,12 @@ fn render_sprites(
             } else {
                 let mut u = bx;
                 let mut v = ly;
+                // OBJ attr1 flips: bit 12 horizontal, bit 13 vertical
+                // (unlike BG map entries, where flips are bits 10/11).
                 if a1 & 0x1000 != 0 {
                     u = w - 1 - u;
                 }
-                if a1 & 0x800 != 0 {
+                if a1 & 0x2000 != 0 {
                     v = h - 1 - v;
                 }
                 (u, v)
@@ -699,6 +701,34 @@ mod tests {
         render_scanline(&mut mem, 22);
         assert_eq!(mem.framebuffer[22 * 240 + 10], 0x03E0);
         assert_eq!(mem.framebuffer[22 * 240 + 18], 0x0000); // outside sprite
+    }
+
+    #[test]
+    fn sprite_flips_use_obj_attr1_bits() {
+        // Tile with one green pixel at texel (0, 0); the rest transparent.
+        // Flips relocate the lit screen pixel: hflip = attr1 bit 12,
+        // vflip = bit 13 (NOT the BG-entry bits 10/11).
+        let mut mem = MemMap::new(vec![]);
+        mem.write16(0x0400_0000, 0x1000); // mode 0, OBJ on
+        mem.write16(0x0500_0200 + 2, 0x03E0);
+        mem.write32(0x0601_0000 + 32, 0x0000_0001); // tile 1 row 0: texel 0 = color 1
+        mem.write16(0x0700_0000, 20); // attr0: y=20
+        mem.write16(0x0700_0002, 10); // attr1: x=10
+        mem.write16(0x0700_0004, 1); // attr2: tile 1
+        let lit = |mem: &mut MemMap, line: usize, x: usize| {
+            render_scanline(mem, line);
+            mem.framebuffer[line * 240 + x] == 0x03E0
+        };
+        assert!(lit(&mut mem, 20, 10)); // unflipped: top-left
+        mem.write16(0x0700_0002, 10 | 0x1000); // hflip
+        assert!(lit(&mut mem, 20, 17));
+        mem.write16(0x0700_0002, 10 | 0x2000); // vflip
+        assert!(lit(&mut mem, 27, 10));
+        mem.write16(0x0700_0002, 10 | 0x3000); // both
+        assert!(lit(&mut mem, 27, 17));
+        // BG-entry flip bits must do nothing on sprites.
+        mem.write16(0x0700_0002, 10 | 0x0C00);
+        assert!(lit(&mut mem, 20, 10));
     }
 
     #[test]
