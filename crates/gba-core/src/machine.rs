@@ -27,6 +27,8 @@ const HANDLER_PTR: u32 = 0x0300_7FFC;
 pub struct Machine {
     pub cpu: Cpu,
     pub bus: MemMap,
+    /// Decode memoization (content-keyed; see `exec::DecodeCache`).
+    pub decode_cache: exec::DecodeCache,
 }
 
 /// What a single `step` did — callers use it for tracing and loop detection.
@@ -39,7 +41,11 @@ pub enum StepEvent {
 
 impl Machine {
     pub fn new(rom: Vec<u8>) -> Machine {
-        Machine { cpu: Cpu::new(), bus: MemMap::new(rom) }
+        Machine {
+            cpu: Cpu::new(),
+            bus: MemMap::new(rom),
+            decode_cache: exec::DecodeCache::default(),
+        }
     }
 
     /// Execute one instruction (or service interrupt machinery).
@@ -66,7 +72,7 @@ impl Machine {
         }
 
         let region = (self.cpu.regs[15] >> 24) as usize & 0xF;
-        let instr = exec::step_hle(&mut self.cpu, &mut self.bus);
+        let instr = exec::step_hle_cached(&mut self.cpu, &mut self.bus, &mut self.decode_cache);
         self.bus.tick(instr_cost(region, &instr));
         StepEvent::Instr(instr)
     }

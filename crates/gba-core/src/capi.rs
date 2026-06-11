@@ -76,7 +76,7 @@ pub struct RcgBlock {
 pub extern "C" fn rt_interp_one(m: *mut core::ffi::c_void) -> u32 {
     let m = unsafe { &mut *(m as *mut Machine) };
     let region = (m.cpu.regs[15] >> 24) as usize & 0xF;
-    let instr = exec::step_hle(&mut m.cpu, &mut m.bus);
+    let instr = exec::step_hle_cached(&mut m.cpu, &mut m.bus, &mut m.decode_cache);
     m.bus.tick(crate::machine::instr_cost(region, &instr));
     m.cpu.regs[15] | m.cpu.thumb() as u32
 }

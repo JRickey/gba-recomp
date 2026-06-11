@@ -14,21 +14,99 @@ use crate::cpu::{Cpu, Exception, FLAG_C, FLAG_N, FLAG_T, FLAG_V, FLAG_Z};
 /// Fetch, decode, and execute one instruction. Returns the decoded
 /// instruction (callers use it for tracing and loop detection).
 pub fn step<B: Bus>(cpu: &mut Cpu, bus: &mut B) -> Instr {
-    step_inner(cpu, bus, false)
+    step_inner(cpu, bus, false, None)
 }
 
 /// Like [`step`], but recognized BIOS SWI calls are emulated natively
 /// instead of vectoring into a (possibly absent) BIOS image.
 pub fn step_hle<B: Bus>(cpu: &mut Cpu, bus: &mut B) -> Instr {
-    step_inner(cpu, bus, true)
+    step_inner(cpu, bus, true, None)
 }
 
-fn step_inner<B: Bus>(cpu: &mut Cpu, bus: &mut B, hle: bool) -> Instr {
+/// Like [`step_hle`], memoizing decodes through `cache`.
+pub fn step_hle_cached<B: Bus>(cpu: &mut Cpu, bus: &mut B, cache: &mut DecodeCache) -> Instr {
+    step_inner(cpu, bus, true, Some(cache))
+}
+
+/// Content-keyed decode memoization. An entry hits only when both its
+/// key (instruction address | thumb bit) and its raw encoding match the
+/// words just fetched, and decoding is a pure function of exactly those
+/// inputs — so a hit is always identical to a fresh decode, and
+/// self-modifying code simply misses and re-decodes. The fetch itself
+/// still goes through the bus on every step.
+pub struct DecodeCache {
+    entries: Box<[CacheEntry]>,
+}
+
+#[derive(Clone, Copy)]
+struct CacheEntry {
+    key: u32,
+    raw: u32,
+    instr: Instr,
+}
+
+const CACHE_SLOTS: usize = 1 << 15;
+
+impl Default for DecodeCache {
+    fn default() -> Self {
+        // An unused-slot sentinel isn't needed: a hit requires the key to
+        // match `addr | thumb`, and no fetch address reaches 0xFFFF_FFFF.
+        let empty = CacheEntry {
+            key: u32::MAX,
+            raw: 0,
+            instr: decode_arm(0, 0),
+        };
+        DecodeCache { entries: vec![empty; CACHE_SLOTS].into_boxed_slice() }
+    }
+}
+
+impl DecodeCache {
+    #[inline]
+    fn get_thumb(&mut self, addr: u32, raw: u16) -> Instr {
+        let e = &mut self.entries[((addr >> 1) as usize) & (CACHE_SLOTS - 1)];
+        let key = addr | 1;
+        if e.key == key && e.raw == raw as u32 {
+            return e.instr;
+        }
+        let instr = decode_thumb(raw, addr);
+        *e = CacheEntry { key, raw: raw as u32, instr };
+        instr
+    }
+
+    #[inline]
+    fn get_arm(&mut self, addr: u32, raw: u32) -> Instr {
+        let e = &mut self.entries[((addr >> 2) as usize) & (CACHE_SLOTS - 1)];
+        if e.key == addr && e.raw == raw {
+            return e.instr;
+        }
+        let instr = decode_arm(raw, addr);
+        *e = CacheEntry { key: addr, raw, instr };
+        instr
+    }
+}
+
+fn step_inner<B: Bus>(
+    cpu: &mut Cpu,
+    bus: &mut B,
+    hle: bool,
+    cache: Option<&mut DecodeCache>,
+) -> Instr {
     let pc = cpu.regs[PC as usize];
-    let instr = if cpu.thumb() {
-        decode_thumb(bus.read16(pc & !1), pc & !1)
-    } else {
-        decode_arm(bus.read32(pc & !3), pc & !3)
+    let instr = match cache {
+        Some(c) => {
+            if cpu.thumb() {
+                c.get_thumb(pc & !1, bus.read16(pc & !1))
+            } else {
+                c.get_arm(pc & !3, bus.read32(pc & !3))
+            }
+        }
+        None => {
+            if cpu.thumb() {
+                decode_thumb(bus.read16(pc & !1), pc & !1)
+            } else {
+                decode_arm(bus.read32(pc & !3), pc & !3)
+            }
+        }
     };
 
     if cond_passed(cpu, instr.cond) {
@@ -447,10 +525,10 @@ fn exec_block<B: Bus>(
 
     // Empty register list: transfer PC only, but step the base by 0x40
     // (as if 16 registers were transferred).
-    let (regs, count): (Vec<u8>, u32) = if rlist == 0 {
-        (vec![PC], 16)
+    let (list, count): (u16, u32) = if rlist == 0 {
+        (1 << PC, 16)
     } else {
-        ((0..16).filter(|r| rlist & (1 << r) != 0).collect(), rlist.count_ones())
+        (rlist, rlist.count_ones())
     };
     let total = count * 4;
 
@@ -473,7 +551,10 @@ fn exec_block<B: Bus>(
         if writeback && !rn_in_list {
             cpu.regs[rn as usize] = wb_val;
         }
-        for &r in &regs {
+        for r in 0..16u8 {
+            if list & (1 << r) == 0 {
+                continue;
+            }
             let value = bus.read32(addr & !3);
             if user_bank {
                 cpu.set_user_reg(r, value);
@@ -490,7 +571,10 @@ fn exec_block<B: Bus>(
             addr = addr.wrapping_add(4);
         }
     } else {
-        for &r in &regs {
+        for r in 0..16u8 {
+            if list & (1 << r) == 0 {
+                continue;
+            }
             let value = if r == PC {
                 instr.pc_value().wrapping_add(4) // STM stores PC+12
             } else if r == rn {
