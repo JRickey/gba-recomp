@@ -303,9 +303,15 @@ fn cmd_play(args: &[String]) -> Result<(), String> {
 
     let mut rom_path = None;
     let mut interp_only = false;
+    // Perf instrumentation is developer tooling: always on in debug
+    // builds, opt-in (--stats or GBA_RECOMP_STATS=1) in release — the
+    // out-of-box experience stays clean.
+    let mut show_stats =
+        cfg!(debug_assertions) || std::env::var_os("GBA_RECOMP_STATS").is_some();
     for arg in args {
         match arg.as_str() {
             "--interp" => interp_only = true,
+            "--stats" => show_stats = true,
             other if rom_path.is_none() => rom_path = Some(other.to_string()),
             other => return Err(format!("unexpected argument {other:?}")),
         }
@@ -338,8 +344,13 @@ fn cmd_play(args: &[String]) -> Result<(), String> {
         eprintln!("loaded {sav_path}");
     }
 
+    let title = Path::new(&rom_path)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("recomp")
+        .to_string();
     let mut window = Window::new(
-        "recomp",
+        &title,
         240 * 3,
         160 * 3,
         WindowOptions { resize: true, ..WindowOptions::default() },
@@ -484,7 +495,9 @@ fn cmd_play(args: &[String]) -> Result<(), String> {
 
         // Live perf readout in the title, once a second: emulation cost
         // against the 16.7 ms budget and the native-dispatch share.
-        if frames_run % 60 == 0 {
+        // Developer tooling — hidden from the release out-of-box
+        // experience unless explicitly requested.
+        if show_stats && frames_run % 60 == 0 {
             let total = native_run + fallback_run;
             let share = if total == 0 { 0.0 } else { native_run as f64 * 100.0 / total as f64 };
             window.set_title(&format!(
