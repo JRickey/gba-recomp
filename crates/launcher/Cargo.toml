@@ -6,4 +6,6 @@ license.workspace = true
 description = "Frontend launcher: ROM selection, input setup, A/V settings"
 
 [dependencies]
+dirs = "6.0.0"
 eframe = "0.34.3"
+rfd = "0.17.2"

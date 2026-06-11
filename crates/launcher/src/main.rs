@@ -4,6 +4,7 @@
 
 mod app;
 mod assets;
+mod platform;
 mod screens;
 mod theme;
 
