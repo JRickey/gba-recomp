@@ -170,6 +170,14 @@ pub struct MemMap {
     /// Mixed mono output collected at `AUDIO_SAMPLE_CYCLES` intervals;
     /// drained by the frontend.
     pub audio_buf: Vec<i16>,
+    /// Per-channel tap for the enhanced audio path (set by the frontend;
+    /// observation only, never fed back). When on, every Direct Sound
+    /// DAC event is recorded as (sample, driving-timer period in master
+    /// cycles) — the channel's own PCM stream at its own rate — and
+    /// `psg_tap` carries the PSG mix alone on the sample grid.
+    pub tap_channels: bool,
+    pub fifo_tap: [Vec<(i8, u32)>; 2],
+    pub psg_tap: Vec<i16>,
     audio_cursor: u64,
     apu: crate::apu::Apu,
     next_event: u64,
@@ -223,6 +231,9 @@ impl MemMap {
             fifo: [std::collections::VecDeque::new(), std::collections::VecDeque::new()],
             fifo_sample: [0; 2],
             audio_buf: Vec::new(),
+            tap_channels: false,
+            fifo_tap: [Vec::new(), Vec::new()],
+            psg_tap: Vec::new(),
             audio_cursor: 0,
             apu: crate::apu::Apu::default(),
             next_event: HBLANK_FLAG_CYCLE,
@@ -291,10 +302,14 @@ impl MemMap {
         self.clock += cycles;
         while self.audio_cursor <= self.clock {
             // Mix Direct Sound DAC levels with the PSG channels.
-            let mut s = (self.fifo_sample[0] as i16 + self.fifo_sample[1] as i16) * 64;
-            s = s.saturating_add(self.apu.sample(&self.io, AUDIO_SAMPLE_CYCLES as u32));
+            let psg = self.apu.sample(&self.io, AUDIO_SAMPLE_CYCLES as u32);
+            let s = ((self.fifo_sample[0] as i16 + self.fifo_sample[1] as i16) * 64)
+                .saturating_add(psg);
             if self.audio_buf.len() < 0x1_0000 {
                 self.audio_buf.push(s);
+            }
+            if self.tap_channels && self.psg_tap.len() < 0x1_0000 {
+                self.psg_tap.push(psg);
             }
             self.audio_cursor += AUDIO_SAMPLE_CYCLES;
         }
@@ -418,11 +433,14 @@ impl MemMap {
         }
         // Direct Sound: timers 0/1 clock the FIFOs selected in SOUNDCNT_H.
         if i < 2 {
+            let t = &self.timers[i];
+            let period =
+                (((0x1_0000 - t.reload as u64).max(1)) << t.prescaler_shift()) as u32;
             let soundcnt_h = u16::from_le_bytes([self.io[0x82], self.io[0x83]]);
             for f in 0..2 {
                 let timer_sel = (soundcnt_h >> (10 + f * 4)) & 1;
                 if timer_sel as usize == i {
-                    self.drain_fifo(f, times);
+                    self.drain_fifo(f, times, period);
                 }
             }
         }
@@ -457,10 +475,17 @@ impl MemMap {
     }
 
     /// Consume samples from a FIFO; refill via sound DMA at the low mark.
-    fn drain_fifo(&mut self, f: usize, times: u64) {
+    /// `period` is the driving timer's period in master cycles — the
+    /// channel's sample spacing, recorded with each DAC event when the
+    /// per-channel tap is on (an underrun holds the level, exactly like
+    /// the hardware DAC, so the tap stays a uniform stream).
+    fn drain_fifo(&mut self, f: usize, times: u64, period: u32) {
         for _ in 0..times {
             if let Some(s) = self.fifo[f].pop_front() {
                 self.fifo_sample[f] = s;
+            }
+            if self.tap_channels && self.fifo_tap[f].len() < 0x1_0000 {
+                self.fifo_tap[f].push((self.fifo_sample[f], period));
             }
         }
         if self.fifo[f].len() <= 16 {
@@ -1090,6 +1115,26 @@ impl Bus for MemMap {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fifo_tap_records_samples_with_timer_period() {
+        let mut mem = MemMap::new(vec![]);
+        mem.tap_channels = true;
+        // FIFO A on timer 0 (SOUNDCNT_H default), timer 0 period 256
+        // cycles (reload 0xFF00, prescaler F/1).
+        mem.write32(0x0400_00A0, 0x4030_2010); // four FIFO A samples
+        mem.write16(0x0400_0100, 0xFF00); // reload
+        mem.write16(0x0400_0102, 0x0080); // enable
+        mem.tick(256 * 6 + 8);
+        let tap = &mem.fifo_tap[0];
+        assert_eq!(tap.len(), 6);
+        assert!(tap.iter().all(|&(_, p)| p == 256));
+        let samples: Vec<i8> = tap.iter().map(|&(s, _)| s).collect();
+        // Four queued samples, then the DAC holds the last level.
+        assert_eq!(samples, vec![0x10, 0x20, 0x30, 0x40, 0x40, 0x40]);
+        // PSG-only tap fills on the sample grid alongside.
+        assert_eq!(mem.psg_tap.len(), mem.audio_buf.len());
+    }
 
     #[test]
     fn mirrors() {

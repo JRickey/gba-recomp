@@ -366,14 +366,15 @@ fn cmd_play(args: &[String]) -> Result<(), String> {
     }
 
 
-    // Audio: cpal output stream fed from a shared ring of mono samples
-    // tapped at the emulated DAC grid (65536 Hz). The A/V config selects
-    // the output path: hardware-faithful zero-order hold, or the premium
-    // path (final product name TBD) — windowed-sinc resampling, DC
-    // blocking, and buffer-fill rate control.
+    // Audio. The A/V config selects the output path: hardware-faithful
+    // zero-order hold of the mixed 65536 Hz tap, or the premium path
+    // (final product name TBD) — each Direct Sound channel interpolated
+    // from its own timer-derived rate straight to the device rate, PSG
+    // band-limited from its grid, summed in float behind a DC blocker.
     let av = input_config::AvConfig::load();
-    let ring = std::sync::Arc::new(std::sync::Mutex::new(std::collections::VecDeque::<i16>::new()));
-    let _stream = start_audio(ring.clone(), av.audio_enhanced);
+    m.bus.tap_channels = av.audio_enhanced;
+    let streams = std::sync::Arc::new(std::sync::Mutex::new(AudioStreams::default()));
+    let _stream = start_audio(streams.clone(), av.audio_enhanced);
 
     // Bindings come from the launcher-managed config (defaults match the
     // historical hardcoded map). Keyboard always works; a configured
@@ -489,12 +490,28 @@ fn cmd_play(args: &[String]) -> Result<(), String> {
             }
         }
 
-        // Hand this frame's audio to the output ring (cap ~250 ms).
+        // Hand this frame's audio to the consumer (caps ~250 ms each).
         {
-            let mut q = ring.lock().unwrap();
-            for s in m.bus.audio_buf.drain(..) {
-                if q.len() < 16384 {
-                    q.push_back(s);
+            let mut st = streams.lock().unwrap();
+            if av.audio_enhanced {
+                m.bus.audio_buf.clear();
+                for s in m.bus.psg_tap.drain(..) {
+                    if st.psg.len() < 16384 {
+                        st.psg.push_back(s);
+                    }
+                }
+                for f in 0..2 {
+                    for e in m.bus.fifo_tap[f].drain(..) {
+                        if st.fifo[f].len() < 32768 {
+                            st.fifo[f].push_back(e);
+                        }
+                    }
+                }
+            } else {
+                for s in m.bus.audio_buf.drain(..) {
+                    if st.mixed.len() < 16384 {
+                        st.mixed.push_back(s);
+                    }
                 }
             }
         }
@@ -564,11 +581,30 @@ fn ensure_native(
     Ok((lib, table))
 }
 
-/// Build the cpal output stream over the shared sample ring. `enhanced`
+/// Streams shared between the emulation loop (producer) and the cpal
+/// callback (consumer). Faithful mode uses only `mixed`; enhanced mode
+/// uses the per-channel taps.
+#[derive(Default)]
+struct AudioStreams {
+    mixed: std::collections::VecDeque<i16>,
+    psg: std::collections::VecDeque<i16>,
+    fifo: [std::collections::VecDeque<(i8, u32)>; 2],
+}
+
+/// The premium path's consumer state: one interpolator per Direct Sound
+/// channel at its own rate, PSG through the fixed-grid resampler, and a
+/// DC blocker on the float sum.
+struct Enhanced {
+    psg: SincResampler,
+    fifo: [FifoInterp; 2],
+    dc: DcBlock,
+}
+
+/// Build the cpal output stream over the shared streams. `enhanced`
 /// selects the premium output path; off reproduces the original
 /// zero-order-hold behavior exactly.
 fn start_audio(
-    ring: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<i16>>>,
+    streams: std::sync::Arc<std::sync::Mutex<AudioStreams>>,
     enhanced: bool,
 ) -> Option<cpal::Stream> {
     use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -578,7 +614,15 @@ fn start_audio(
     let channels = cfg.channels() as usize;
     let src = gba_core::mem::AUDIO_RATE_HZ as f64;
 
-    let mut resampler = if enhanced { Some(SincResampler::new(src, rate)) } else { None };
+    let mut eng = if enhanced {
+        Some(Enhanced {
+            psg: SincResampler::new(src, rate),
+            fifo: [FifoInterp::new(rate), FifoInterp::new(rate)],
+            dc: DcBlock::new(rate),
+        })
+    } else {
+        None
+    };
     let step = src / rate;
     let mut frac = 0.0f64;
     let mut last = 0i16;
@@ -586,15 +630,20 @@ fn start_audio(
         .build_output_stream(
             &cfg.into(),
             move |out: &mut [f32], _| {
-                let mut q = ring.lock().unwrap();
+                let mut st = streams.lock().unwrap();
                 for frame in out.chunks_mut(channels) {
-                    let v = match resampler.as_mut() {
-                        Some(r) => r.next(&mut q),
+                    let v = match eng.as_mut() {
+                        Some(e) => {
+                            let sum = e.psg.next(&mut st.psg)
+                                + e.fifo[0].next(&mut st.fifo[0])
+                                + e.fifo[1].next(&mut st.fifo[1]);
+                            e.dc.next(sum)
+                        }
                         None => {
                             frac += step;
                             while frac >= 1.0 {
                                 frac -= 1.0;
-                                if let Some(s) = q.pop_front() {
+                                if let Some(s) = st.mixed.pop_front() {
                                     last = s;
                                 }
                             }
@@ -619,60 +668,77 @@ const SINC_PHASES: usize = 128;
 /// Ring fill the rate control steers toward (~62 ms at the 65536 Hz tap).
 const RING_TARGET: usize = 4096;
 
-/// Polyphase windowed-sinc resampler with a one-pole DC blocker and
-/// gentle (max ±0.5%) consumption-rate control against the ring fill —
-/// the premium audio output path. Band-limits to the narrower of the
-/// two Nyquists, so downsampling to a 44.1/48 kHz device does not fold
-/// images the way the zero-order-hold path does.
+/// Polyphase interpolation table: (SINC_PHASES + 1) rows of SINC_TAPS
+/// coefficients, Hann-windowed sinc at cutoff `fc` (cycles per source
+/// sample), each row normalized to unity DC gain.
+fn build_sinc_table(fc: f64) -> Vec<f32> {
+    use std::f64::consts::PI;
+    let center = (SINC_TAPS / 2 - 1) as f64;
+    let half = SINC_TAPS as f64 / 2.0;
+    let mut table = Vec::with_capacity((SINC_PHASES + 1) * SINC_TAPS);
+    for p in 0..=SINC_PHASES {
+        let phi = p as f64 / SINC_PHASES as f64;
+        let mut row = [0.0f64; SINC_TAPS];
+        let mut sum = 0.0;
+        for (k, c) in row.iter_mut().enumerate() {
+            let t = k as f64 - center - phi;
+            let sinc = if t.abs() < 1e-9 {
+                2.0 * fc
+            } else {
+                (2.0 * PI * fc * t).sin() / (PI * t)
+            };
+            let win = if t.abs() < half { 0.5 * (1.0 + (PI * t / half).cos()) } else { 0.0 };
+            *c = sinc * win;
+            sum += *c;
+        }
+        table.extend(row.iter().map(|c| (c / sum) as f32));
+    }
+    table
+}
+
+/// One-pole DC blocker, fc ~ 10 Hz: y[n] = x[n] - x[n-1] + r*y[n-1].
+/// Kills bias offsets, held-DAC ledges, and underrun pops.
+struct DcBlock {
+    r: f32,
+    x1: f32,
+    y1: f32,
+}
+
+impl DcBlock {
+    fn new(out_hz: f64) -> DcBlock {
+        DcBlock { r: 1.0 - (2.0 * std::f64::consts::PI * 10.0 / out_hz) as f32, x1: 0.0, y1: 0.0 }
+    }
+
+    fn next(&mut self, x: f32) -> f32 {
+        let y = x - self.x1 + self.r * self.y1;
+        self.x1 = x;
+        self.y1 = y;
+        y
+    }
+}
+
+/// Fixed-ratio polyphase windowed-sinc resampler with gentle (max
+/// ±0.5%) consumption-rate control against the queue fill. Band-limits
+/// to the narrower of the two Nyquists, so downsampling to a 44.1/48
+/// kHz device does not fold images the way the zero-order-hold path
+/// does. Used for the PSG grid stream.
 struct SincResampler {
-    /// (SINC_PHASES + 1) rows of SINC_TAPS coefficients; each row has
-    /// unity DC gain.
     table: Vec<f32>,
     /// Last SINC_TAPS source samples, oldest first.
     hist: [f32; SINC_TAPS],
     ratio: f64,
     frac: f64,
-    // DC blocker: y[n] = x[n] - x[n-1] + r*y[n-1], fc ~ 10 Hz.
-    dc_r: f32,
-    dc_x1: f32,
-    dc_y1: f32,
 }
 
 impl SincResampler {
     fn new(src_hz: f64, out_hz: f64) -> SincResampler {
-        use std::f64::consts::PI;
-        // Cutoff in cycles per source sample, 10% under the narrower
-        // Nyquist to leave the window transition band room.
-        let fc = 0.45 * (out_hz / src_hz).min(1.0);
-        let center = (SINC_TAPS / 2 - 1) as f64;
-        let half = SINC_TAPS as f64 / 2.0;
-        let mut table = Vec::with_capacity((SINC_PHASES + 1) * SINC_TAPS);
-        for p in 0..=SINC_PHASES {
-            let phi = p as f64 / SINC_PHASES as f64;
-            let mut row = [0.0f64; SINC_TAPS];
-            let mut sum = 0.0;
-            for (k, c) in row.iter_mut().enumerate() {
-                let t = k as f64 - center - phi;
-                let sinc = if t.abs() < 1e-9 {
-                    2.0 * fc
-                } else {
-                    (2.0 * PI * fc * t).sin() / (PI * t)
-                };
-                let win = if t.abs() < half { 0.5 * (1.0 + (PI * t / half).cos()) } else { 0.0 };
-                *c = sinc * win;
-                sum += *c;
-            }
-            // Unity DC gain per phase row.
-            table.extend(row.iter().map(|c| (c / sum) as f32));
-        }
+        // 10% under the narrower Nyquist leaves the window transition
+        // band room.
         SincResampler {
-            table,
+            table: build_sinc_table(0.45 * (out_hz / src_hz).min(1.0)),
             hist: [0.0; SINC_TAPS],
             ratio: src_hz / out_hz,
             frac: 0.0,
-            dc_r: 1.0 - (2.0 * PI * 10.0 / out_hz) as f32,
-            dc_x1: 0.0,
-            dc_y1: 0.0,
         }
     }
 
@@ -691,11 +757,73 @@ impl SincResampler {
             self.hist[SINC_TAPS - 1] = s;
         }
         let row = &self.table[(self.frac * SINC_PHASES as f64) as usize * SINC_TAPS..][..SINC_TAPS];
-        let x: f32 = row.iter().zip(self.hist.iter()).map(|(c, s)| c * s).sum();
-        let y = x - self.dc_x1 + self.dc_r * self.dc_y1;
-        self.dc_x1 = x;
-        self.dc_y1 = y;
-        y
+        row.iter().zip(self.hist.iter()).map(|(c, s)| c * s).sum()
+    }
+}
+
+/// Interpolates one Direct Sound channel from its own timer-derived
+/// rate — which can change at any DAC event — straight to the device
+/// rate, bypassing the mixed-grid zero-order hold entirely (Stage 1).
+/// The table is a pure interpolation filter (cutoff 0.45 of the source
+/// rate): correct whenever the channel runs below the device rate,
+/// which is every real driver mix rate. A channel driven *above* the
+/// device rate falls back to sample-and-hold — interpolating it would
+/// require a decimation filter retuned per rate, and games doing this
+/// are exploiting fold-down on purpose.
+struct FifoInterp {
+    table: Vec<f32>,
+    hist: [f32; SINC_TAPS],
+    /// Output position inside the current source sample, in master
+    /// cycles (the period is the unit, so rate changes are seamless).
+    frac: f64,
+    /// Current source sample spacing in master cycles.
+    period: f64,
+    /// Master cycles per output sample.
+    out_step: f64,
+    out_hz: f64,
+    hold: bool,
+}
+
+impl FifoInterp {
+    fn new(out_hz: f64) -> FifoInterp {
+        FifoInterp {
+            table: build_sinc_table(0.45),
+            hist: [0.0; SINC_TAPS],
+            frac: 0.0,
+            period: 512.0, // placeholder until the first DAC event
+            out_step: (1u64 << 24) as f64 / out_hz,
+            out_hz,
+            hold: false,
+        }
+    }
+
+    fn next(&mut self, q: &mut std::collections::VecDeque<(i8, u32)>) -> f32 {
+        // Steer toward ~62 ms queued at the channel's current rate.
+        let target = ((1u64 << 24) as f64 / self.period / 16.0).max(64.0);
+        let err = (q.len() as f64 - target) / target;
+        self.frac += self.out_step * (1.0 + 0.005 * err.clamp(-1.0, 1.0));
+        while self.frac >= self.period {
+            self.frac -= self.period;
+            let s = match q.pop_front() {
+                Some((s, p)) => {
+                    self.period = (p as f64).max(1.0);
+                    self.hold = (1u64 << 24) as f64 / self.period > self.out_hz;
+                    s as f32 * (64.0 / 32768.0)
+                }
+                None => self.hist[SINC_TAPS - 1], // DAC holds on underrun
+            };
+            self.hist.copy_within(1.., 0);
+            self.hist[SINC_TAPS - 1] = s;
+        }
+        if self.hold {
+            return self.hist[SINC_TAPS - 1];
+        }
+        let phase = ((self.frac / self.period) * SINC_PHASES as f64) as usize;
+        self.table[phase * SINC_TAPS..][..SINC_TAPS]
+            .iter()
+            .zip(self.hist.iter())
+            .map(|(c, s)| c * s)
+            .sum()
     }
 }
 
@@ -1186,7 +1314,7 @@ mod tests {
     #[test]
     fn sinc_preserves_audible_sine() {
         // 1 kHz at the 65536 Hz tap, resampled to 48 kHz: RMS must come
-        // through within a few percent (DC blocker barely touches 1 kHz).
+        // through within a few percent.
         let mut r = SincResampler::new(65536.0, 48000.0);
         let mut q = std::collections::VecDeque::new();
         for n in 0..65536 {
@@ -1200,5 +1328,52 @@ mod tests {
             (rms - expect).abs() / expect < 0.03,
             "rms {rms} vs {expect}"
         );
+    }
+
+    /// Fill a FIFO event queue with a sine at the given timer period.
+    fn fifo_sine(period: u32, hz: f64, n: usize) -> std::collections::VecDeque<(i8, u32)> {
+        let src_hz = (1u64 << 24) as f64 / period as f64;
+        (0..n)
+            .map(|i| {
+                let s = (2.0 * std::f64::consts::PI * hz * i as f64 / src_hz).sin();
+                ((s * 100.0) as i8, period)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn fifo_interp_preserves_sine_at_mp2k_rate() {
+        // 1 kHz at 13379 Hz (period 1254) — the MP2K default mix rate —
+        // interpolated to 48 kHz: RMS within a few percent of the 8-bit
+        // source amplitude.
+        let mut f = FifoInterp::new(48000.0);
+        let mut q = fifo_sine(1254, 1000.0, 40000);
+        let out: Vec<f32> = (0..96000).map(|_| f.next(&mut q)).collect();
+        let rms = (out[2000..90000].iter().map(|v| v * v).sum::<f32>() / 88000.0).sqrt();
+        let expect = (100.0 * 64.0 / 32768.0) / 2f32.sqrt();
+        assert!((rms - expect).abs() / expect < 0.05, "rms {rms} vs {expect}");
+    }
+
+    #[test]
+    fn fifo_interp_follows_rate_change() {
+        // Retune mid-stream 13379 Hz -> 32768 Hz; output stays bounded
+        // and alive on both sides of the change.
+        let mut f = FifoInterp::new(48000.0);
+        let mut q = fifo_sine(1254, 1000.0, 4000);
+        q.extend(fifo_sine(512, 1000.0, 8000));
+        let out: Vec<f32> = (0..40000).map(|_| f.next(&mut q)).collect();
+        assert!(out.iter().all(|v| v.abs() < 0.5));
+        let tail_rms = (out[30000..40000].iter().map(|v| v * v).sum::<f32>() / 10000.0).sqrt();
+        assert!(tail_rms > 0.05, "went silent after rate change: {tail_rms}");
+    }
+
+    #[test]
+    fn fifo_interp_holds_above_device_rate() {
+        // 65536 Hz channel into a 48 kHz device: the structural fallback
+        // is sample-and-hold; output must stay bounded.
+        let mut f = FifoInterp::new(48000.0);
+        let mut q = fifo_sine(256, 1000.0, 16384);
+        let out: Vec<f32> = (0..8000).map(|_| f.next(&mut q)).collect();
+        assert!(out.iter().all(|v| v.abs() < 0.5));
     }
 }
