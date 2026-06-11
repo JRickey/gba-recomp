@@ -18,6 +18,7 @@ pub mod exec;
 pub mod hle;
 pub mod machine;
 pub mod mem;
+pub mod mp2k;
 pub mod ppu;
 
 pub use bus::Bus;

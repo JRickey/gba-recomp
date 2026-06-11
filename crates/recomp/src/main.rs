@@ -24,6 +24,7 @@ fn main() -> ExitCode {
         Some("frames") => cmd_frames(&args[1..]),
         Some("play") => cmd_play(&args[1..]),
         Some("build") => cmd_build(&args[1..]),
+        Some("mp2k-scan") => cmd_mp2k_scan(&args[1..]),
         Some("runc") => cmd_runc(&args[1..]),
         Some("verify") => cmd_verify(&args[1..]),
         _ => {
@@ -323,6 +324,45 @@ fn cmd_frames(args: &[String]) -> Result<(), String> {
         std::fs::write(&path, ppm).map_err(|e| format!("{path}: {e}"))?;
         println!("wrote {path}");
     }
+    Ok(())
+}
+
+/// Dev triage: report MP2K driver detection over a ROM or a directory
+/// of ROMs (symlinks followed) — validates the signature scan against
+/// the corpus and reports where each hook would land.
+fn cmd_mp2k_scan(args: &[String]) -> Result<(), String> {
+    let target = args.first().ok_or("missing ROM or directory")?;
+    let path = Path::new(target);
+    let mut files: Vec<std::path::PathBuf> = if path.is_dir() {
+        std::fs::read_dir(path)
+            .map_err(|e| format!("{target}: {e}"))?
+            .filter_map(Result::ok)
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|x| x == "gba"))
+            .collect()
+    } else {
+        vec![path.to_path_buf()]
+    };
+    files.sort();
+    let (mut hits, mut total) = (0u32, 0u32);
+    for f in &files {
+        let rom = std::fs::read(f).map_err(|e| format!("{}: {e}", f.display()))?;
+        total += 1;
+        match gba_core::mp2k::detect(&rom) {
+            Some(sig) => {
+                hits += 1;
+                println!(
+                    "MP2K {} SoundMain@{:#08x} SoundMainRAM={:#010x} ({})",
+                    file_name(f),
+                    sig.sound_main_off,
+                    sig.sound_main_ram & !1,
+                    if sig.sound_main_ram & 1 != 0 { "thumb" } else { "arm" },
+                );
+            }
+            None => println!("---- {}", file_name(f)),
+        }
+    }
+    println!("\n{hits}/{total} images carry the stock MP2K driver signature");
     Ok(())
 }
 
