@@ -718,6 +718,24 @@ impl MemMap {
         (addr & 0x01FF_FFFF) as usize
     }
 
+    /// Byte-composed read16, identical to the `Bus` trait default. The
+    /// native fast paths below fall back to this wherever wide access
+    /// isn't provably equivalent (I/O side effects, region edges, the
+    /// VRAM fold, EEPROM, flash, open bus).
+    fn rd16_bytes(&mut self, addr: u32) -> u16 {
+        let lo = self.read8(addr) as u16;
+        let hi = self.read8(addr.wrapping_add(1)) as u16;
+        lo | (hi << 8)
+    }
+
+    /// Halfword-composed read32, identical to the `Bus` trait default
+    /// (which composes two read16s — themselves byte-equivalent).
+    fn rd32_halves(&mut self, addr: u32) -> u32 {
+        let lo = self.read16(addr) as u32;
+        let hi = self.read16(addr.wrapping_add(2)) as u32;
+        lo | (hi << 16)
+    }
+
     /// Reads past the cartridge's physical end return an address-derived
     /// 16-bit pattern (hardware reference: cartridge bus with nothing
     /// driving it).
@@ -815,9 +833,159 @@ impl Bus for MemMap {
         }
     }
 
+    fn read16(&mut self, addr: u32) -> u16 {
+        match addr >> 24 {
+            0x00 => {
+                let a = addr as usize;
+                if a + 2 <= 0x4000 {
+                    u16::from_le_bytes([self.bios[a], self.bios[a + 1]])
+                } else {
+                    self.rd16_bytes(addr)
+                }
+            }
+            0x02 => {
+                let off = (addr & 0x3_FFFF) as usize;
+                if off + 2 <= 0x4_0000 {
+                    u16::from_le_bytes([self.ewram[off], self.ewram[off + 1]])
+                } else {
+                    self.rd16_bytes(addr)
+                }
+            }
+            0x03 => {
+                let off = (addr & 0x7FFF) as usize;
+                if off + 2 <= 0x8000 {
+                    u16::from_le_bytes([self.iwram[off], self.iwram[off + 1]])
+                } else {
+                    self.rd16_bytes(addr)
+                }
+            }
+            0x05 => {
+                let off = (addr & 0x3FF) as usize;
+                if off + 2 <= 0x400 {
+                    u16::from_le_bytes([self.palette[off], self.palette[off + 1]])
+                } else {
+                    self.rd16_bytes(addr)
+                }
+            }
+            0x06 => {
+                let i0 = Self::vram_index(addr);
+                let i1 = Self::vram_index(addr.wrapping_add(1));
+                if i1 == i0 + 1 {
+                    u16::from_le_bytes([self.vram[i0], self.vram[i1]])
+                } else {
+                    self.rd16_bytes(addr)
+                }
+            }
+            0x07 => {
+                let off = (addr & 0x3FF) as usize;
+                if off + 2 <= 0x400 {
+                    u16::from_le_bytes([self.oam[off], self.oam[off + 1]])
+                } else {
+                    self.rd16_bytes(addr)
+                }
+            }
+            0x08..=0x0D => {
+                if self.is_eeprom_addr(addr) {
+                    return self.rd16_bytes(addr);
+                }
+                let idx = Self::rom_index(addr);
+                if idx + 2 <= self.rom.len() {
+                    u16::from_le_bytes([self.rom[idx], self.rom[idx + 1]])
+                } else {
+                    self.rd16_bytes(addr)
+                }
+            }
+            _ => self.rd16_bytes(addr),
+        }
+    }
+
+    fn read32(&mut self, addr: u32) -> u32 {
+        match addr >> 24 {
+            0x00 => {
+                let a = addr as usize;
+                if a + 4 <= 0x4000 {
+                    u32::from_le_bytes(self.bios[a..a + 4].try_into().unwrap())
+                } else {
+                    self.rd32_halves(addr)
+                }
+            }
+            0x02 => {
+                let off = (addr & 0x3_FFFF) as usize;
+                if off + 4 <= 0x4_0000 {
+                    u32::from_le_bytes(self.ewram[off..off + 4].try_into().unwrap())
+                } else {
+                    self.rd32_halves(addr)
+                }
+            }
+            0x03 => {
+                let off = (addr & 0x7FFF) as usize;
+                if off + 4 <= 0x8000 {
+                    u32::from_le_bytes(self.iwram[off..off + 4].try_into().unwrap())
+                } else {
+                    self.rd32_halves(addr)
+                }
+            }
+            0x05 => {
+                let off = (addr & 0x3FF) as usize;
+                if off + 4 <= 0x400 {
+                    u32::from_le_bytes(self.palette[off..off + 4].try_into().unwrap())
+                } else {
+                    self.rd32_halves(addr)
+                }
+            }
+            0x06 => {
+                let i0 = Self::vram_index(addr);
+                let i3 = Self::vram_index(addr.wrapping_add(3));
+                if i3 == i0 + 3 {
+                    u32::from_le_bytes(self.vram[i0..i0 + 4].try_into().unwrap())
+                } else {
+                    self.rd32_halves(addr)
+                }
+            }
+            0x07 => {
+                let off = (addr & 0x3FF) as usize;
+                if off + 4 <= 0x400 {
+                    u32::from_le_bytes(self.oam[off..off + 4].try_into().unwrap())
+                } else {
+                    self.rd32_halves(addr)
+                }
+            }
+            0x08..=0x0D => {
+                if self.is_eeprom_addr(addr) {
+                    return self.rd32_halves(addr);
+                }
+                let idx = Self::rom_index(addr);
+                if idx + 4 <= self.rom.len() {
+                    u32::from_le_bytes(self.rom[idx..idx + 4].try_into().unwrap())
+                } else {
+                    self.rd32_halves(addr)
+                }
+            }
+            _ => self.rd32_halves(addr),
+        }
+    }
+
     fn write16(&mut self, addr: u32, value: u16) {
         // Bypass the byte-write quirks for naturally sized accesses.
         match addr >> 24 {
+            0x02 => {
+                let off = (addr & 0x3_FFFF) as usize;
+                if off + 2 <= 0x4_0000 {
+                    self.ewram[off..off + 2].copy_from_slice(&value.to_le_bytes());
+                } else {
+                    self.write8(addr, value as u8);
+                    self.write8(addr.wrapping_add(1), (value >> 8) as u8);
+                }
+            }
+            0x03 => {
+                let off = (addr & 0x7FFF) as usize;
+                if off + 2 <= 0x8000 {
+                    self.iwram[off..off + 2].copy_from_slice(&value.to_le_bytes());
+                } else {
+                    self.write8(addr, value as u8);
+                    self.write8(addr.wrapping_add(1), (value >> 8) as u8);
+                }
+            }
             0x05 => {
                 let base = (addr & 0x3FE) as usize;
                 self.palette[base..base + 2].copy_from_slice(&value.to_le_bytes());
@@ -838,8 +1006,48 @@ impl Bus for MemMap {
     }
 
     fn write32(&mut self, addr: u32, value: u32) {
-        self.write16(addr & !1, value as u16);
-        self.write16((addr & !1).wrapping_add(2), (value >> 16) as u16);
+        let a = addr & !1;
+        match a >> 24 {
+            0x02 => {
+                let off = (a & 0x3_FFFF) as usize;
+                if off + 4 <= 0x4_0000 {
+                    self.ewram[off..off + 4].copy_from_slice(&value.to_le_bytes());
+                    return;
+                }
+            }
+            0x03 => {
+                let off = (a & 0x7FFF) as usize;
+                if off + 4 <= 0x8000 {
+                    self.iwram[off..off + 4].copy_from_slice(&value.to_le_bytes());
+                    return;
+                }
+            }
+            0x05 => {
+                // Match the two-halfword path: each half re-masks to 0x3FE.
+                let off = (a & 0x3FE) as usize;
+                if ((a.wrapping_add(2)) & 0x3FE) as usize == off + 2 {
+                    self.palette[off..off + 4].copy_from_slice(&value.to_le_bytes());
+                    return;
+                }
+            }
+            0x06 => {
+                let i0 = Self::vram_index(a);
+                if Self::vram_index(a.wrapping_add(2)) == i0 + 2 {
+                    self.vram[i0..i0 + 4].copy_from_slice(&value.to_le_bytes());
+                    return;
+                }
+            }
+            0x07 => {
+                let off = (a & 0x3FE) as usize;
+                if ((a.wrapping_add(2)) & 0x3FE) as usize == off + 2 {
+                    self.oam[off..off + 4].copy_from_slice(&value.to_le_bytes());
+                    return;
+                }
+            }
+            _ => {}
+        }
+        self.write16(a, value as u16);
+        self.write16(a.wrapping_add(2), (value >> 16) as u16);
     }
 
     fn hle_halt(&mut self) {
