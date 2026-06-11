@@ -232,8 +232,26 @@ fn cmd_frames(args: &[String]) -> Result<(), String> {
     let mut mixed: Vec<i16> = Vec::new();
     let mut psg: Vec<i16> = Vec::new();
     let mut fifo_ev: [Vec<(i8, u32)>; 2] = [Vec::new(), Vec::new()];
+    let mut hle: Vec<f32> = Vec::new();
     if dump_audio.is_some() {
         m.bus.tap_channels = true;
+    }
+    // RECOMP_MP2K=1: arm the HLE shadow mixer headless — the
+    // differential self-check then runs under `frames`, which is the
+    // autonomous validation path for the shadow (no ears required).
+    let mp2k_on = std::env::var_os("RECOMP_MP2K").is_some();
+    if mp2k_on {
+        m.bus.tap_channels = true;
+        match gba_core::mp2k::detect(&m.bus.rom) {
+            Some(sig) => {
+                eprintln!(
+                    "mp2k: driver detected, SoundMainRAM {:#010x}",
+                    sig.sound_main_ram & !1
+                );
+                m.bus.mp2k = Some(Box::new(gba_core::mp2k::Mp2kHle::new(sig)));
+            }
+            None => eprintln!("mp2k: no stock driver signature"),
+        }
     }
     for _ in 0..frames {
         m.run_frame(5_000_000);
@@ -244,10 +262,35 @@ fn cmd_frames(args: &[String]) -> Result<(), String> {
                 fifo_ev[f].append(&mut m.bus.fifo_tap[f]);
             }
         }
+        if mp2k_on {
+            hle.extend(m.bus.hle_tap.drain(..));
+        }
+    }
+    if let Some(h) = m.bus.mp2k.as_deref() {
+        let (corr, ratio) = h.last_correlation();
+        eprintln!(
+            "mp2k: hooks={} stale={} bad_waves={} corr={corr:.3} ratio={ratio:.2} engaged={} active={}{}",
+            h.hooks,
+            h.stale_ticks,
+            h.bad_waves,
+            h.engaged,
+            h.active,
+            h.reverted
+                .as_deref()
+                .map(|m| format!(" REVERTED: {m}"))
+                .unwrap_or_default()
+        );
     }
     if let Some(prefix) = &dump_audio {
         write_wav(&format!("{prefix}.mixed.wav"), &mixed, gba_core::mem::AUDIO_RATE_HZ, 2)?;
         write_wav(&format!("{prefix}.psg.wav"), &psg, gba_core::mem::AUDIO_RATE_HZ, 2)?;
+        if !hle.is_empty() {
+            let pcm: Vec<i16> = hle
+                .iter()
+                .map(|v| (v * 32768.0).clamp(-32768.0, 32767.0) as i16)
+                .collect();
+            write_wav(&format!("{prefix}.hle.wav"), &pcm, gba_core::mem::AUDIO_RATE_HZ, 2)?;
+        }
         for f in 0..2 {
             let mut raw = Vec::with_capacity(fifo_ev[f].len() * 5);
             for &(s, p) in &fifo_ev[f] {
@@ -464,6 +507,18 @@ fn cmd_play(args: &[String]) -> Result<(), String> {
     // band-limited from its grid, summed in float behind a DC blocker.
     let av = input_config::AvConfig::load();
     m.bus.tap_channels = av.audio_enhanced;
+    // MP2K HLE (Stage 3): arm the shadow mixer when the stock driver
+    // is present. It engages on the first live driver tick and reverts
+    // loudly if its output stops matching the canon FIFO stream.
+    if av.audio_enhanced {
+        if let Some(sig) = gba_core::mp2k::detect(&m.bus.rom) {
+            eprintln!(
+                "MP2K driver detected: HLE shadow mixer armed (SoundMainRAM {:#010x})",
+                sig.sound_main_ram & !1
+            );
+            m.bus.mp2k = Some(Box::new(gba_core::mp2k::Mp2kHle::new(sig)));
+        }
+    }
     let streams = std::sync::Arc::new(std::sync::Mutex::new(AudioStreams::default()));
     let _stream = start_audio(streams.clone(), av.audio_enhanced);
 
@@ -637,20 +692,49 @@ fn cmd_play(args: &[String]) -> Result<(), String> {
                     m.bus.audio_buf.clear();
                     for pair in m.bus.psg_tap.chunks_exact(2) {
                         if st.psg.len() < 65536 {
-                            st.psg.push_back(pair[0]);
-                            st.psg.push_back(pair[1]);
+                            st.psg.push_back(pair[0] as f32 / 32768.0);
+                            st.psg.push_back(pair[1] as f32 / 32768.0);
                         } else {
                             st.drops += 1;
                         }
                     }
                     m.bus.psg_tap.clear();
+                    // MP2K HLE stream and liveness. A revert is a
+                    // product-bar event: say so, with the reason.
+                    let live = m.bus.mp2k.as_deref().is_some_and(|h| h.live());
+                    if let Some(h) = m.bus.mp2k.as_deref_mut() {
+                        if let Some(msg) = h.reverted.take() {
+                            eprintln!(
+                                "DEGRADED: MP2K HLE reverted to per-channel path: {msg}"
+                            );
+                        }
+                    }
+                    for pair in m.bus.hle_tap.chunks_exact(2) {
+                        if st.hle.len() < 65536 {
+                            st.hle.push_back(pair[0]);
+                            st.hle.push_back(pair[1]);
+                        } else {
+                            st.drops += 1;
+                        }
+                    }
+                    m.bus.hle_tap.clear();
+                    // Switch over only once the HLE ring is primed, so
+                    // the engage moment cannot gap; revert switches back
+                    // immediately (the FIFO interpolators self-prime).
+                    if !live {
+                        st.hle_on = false;
+                    } else if st.hle.len() / 2 >= RING_TARGET / 2 {
+                        st.hle_on = true;
+                    }
                     for f in 0..2 {
                         let events = std::mem::take(&mut m.bus.fifo_tap[f]);
-                        for e in events {
-                            if st.fifo[f].len() < 32768 {
-                                st.fifo[f].push_back(e);
-                            } else {
-                                st.drops += 1;
+                        if !st.hle_on {
+                            for e in events {
+                                if st.fifo[f].len() < 32768 {
+                                    st.fifo[f].push_back(e);
+                                } else {
+                                    st.drops += 1;
+                                }
                             }
                         }
                     }
@@ -778,8 +862,14 @@ fn ensure_native(
 #[derive(Default)]
 struct AudioStreams {
     mixed: std::collections::VecDeque<i16>,
-    psg: std::collections::VecDeque<i16>,
+    psg: std::collections::VecDeque<f32>,
     fifo: [std::collections::VecDeque<(i8, u32)>; 2],
+    /// MP2K HLE shadow-mixer stereo (65536 Hz grid, hardware-rail
+    /// units like `psg`). When `hle_on`, the callback substitutes this
+    /// for the FIFO A/B channels; reverting mid-session falls straight
+    /// back to the per-channel interpolators.
+    hle: std::collections::VecDeque<f32>,
+    hle_on: bool,
     /// SOUNDCNT_H routing snapshot for the enhanced path, refreshed
     /// each frame by the producer: bit 0 = right side, bit 1 = left.
     route: [u8; 2],
@@ -802,6 +892,9 @@ struct AudioStreams {
 struct Enhanced {
     psg: SincResampler,
     fifo: [FifoInterp; 2],
+    /// MP2K HLE stream resampler — consulted instead of `fifo` while
+    /// the shadow mixer is live.
+    hle: SincResampler,
     dc: [DcBlock; 2],
 }
 
@@ -823,6 +916,7 @@ fn start_audio(
         Some(Enhanced {
             psg: SincResampler::new(src, rate),
             fifo: [FifoInterp::new(rate), FifoInterp::new(rate)],
+            hle: SincResampler::new(src, rate),
             dc: [DcBlock::new(rate), DcBlock::new(rate)],
         })
     } else {
@@ -844,23 +938,41 @@ fn start_audio(
                     let (l, r) = match eng.as_mut() {
                         Some(e) => {
                             let (pl, pr) = e.psg.next(&mut st.psg);
-                            let a = e.fifo[0].next(&mut st.fifo[0])
-                                * if st.vol_half[0] { 0.5 } else { 1.0 };
-                            let b = e.fifo[1].next(&mut st.fifo[1])
-                                * if st.vol_half[1] { 0.5 } else { 1.0 };
                             let mut l = pl;
                             let mut r = pr;
-                            if st.route[0] & 2 != 0 {
-                                l += a;
-                            }
-                            if st.route[0] & 1 != 0 {
-                                r += a;
-                            }
-                            if st.route[1] & 2 != 0 {
-                                l += b;
-                            }
-                            if st.route[1] & 1 != 0 {
-                                r += b;
+                            if st.hle_on {
+                                // MP2K shadow mixer live: its stereo
+                                // already carries the driver's per-voice
+                                // pan and master volume; the SOUNDCNT
+                                // side enables and 50% bits still gate
+                                // the DAC path (FIFO A carries the right
+                                // mix half, B the left, per stock init).
+                                let (hl, hr) = e.hle.next(&mut st.hle);
+                                let hr = hr * if st.vol_half[0] { 0.5 } else { 1.0 };
+                                let hl = hl * if st.vol_half[1] { 0.5 } else { 1.0 };
+                                if st.route[0] & 2 != 0 || st.route[1] & 2 != 0 {
+                                    l += hl;
+                                }
+                                if st.route[0] & 1 != 0 || st.route[1] & 1 != 0 {
+                                    r += hr;
+                                }
+                            } else {
+                                let a = e.fifo[0].next(&mut st.fifo[0])
+                                    * if st.vol_half[0] { 0.5 } else { 1.0 };
+                                let b = e.fifo[1].next(&mut st.fifo[1])
+                                    * if st.vol_half[1] { 0.5 } else { 1.0 };
+                                if st.route[0] & 2 != 0 {
+                                    l += a;
+                                }
+                                if st.route[0] & 1 != 0 {
+                                    r += a;
+                                }
+                                if st.route[1] & 2 != 0 {
+                                    l += b;
+                                }
+                                if st.route[1] & 1 != 0 {
+                                    r += b;
+                                }
                             }
                             // Stage 2: where the hardware would hard-clip
                             // the over-rail sum, saturate it softly
@@ -1025,7 +1137,7 @@ impl SincResampler {
         }
     }
 
-    fn next(&mut self, q: &mut std::collections::VecDeque<i16>) -> (f32, f32) {
+    fn next(&mut self, q: &mut std::collections::VecDeque<f32>) -> (f32, f32) {
         // Steer consumption toward the target fill; an underrun repeats
         // the newest pair (a one-sample ZOH the DC blocker smooths).
         let pairs = (q.len() / 2) as f64;
@@ -1034,7 +1146,7 @@ impl SincResampler {
         while self.frac >= 1.0 {
             self.frac -= 1.0;
             let (l, r) = match (q.pop_front(), q.pop_front()) {
-                (Some(l), Some(r)) => (l as f32 / 32768.0, r as f32 / 32768.0),
+                (Some(l), Some(r)) => (l, r),
                 _ => (self.hist[0][SINC_TAPS - 1], self.hist[1][SINC_TAPS - 1]),
             };
             for (h, s) in self.hist.iter_mut().zip([l, r]) {
@@ -1417,6 +1529,15 @@ fn run_frame_native(
             continue;
         }
         let key = m.cpu.regs[15] | m.cpu.thumb() as u32;
+        // MP2K HLE hook at block granularity (SoundMainRAM is a call
+        // target, so its entry is always a dispatch point). The
+        // interpreter fallback re-checks inside step(); the hook is
+        // idempotent within a tick.
+        if let Some(h) = m.bus.mp2k.as_deref() {
+            if h.active && key == h.hook_key {
+                m.bus.mp2k_frame_hook();
+            }
+        }
         match table.get(key) {
             Some(f) => {
                 // Diagnostic: census of executed IWRAM natives.
@@ -1683,8 +1804,8 @@ mod tests {
         let mut q = std::collections::VecDeque::new();
         for n in 0..65536 {
             let s = (2.0 * std::f64::consts::PI * 1000.0 * n as f64 / 65536.0).sin();
-            q.push_back((s * 16384.0) as i16);
-            q.push_back((s * 16384.0) as i16);
+            q.push_back(s as f32 * 0.5);
+            q.push_back(s as f32 * 0.5);
         }
         let out: Vec<f32> = (0..40000).map(|_| { let (l, r2) = r.next(&mut q); (l + r2) * 0.5 }).collect();
         let rms = (out[2000..38000].iter().map(|v| v * v).sum::<f32>() / 36000.0).sqrt();

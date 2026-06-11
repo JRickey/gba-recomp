@@ -179,6 +179,13 @@ pub struct MemMap {
     pub tap_channels: bool,
     pub fifo_tap: [Vec<(i8, u32)>; 2],
     pub psg_tap: Vec<i16>,
+    /// MP2K HLE shadow mixer (Stage 3): present when the stock driver
+    /// was detected and the enhanced path is on. The dispatch loops
+    /// call `mp2k_frame_hook` when PC lands on `SoundMainRAM`.
+    pub mp2k: Option<Box<crate::mp2k::Mp2kHle>>,
+    /// Shadow-mixer stereo output on the tap grid (interleaved L, R;
+    /// hardware-rail units scaled to ±0.5 like the play-side floats).
+    pub hle_tap: Vec<f32>,
     /// Diagnostics: DAC events that found the FIFO empty (held level),
     /// and sound-DMA refills triggered at the low mark.
     pub fifo_underruns: [u64; 2],
@@ -240,6 +247,8 @@ impl MemMap {
             tap_channels: false,
             fifo_tap: [Vec::new(), Vec::new()],
             psg_tap: Vec::new(),
+            mp2k: None,
+            hle_tap: Vec::new(),
             fifo_underruns: [0; 2],
             fifo_refills: [0; 2],
             fifo_pushes: [0; 2],
@@ -325,6 +334,9 @@ impl MemMap {
     /// gap collapse into one held ledge (an audible thump per gap).
     fn pump_audio(&mut self, until: u64) {
         let until = until.min(self.clock);
+        // The shadow mixer renders on the same grid; hoisted out of
+        // `self` so it can read guest memory while we mutate the taps.
+        let mut mp2k = self.mp2k.take();
         while self.audio_cursor <= until {
             // Mix Direct Sound DAC levels with the PSG channels into a
             // stereo pair, honoring the SOUNDCNT routing the hardware
@@ -366,7 +378,38 @@ impl MemMap {
                 self.psg_tap.push(psg_l);
                 self.psg_tap.push(psg_r);
             }
+            if self.tap_channels {
+                if let Some(h) = mp2k.as_deref_mut() {
+                    if h.active && h.engaged {
+                        let mem = crate::mp2k::MemView {
+                            rom: &self.rom,
+                            ewram: &self.ewram,
+                            iwram: &self.iwram,
+                        };
+                        let (hl, hr) = h.render(&mem, self.fifo_sample);
+                        if self.hle_tap.len() < 0x2_0000 {
+                            self.hle_tap.push(hl);
+                            self.hle_tap.push(hr);
+                        }
+                    }
+                }
+            }
             self.audio_cursor += AUDIO_SAMPLE_CYCLES;
+        }
+        self.mp2k = mp2k;
+    }
+
+    /// MP2K HLE per-tick hook: the dispatch loops call this when PC
+    /// lands on the detected SoundMainRAM entry.
+    pub fn mp2k_frame_hook(&mut self) {
+        if let Some(mut h) = self.mp2k.take() {
+            let mem = crate::mp2k::MemView {
+                rom: &self.rom,
+                ewram: &self.ewram,
+                iwram: &self.iwram,
+            };
+            h.frame_hook(&mem, self.audio_cursor);
+            self.mp2k = Some(h);
         }
     }
 

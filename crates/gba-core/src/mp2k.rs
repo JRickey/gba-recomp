@@ -91,6 +91,690 @@ pub fn detect(rom: &[u8]) -> Option<Mp2kSig> {
     None
 }
 
+/// Guest pointer to the driver's `SoundInfo` (the SDK's well-known
+/// IWRAM slot).
+const SOUND_INFO_PTR: u32 = 0x0300_7FF0;
+/// `SoundInfo.ident` while a SoundMain tick is in flight: the SDK's
+/// ID_NUMBER 'Smsh' incremented as a lock — reading the +1 value at the
+/// SoundMainRAM hook doubles as "this really is a live driver tick"
+/// (m4aSoundVSyncOff parks ident at ID+10/11; pre-init is garbage).
+const MAGIC_LIVE: u32 = 0x6873_6D54;
+/// SoundChannel array at SoundInfo+0x50, stride 0x40, 12 entries.
+const CHANS_OFF: u32 = 0x50;
+const CHAN_STRIDE: u32 = 0x40;
+const MAX_CHANS: usize = 12;
+/// The tap grid the shadow renders on (mem::AUDIO_RATE_HZ).
+const RENDER_HZ: f64 = 65536.0;
+/// Grid samples per driver tick (59.7275 Hz frame) — envelope
+/// interpolation span and the reverb ring's frame granularity.
+const FRAME: usize = 1097;
+/// DPCM delta table (SDK gDeltaEncodingTable).
+const DPCM_LUT: [i8; 16] =
+    [0, 1, 4, 9, 16, 25, 36, 49, -64, -49, -36, -25, -16, -9, -4, -1];
+
+/// Read-only view of the guest memory regions sample data can live in.
+/// Side-effect free by construction — snapshotting and rendering must
+/// never perturb emulation (no I/O reads, no waitstates).
+pub struct MemView<'a> {
+    pub rom: &'a [u8],
+    pub ewram: &'a [u8],
+    pub iwram: &'a [u8],
+}
+
+impl<'a> MemView<'a> {
+    /// Resolve a guest address range to a slice, or None if it leaves
+    /// the region (the wave-pointer validation backbone).
+    pub fn slice(&self, addr: u32, len: usize) -> Option<&'a [u8]> {
+        let (region, off) = match addr >> 24 {
+            0x02 => (self.ewram, (addr & 0x3_FFFF) as usize),
+            0x03 => (self.iwram, (addr & 0x7FFF) as usize),
+            0x08..=0x0D => (self.rom, (addr & 0x01FF_FFFF) as usize),
+            _ => return None,
+        };
+        region.get(off..off.checked_add(len)?)
+    }
+
+    fn u8(&self, addr: u32) -> Option<u8> {
+        self.slice(addr, 1).map(|s| s[0])
+    }
+
+    fn u32(&self, addr: u32) -> Option<u32> {
+        self.slice(addr, 4).map(|s| u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
+    }
+}
+
+/// One shadowed Direct Sound voice. Gains are the driver's own
+/// envelopeVolumeR/L mirror (0..255 → /256), already including master
+/// and track volume; the sampler persists across ticks and resets on
+/// note-on, so position can never drift unboundedly from the guest's.
+#[derive(Clone, Copy)]
+struct Voice {
+    on: bool,
+    /// Guest address of the first sample byte (wave header + 16).
+    data: u32,
+    size: u32,
+    loop_start: u32,
+    looped: bool,
+    compressed: bool,
+    /// Source position in samples (fractional).
+    pos: f64,
+    /// Source samples per rendered grid sample.
+    step: f64,
+    /// (right, left) gain at tick start and one-tick prediction —
+    /// linear interpolation across the frame removes envelope zipper.
+    g0: (f32, f32),
+    g1: (f32, f32),
+    /// Decoded DPCM block cache (33 bytes -> 64 samples).
+    blk_idx: u32,
+    blk: [i8; 64],
+}
+
+impl Default for Voice {
+    fn default() -> Voice {
+        Voice {
+            on: false,
+            data: 0,
+            size: 0,
+            loop_start: 0,
+            looped: false,
+            compressed: false,
+            pos: 0.0,
+            step: 0.0,
+            g0: (0.0, 0.0),
+            g1: (0.0, 0.0),
+            blk_idx: u32::MAX,
+            blk: [0; 64],
+        }
+    }
+}
+
+/// Differential self-check: our shadow mix vs the canon FIFO DAC
+/// stream (which keeps running underneath). Raw-sample correlation is
+/// the wrong tool here — the canon stream is an 8-bit ZOH staircase
+/// whose image energy decorrelates from a clean render, and tonal
+/// content flips sign within a couple of ms of lag error. What we
+/// police is *structure*: the same notes at the same loudness at the
+/// same time. So both streams are rectified and lowpassed into
+/// envelopes, decimated, and Pearson-correlated over a coarse lag
+/// range covering the driver's DMA pipeline delay.
+struct SelfCheck {
+    /// One-pole envelope followers (per side, canon and shadow).
+    lp_x: (f32, f32),
+    lp_y: (f32, f32),
+    /// Decimated envelopes for the current window.
+    ex: Vec<(f32, f32)>,
+    ey: Vec<(f32, f32)>,
+    phase: u32,
+    strikes: u32,
+    /// Most recent windowed correlation and level ratio (diagnostics).
+    pub last_r: f32,
+    pub last_ratio: f32,
+}
+
+/// Envelope decimation: one entry per 64 grid samples (~1 ms).
+const DECIM: u32 = 64;
+/// Window: 1 s (1024 decimated entries).
+const CHECK_WINDOW: usize = 1024;
+/// Lag search 0..=56 decimated steps (~3.5 driver frames), step 2.
+const CHECK_MAX_LAG: usize = 56;
+/// Envelope follower pole (~80 Hz at the grid rate).
+const ENV_ALPHA: f32 = 0.0075;
+/// Windows whose canon envelope mean is below this carry no verdict.
+const CHECK_MIN_LEVEL: f32 = 0.002;
+/// Sustained correlation below this reverts the HLE.
+const CHECK_MIN_R: f32 = 0.5;
+const CHECK_MAX_STRIKES: u32 = 3;
+
+impl SelfCheck {
+    fn new() -> SelfCheck {
+        SelfCheck {
+            lp_x: (0.0, 0.0),
+            lp_y: (0.0, 0.0),
+            ex: Vec::with_capacity(CHECK_WINDOW),
+            ey: Vec::with_capacity(CHECK_WINDOW),
+            phase: 0,
+            strikes: 0,
+            last_r: 0.0,
+            last_ratio: 0.0,
+        }
+    }
+
+    /// Feed one grid sample; returns Some((best_r, level_ratio)) at
+    /// window ends that produced a verdict.
+    fn push(&mut self, canon: (f32, f32), shadow: (f32, f32)) -> Option<(f32, f32)> {
+        self.lp_x.0 += ENV_ALPHA * (canon.0.abs() - self.lp_x.0);
+        self.lp_x.1 += ENV_ALPHA * (canon.1.abs() - self.lp_x.1);
+        self.lp_y.0 += ENV_ALPHA * (shadow.0.abs() - self.lp_y.0);
+        self.lp_y.1 += ENV_ALPHA * (shadow.1.abs() - self.lp_y.1);
+        self.phase += 1;
+        if self.phase < DECIM {
+            return None;
+        }
+        self.phase = 0;
+        self.ex.push(self.lp_x);
+        self.ey.push(self.lp_y);
+        if self.ex.len() < CHECK_WINDOW {
+            return None;
+        }
+
+        // The canon stream lags the shadow (mix-ahead + FIFO depth):
+        // correlate canon[t] against shadow[t - lag], lag >= 0.
+        let n = CHECK_WINDOW - CHECK_MAX_LAG;
+        let mean = |v: &[(f32, f32)], side: usize| -> f64 {
+            v.iter().map(|e| if side == 0 { e.0 as f64 } else { e.1 as f64 }).sum::<f64>()
+                / v.len() as f64
+        };
+        let canon_level = (mean(&self.ex, 0) + mean(&self.ex, 1)) / 2.0;
+        let shadow_level = (mean(&self.ey, 0) + mean(&self.ey, 1)) / 2.0;
+        let mut best: Option<f32> = None;
+        if canon_level >= CHECK_MIN_LEVEL as f64 {
+            for lag in (0..=CHECK_MAX_LAG).step_by(2) {
+                let mut sum = 0.0;
+                let mut sides = 0;
+                for side in 0..2 {
+                    let x: Vec<f64> = self.ex[CHECK_MAX_LAG..CHECK_WINDOW]
+                        .iter()
+                        .map(|e| if side == 0 { e.0 as f64 } else { e.1 as f64 })
+                        .collect();
+                    let y: Vec<f64> = self.ey[CHECK_MAX_LAG - lag..CHECK_WINDOW - lag]
+                        .iter()
+                        .map(|e| if side == 0 { e.0 as f64 } else { e.1 as f64 })
+                        .collect();
+                    let mx = x.iter().sum::<f64>() / n as f64;
+                    let my = y.iter().sum::<f64>() / n as f64;
+                    let mut cov = 0.0;
+                    let mut vx = 0.0;
+                    let mut vy = 0.0;
+                    for (a, b) in x.iter().zip(&y) {
+                        cov += (a - mx) * (b - my);
+                        vx += (a - mx) * (a - mx);
+                        vy += (b - my) * (b - my);
+                    }
+                    if vx > 1e-12 && vy > 1e-12 {
+                        sum += cov / (vx * vy).sqrt();
+                        sides += 1;
+                    }
+                }
+                if sides > 0 {
+                    let r = (sum / sides as f64) as f32;
+                    best = Some(best.map_or(r, |b: f32| b.max(r)));
+                }
+            }
+            // Both streams flat (sides==0 at every lag, e.g. a held
+            // constant tone): structurally consistent — no verdict.
+        }
+        self.ex.clear();
+        self.ey.clear();
+        best.map(|r| (r, (shadow_level / canon_level) as f32))
+    }
+}
+
+/// The MP2K HLE shadow mixer. Lives on the bus; fed by the dispatch
+/// hook (`frame_hook`) and the audio grid (`render`).
+pub struct Mp2kHle {
+    /// Dispatch key (SoundMainRAM entry | thumb) the loops compare PC
+    /// against.
+    pub hook_key: u32,
+    /// Rendering and substituting. Cleared by revert.
+    pub active: bool,
+    /// Saw at least one valid live tick (magic OK) — the frontend
+    /// substitutes only after this.
+    pub engaged: bool,
+    /// Set once on revert with the reason; the frontend surfaces it
+    /// loudly (DEGRADED) and falls back to the per-channel path.
+    pub reverted: Option<String>,
+    /// Diagnostics: hooks seen, ticks skipped (magic not live), voices
+    /// killed by wave validation.
+    pub hooks: u64,
+    pub stale_ticks: u64,
+    pub bad_waves: u64,
+    voices: [Voice; MAX_CHANS],
+    /// Envelope interpolation position/span (grid samples).
+    env_pos: u32,
+    env_span: u32,
+    last_hook_cursor: u64,
+    /// Reverb: SDK-faithful feedback off our own output ring at
+    /// pcmDmaPeriod frames of delay, mono-summed, x strength/512.
+    reverb: u8,
+    dma_period: u8,
+    ring: Vec<(f32, f32)>,
+    ring_pos: usize,
+    check: SelfCheck,
+}
+
+impl Mp2kHle {
+    pub fn new(sig: Mp2kSig) -> Mp2kHle {
+        let hook_key = if sig.sound_main_ram & 1 != 0 {
+            sig.sound_main_ram // thumb: bit 0 already the dispatch key bit
+        } else {
+            sig.sound_main_ram & !3
+        };
+        Mp2kHle {
+            hook_key,
+            active: true,
+            engaged: false,
+            reverted: None,
+            hooks: 0,
+            stale_ticks: 0,
+            bad_waves: 0,
+            voices: [Voice::default(); MAX_CHANS],
+            env_pos: 0,
+            env_span: FRAME as u32,
+            last_hook_cursor: 0,
+            // 16 frames covers every pcmDmaPeriod the rate table
+            // produces (up to 16 at 5734 Hz).
+            ring: vec![(0.0, 0.0); FRAME * 16],
+            ring_pos: 0,
+            reverb: 0,
+            dma_period: 7,
+            check: SelfCheck::new(),
+        }
+    }
+
+    fn revert(&mut self, reason: String) {
+        self.active = false;
+        self.reverted = Some(reason);
+    }
+
+    /// Per-tick hook: PC just landed on SoundMainRAM, so the track
+    /// engine has finalized this tick's channel state and the guest
+    /// mixer is about to run. Mirror its envelope step (int math,
+    /// bit-exact) to derive this tick's gains and a one-tick
+    /// prediction; reset samplers on note-on. Self-resyncing: all
+    /// envelope state is re-read from the guest every tick, so the
+    /// shadow can never drift from a driver reinit (the upstream
+    /// issue-416 class).
+    pub fn frame_hook(&mut self, mem: &MemView, audio_cursor: u64) {
+        if !self.active {
+            return;
+        }
+        self.hooks += 1;
+        // Re-fired inside the same grid sample (IRQ replay, fallback
+        // double-dispatch): idempotent by construction, but skip the
+        // span update so interpolation pacing stays sane.
+        let gap = (audio_cursor - self.last_hook_cursor) / crate::mem::AUDIO_SAMPLE_CYCLES;
+        if gap >= 64 {
+            self.env_span = (gap as u32).clamp(256, 8192);
+            self.env_pos = 0;
+            self.last_hook_cursor = audio_cursor;
+        }
+
+        let Some(si) = mem.u32(SOUND_INFO_PTR).filter(|p| matches!(p >> 24, 2 | 3)) else {
+            self.stale_ticks += 1;
+            return;
+        };
+        if mem.u32(si) != Some(MAGIC_LIVE) {
+            // Driver idle/parked (VSyncOff) or not yet initialized —
+            // not an error; the canon path is silent too.
+            self.stale_ticks += 1;
+            return;
+        }
+        let Some(head) = mem.slice(si, 0x50) else {
+            self.stale_ticks += 1;
+            return;
+        };
+        let master_vol = (head[0x07] & 0x0F) as u32;
+        self.reverb = head[0x05] & 0x7F;
+        let max_chans = (head[0x06] as usize).clamp(1, MAX_CHANS);
+        let pcm_freq = u32::from_le_bytes([head[0x14], head[0x15], head[0x16], head[0x17]]);
+        let spv = u32::from_le_bytes([head[0x10], head[0x11], head[0x12], head[0x13]]);
+        if spv == 0 || pcm_freq == 0 {
+            self.stale_ticks += 1;
+            return;
+        }
+        self.dma_period = (head[0x0B]).clamp(1, 16);
+        self.engaged = true;
+        // Diagnostic: raw per-channel bytes, whole array.
+        if std::env::var_os("RECOMP_MP2K_TRACE").is_some() && self.hooks % 30 == 0 {
+            let mut line = format!(
+                "mp2k map hook={} mv={master_vol} maxch={max_chans} rev={} freq={pcm_freq}:",
+                self.hooks, self.reverb
+            );
+            for ch in 0..MAX_CHANS {
+                if let Some(c) = mem.slice(si + CHANS_OFF + ch as u32 * CHAN_STRIDE, 0x28) {
+                    if c[0] & 0xC7 != 0 {
+                        line += &format!(
+                            " [{ch}] st={:02x} ty={:02x} env={} eRL=({},{}) vRL=({},{})",
+                            c[0], c[1], c[9], c[0x0A], c[0x0B], c[2], c[3]
+                        );
+                    }
+                }
+            }
+            eprintln!("{line}");
+        }
+
+        for ch in 0..MAX_CHANS {
+            if ch >= max_chans {
+                self.voices[ch].on = false;
+                continue;
+            }
+            let base = si + CHANS_OFF + ch as u32 * CHAN_STRIDE;
+            let Some(c) = mem.slice(base, 0x28) else {
+                self.voices[ch].on = false;
+                continue;
+            };
+            let status = c[0x00];
+            let ctype = c[0x01];
+            // Inactive, or a CGB-backed slot (PSG stays fully LLE).
+            if status & 0xC7 == 0 || ctype & 0x07 != 0 {
+                self.voices[ch].on = false;
+                continue;
+            }
+            // Reversed playback (pokeemerald-era extension): not
+            // implemented; mute the voice rather than render garbage.
+            if ctype & 0x10 != 0 {
+                self.voices[ch].on = false;
+                self.bad_waves += 1;
+                continue;
+            }
+            let vol_r = c[0x02] as u32;
+            let vol_l = c[0x03] as u32;
+            let attack = c[0x04] as u32;
+            let decay = c[0x05] as u32;
+            let sustain = c[0x06] as u32;
+            let release = c[0x07] as u32;
+            let env = c[0x09] as u32;
+            let echo_vol = c[0x0C] as u32;
+            let echo_len = c[0x0D];
+            let count = u32::from_le_bytes([c[0x18], c[0x19], c[0x1A], c[0x1B]]);
+            let freq = u32::from_le_bytes([c[0x20], c[0x21], c[0x22], c[0x23]]);
+            let wav = u32::from_le_bytes([c[0x24], c[0x25], c[0x26], c[0x27]]);
+
+            // Mirror the guest mixer's envelope tick (m4a SoundMainRAM
+            // order): note-on / echo / release / decay / attack. The
+            // guest writes the same values back to its own struct, so
+            // next tick's read re-syncs us bit-exactly.
+            let v = &mut self.voices[ch];
+            let mut dead = false;
+            let mut env_now;
+            // Envelope phase after this tick, for the prediction step.
+            let mut phase = status & 0x03;
+            let mut iec = status & 0x04 != 0;
+            let mut stopping = status & 0x40 != 0;
+            if status & 0x80 != 0 {
+                // Note-on (START). START+STOP together kills.
+                if stopping {
+                    dead = true;
+                    env_now = 0;
+                } else if note_on(v, mem, ctype, count, wav) {
+                    env_now = attack.min(0xFF);
+                    phase = 3;
+                    if env_now >= 0xFF {
+                        phase = 2;
+                    }
+                    stopping = false;
+                    iec = false;
+                } else {
+                    self.bad_waves += 1;
+                    dead = true;
+                    env_now = 0;
+                }
+            } else if iec {
+                // Pseudo-echo hold: guest decrements echoLength and
+                // kills at zero; env holds at echoVolume.
+                env_now = env;
+                if echo_len == 0 {
+                    dead = true;
+                }
+            } else if stopping {
+                env_now = (env * release) >> 8;
+                if env_now <= echo_vol {
+                    if echo_vol == 0 {
+                        dead = true;
+                    } else {
+                        iec = true;
+                        env_now = echo_vol;
+                    }
+                }
+            } else {
+                env_now = env;
+                match phase {
+                    3 => {
+                        env_now = env + attack;
+                        if env_now >= 0xFF {
+                            env_now = 0xFF;
+                            phase = 2;
+                        }
+                    }
+                    2 => {
+                        env_now = (env * decay) >> 8;
+                        if env_now <= sustain {
+                            env_now = sustain;
+                            if sustain == 0 {
+                                if echo_vol == 0 {
+                                    dead = true;
+                                } else {
+                                    iec = true;
+                                    env_now = echo_vol;
+                                }
+                            }
+                            phase = 1;
+                        }
+                    }
+                    _ => {} // sustain holds; release handled above
+                }
+            }
+            if dead {
+                v.on = false;
+                continue;
+            }
+            // One-tick prediction for envelope interpolation.
+            let env_next = if iec {
+                env_now
+            } else if stopping {
+                let e = (env_now * release) >> 8;
+                if e <= echo_vol { echo_vol } else { e }
+            } else {
+                match phase {
+                    3 => (env_now + attack).min(0xFF),
+                    2 => ((env_now * decay) >> 8).max(sustain),
+                    _ => env_now,
+                }
+            };
+            let gains = |e: u32| {
+                let v = (e * (master_vol + 1)) >> 4;
+                (
+                    (((v * vol_r) >> 8) as f32) / 256.0,
+                    (((v * vol_l) >> 8) as f32) / 256.0,
+                )
+            };
+            v.g0 = gains(env_now);
+            v.g1 = gains(env_next);
+            // Diagnostic (RECOMP_MP2K_TRACE): mirror vs the guest
+            // mixer's own envelopeVolumeR/L from last tick.
+            if std::env::var_os("RECOMP_MP2K_TRACE").is_some() && self.hooks < 400 {
+                let v_now = (env_now * (master_vol + 1)) >> 4;
+                eprintln!(
+                    "mp2k trace hook={} ch={ch} status={status:02x} type={ctype:02x} \
+                     env={env} env_now={env_now} mv={master_vol} vol_rl=({vol_r},{vol_l}) \
+                     guest_envRL=({},{}) mine_envRL=({},{}) freq={freq} pos={:.0}/{}",
+                    self.hooks,
+                    c[0x0A],
+                    c[0x0B],
+                    (v_now * vol_r) >> 8,
+                    (v_now * vol_l) >> 8,
+                    v.pos,
+                    v.size,
+                );
+            }
+            // Pitch can be rewritten mid-note (vibrato, pitch bend).
+            if ctype & 0x08 != 0 {
+                v.step = pcm_freq as f64 / RENDER_HZ; // FIX: source rate
+            } else {
+                v.step = freq as f64 / RENDER_HZ; // integer Hz
+            }
+            v.on = true;
+        }
+    }
+
+    /// True while the frontend should substitute the HLE stream.
+    pub fn live(&self) -> bool {
+        self.active && self.engaged
+    }
+
+    /// Render one grid sample: (left, right) in the bus float scale
+    /// where one full-scale FIFO DAC = 0.25 (matching the canon
+    /// `fifo_sample x 64 / 32768` path before SOUNDCNT volume/routing).
+    /// `canon` is the live FIFO DAC pair (A, B) for the self-check.
+    pub fn render(&mut self, mem: &MemView, canon: [i8; 2]) -> (f32, f32) {
+        let t = (self.env_pos as f32 / self.env_span as f32).min(1.0);
+        self.env_pos = self.env_pos.saturating_add(1);
+
+        // SDK-faithful reverb base: mono sum of both sides at two
+        // adjacent samples, one DMA period ago, x strength/512. The
+        // float ring removes only the 8-bit recirculation noise.
+        let (mut right, mut left) = (0.0f32, 0.0f32);
+        if self.reverb > 0 {
+            let len = self.ring.len();
+            let delay = self.dma_period as usize * FRAME;
+            let i0 = (self.ring_pos + len - delay) % len;
+            let i1 = (i0 + 1) % len;
+            let (r0, l0) = self.ring[i0];
+            let (r1, l1) = self.ring[i1];
+            let mono = (r0 + l0 + r1 + l1) * (self.reverb as f32 / 512.0);
+            right = mono;
+            left = mono;
+        }
+
+        for v in self.voices.iter_mut() {
+            if !v.on {
+                continue;
+            }
+            let s = sample_voice(v, mem);
+            let gr = v.g0.0 + (v.g1.0 - v.g0.0) * t;
+            let gl = v.g0.1 + (v.g1.1 - v.g0.1) * t;
+            right += s * gr;
+            left += s * gl;
+        }
+
+        self.ring[self.ring_pos] = (right, left);
+        self.ring_pos = (self.ring_pos + 1) % self.ring.len();
+
+        // Differential self-check vs the canon stream (FIFO A carries
+        // the right mix half, B the left, per stock SoundInit DMA
+        // programming). Sustained divergence means our shadow does not
+        // match what the game's own mixer produced — revert loudly.
+        let canon_rl = (canon[0] as f32 / 128.0, canon[1] as f32 / 128.0);
+        if let Some((r, ratio)) = self.check.push(canon_rl, (right, left)) {
+            self.check.last_r = r;
+            self.check.last_ratio = ratio;
+            // Two failure axes: structure (correlation) and level
+            // (envelope ratio — scale-invariant correlation alone would
+            // bless a mixer whose volume math is wrong for this driver
+            // version). The canon's 8-bit per-voice truncation makes it
+            // genuinely quieter than the ideal mix on quiet content, so
+            // the band is asymmetric and generous.
+            let level_ok = (0.5..=3.0).contains(&ratio);
+            if r < CHECK_MIN_R || !level_ok {
+                self.check.strikes += 1;
+                if self.check.strikes >= CHECK_MAX_STRIKES {
+                    self.revert(format!(
+                        "shadow/canon correlation {r:.2}, level ratio {ratio:.2} \
+                         for {CHECK_MAX_STRIKES} s (driver variant or unsupported feature)"
+                    ));
+                }
+            } else {
+                self.check.strikes = 0;
+            }
+        }
+
+        (left * 0.25, right * 0.25)
+    }
+
+    /// Most recent self-check correlation and level ratio (diagnostics).
+    pub fn last_correlation(&self) -> (f32, f32) {
+        (self.check.last_r, self.check.last_ratio)
+    }
+}
+
+/// Note-on: validate the wave and reset the sampler. Returns false
+/// (voice killed) on a hostile/garbage wave pointer — validation is
+/// per-voice and per-note (the upstream v1.8.1 hardening lesson).
+/// Free function: the caller holds a split borrow of `voices[ch]`.
+fn note_on(v: &mut Voice, mem: &MemView, ctype: u8, count: u32, wav: u32) -> bool {
+    let Some(h) = mem.slice(wav, 16) else { return false };
+    let hdr_type = u16::from_le_bytes([h[0], h[1]]);
+    let flags = u16::from_le_bytes([h[2], h[3]]);
+    let loop_start = u32::from_le_bytes([h[8], h[9], h[10], h[11]]);
+    let size = u32::from_le_bytes([h[12], h[13], h[14], h[15]]);
+    if size == 0 || size > 0x0100_0000 || loop_start > size {
+        return false;
+    }
+    let compressed = ctype & 0x20 != 0 || hdr_type != 0;
+    // The full data range must be resolvable now — no per-sample
+    // surprises later.
+    let bytes = if compressed {
+        ((size as u64 * 33 + 63) / 64) as usize
+    } else {
+        size as usize
+    };
+    if mem.slice(wav + 16, bytes).is_none() {
+        return false;
+    }
+    v.data = wav + 16;
+    v.size = size;
+    v.loop_start = loop_start;
+    v.looped = flags & 0xC000 != 0;
+    v.compressed = compressed;
+    // SDK: `count` carries an initial sample offset at note-on.
+    v.pos = count.min(size) as f64;
+    v.blk_idx = u32::MAX;
+    true
+}
+
+/// Fetch one linearly-interpolated source sample (s8/128) and advance
+/// the voice. The real driver linear-interpolates too — its grit is
+/// the 8-bit output and the FIX path, not the interpolator.
+fn sample_voice(v: &mut Voice, mem: &MemView) -> f32 {
+    if v.pos >= v.size as f64 {
+        if v.looped && v.size > v.loop_start {
+            let span = (v.size - v.loop_start) as f64;
+            let over = (v.pos - v.loop_start as f64) % span;
+            v.pos = v.loop_start as f64 + over;
+        } else {
+            // One-shot exhausted: the envelope (guest-driven) ends the
+            // note; hold silence meanwhile.
+            return 0.0;
+        }
+    }
+    let i0 = v.pos as u32;
+    let frac = (v.pos - i0 as f64) as f32;
+    let s0 = fetch(v, mem, i0);
+    let i1 = if i0 + 1 >= v.size {
+        if v.looped { v.loop_start } else { i0 }
+    } else {
+        i0 + 1
+    };
+    let s1 = fetch(v, mem, i1);
+    v.pos += v.step;
+    (s0 + (s1 - s0) * frac) / 128.0
+}
+
+/// Fetch source sample `idx` as a float in s8 units.
+fn fetch(v: &mut Voice, mem: &MemView, idx: u32) -> f32 {
+    if !v.compressed {
+        return mem.u8(v.data + idx).map_or(0.0, |b| b as i8 as f32);
+    }
+    // DPCM: 33-byte blocks of 64 samples; byte 0 is the absolute s8
+    // seed, then delta nibbles. SDK layout exactly: sample 0 = seed
+    // unmodified; sample k (k>=1) reads byte 1+(k>>1), even k the high
+    // nibble, odd k the low — byte 1's high nibble is never read.
+    let blk = idx >> 6;
+    if blk != v.blk_idx {
+        let Some(b) = mem.slice(v.data + blk * 33, 33) else { return 0.0 };
+        let mut cur = b[0] as i8;
+        v.blk[0] = cur;
+        for k in 1..64usize {
+            let byte = b[1 + (k >> 1)];
+            let nib = if k & 1 == 0 { byte >> 4 } else { byte & 0xF };
+            cur = cur.wrapping_add(DPCM_LUT[nib as usize]);
+            v.blk[k] = cur;
+        }
+        v.blk_idx = blk;
+    }
+    v.blk[(idx & 63) as usize] as f32
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -99,6 +783,158 @@ mod tests {
     fn crc32_matches_ieee_reference() {
         // Standard check value for the IEEE 802.3 variant.
         assert_eq!(crc32(b"123456789"), 0xCBF4_3926);
+    }
+
+    /// Build a synthetic guest with a live SoundInfo, one channel, and
+    /// a wave in ROM. Returns (iwram, rom, si guest address).
+    fn synth_guest() -> (Vec<u8>, Vec<u8>, u32) {
+        let mut iwram = vec![0u8; 0x8000];
+        let si = 0x0300_0100u32;
+        iwram[0x7FF0..0x7FF4].copy_from_slice(&si.to_le_bytes());
+        let s = (si & 0x7FFF) as usize;
+        iwram[s..s + 4].copy_from_slice(&MAGIC_LIVE.to_le_bytes());
+        iwram[s + 0x05] = 0; // reverb
+        iwram[s + 0x06] = 5; // maxChans
+        iwram[s + 0x07] = 15; // masterVolume
+        iwram[s + 0x0B] = 7; // pcmDmaPeriod
+        iwram[s + 0x10..s + 0x14].copy_from_slice(&224u32.to_le_bytes()); // spv
+        iwram[s + 0x14..s + 0x18].copy_from_slice(&13379u32.to_le_bytes()); // pcmFreq
+        // Channel 0: START, full right volume, half left, instant attack.
+        let c = s + 0x50;
+        iwram[c] = 0x80;
+        iwram[c + 0x02] = 255; // rightVolume
+        iwram[c + 0x03] = 128; // leftVolume
+        iwram[c + 0x04] = 255; // attack
+        iwram[c + 0x05] = 200; // decay
+        iwram[c + 0x06] = 180; // sustain
+        iwram[c + 0x07] = 150; // release
+        iwram[c + 0x20..c + 0x24].copy_from_slice(&8000u32.to_le_bytes()); // freq Hz
+        iwram[c + 0x24..c + 0x28].copy_from_slice(&0x0800_0000u32.to_le_bytes()); // wav
+
+        // ROM: wave header (one-shot, 64 samples of constant 100).
+        let mut rom = vec![0u8; 0x100];
+        rom[0x0C..0x10].copy_from_slice(&64u32.to_le_bytes()); // size
+        for b in rom[0x10..0x50].iter_mut() {
+            *b = 100;
+        }
+        (iwram, rom, si)
+    }
+
+    #[test]
+    fn frame_hook_mirrors_envelope_and_arms_voice() {
+        let (iwram, rom, _) = synth_guest();
+        let ewram = vec![0u8; 0x4_0000];
+        let mem = MemView { rom: &rom, ewram: &ewram, iwram: &iwram };
+        let mut h = Mp2kHle::new(Mp2kSig { sound_main_off: 0, sound_main_ram: 0x0300_2001 });
+        h.frame_hook(&mem, 256 * 2000);
+        assert!(h.engaged);
+        let v = &h.voices[0];
+        assert!(v.on);
+        // Note-on with attack 255: env = 255; v = (255*(15+1))>>4 = 255;
+        // gains = (255*255)>>8 = 254 right, (255*128)>>8 = 127 left.
+        assert_eq!(v.g0.0, 254.0 / 256.0);
+        assert_eq!(v.g0.1, 127.0 / 256.0);
+        // 8000 Hz source on the 65536 Hz grid.
+        assert!((v.step - 8000.0 / 65536.0).abs() < 1e-12);
+        assert_eq!(v.size, 64);
+        assert!(!v.looped);
+
+        // Render: constant +100 wave -> right = 100/128 * g_r * 0.25.
+        let (l, r) = h.render(&mem, [0, 0]);
+        let want_r = 100.0 / 128.0 * (254.0 / 256.0) * 0.25;
+        let want_l = 100.0 / 128.0 * (127.0 / 256.0) * 0.25;
+        assert!((r - want_r).abs() < 1e-4, "right {r} want {want_r}");
+        assert!((l - want_l).abs() < 1e-4, "left {l} want {want_l}");
+    }
+
+    #[test]
+    fn frame_hook_skips_without_live_magic() {
+        let (mut iwram, rom, si) = synth_guest();
+        let s = (si & 0x7FFF) as usize;
+        // Parked ident ('Smsh' idle, not the +1 live value).
+        iwram[s..s + 4].copy_from_slice(&0x6873_6D53u32.to_le_bytes());
+        let ewram = vec![0u8; 0x4_0000];
+        let mem = MemView { rom: &rom, ewram: &ewram, iwram: &iwram };
+        let mut h = Mp2kHle::new(Mp2kSig { sound_main_off: 0, sound_main_ram: 0x0300_2001 });
+        h.frame_hook(&mem, 256 * 2000);
+        assert!(!h.engaged);
+        assert_eq!(h.stale_ticks, 1);
+    }
+
+    #[test]
+    fn note_on_rejects_garbage_wave_pointers() {
+        let (mut iwram, rom, si) = synth_guest();
+        let s = (si & 0x7FFF) as usize;
+        // Wave pointer into unmapped space.
+        iwram[s + 0x50 + 0x24..s + 0x50 + 0x28]
+            .copy_from_slice(&0x0500_0000u32.to_le_bytes());
+        let ewram = vec![0u8; 0x4_0000];
+        let mem = MemView { rom: &rom, ewram: &ewram, iwram: &iwram };
+        let mut h = Mp2kHle::new(Mp2kSig { sound_main_off: 0, sound_main_ram: 0x0300_2001 });
+        h.frame_hook(&mem, 256 * 2000);
+        assert!(!h.voices[0].on);
+        assert_eq!(h.bad_waves, 1);
+    }
+
+    #[test]
+    fn sample_voice_wraps_loop_and_ends_one_shot() {
+        let ewram = vec![0u8; 0x10];
+        let iwram = vec![0u8; 0x10];
+        let mut rom = vec![0u8; 0x100];
+        for (i, b) in rom.iter_mut().enumerate() {
+            *b = i as u8; // ramp 0..,  values < 128 stay positive
+        }
+        let mem = MemView { rom: &rom, ewram: &ewram, iwram: &iwram };
+        let mut v = Voice {
+            on: true,
+            data: 0x0800_0000,
+            size: 100,
+            loop_start: 90,
+            looped: true,
+            step: 7.0,
+            ..Voice::default()
+        };
+        // Walk well past the end: the wrap is lazy (applied at fetch),
+        // so between calls pos < size + step; steady-state samples must
+        // come from the loop region [90, 100).
+        for i in 0..200 {
+            let s = sample_voice(&mut v, &mem) * 128.0;
+            if i >= 20 {
+                assert!((89.0..=99.5).contains(&s), "iter {i}: sample {s}");
+            }
+        }
+        assert!(v.pos < 107.0, "pos {}", v.pos);
+        // One-shot: silence after the end, position parks.
+        let mut v2 = Voice { looped: false, ..v };
+        v2.pos = 99.0;
+        let _ = sample_voice(&mut v2, &mem);
+        let s = sample_voice(&mut v2, &mem);
+        assert_eq!(s, 0.0);
+    }
+
+    #[test]
+    fn dpcm_decode_follows_sdk_nibble_layout() {
+        let ewram = vec![0u8; 0x10];
+        let iwram = vec![0u8; 0x10];
+        // One 33-byte block: seed 10; byte1 low nibble -> sample 1;
+        // byte2 high nibble -> sample 2, low -> sample 3.
+        let mut rom = vec![0u8; 64];
+        rom[0] = 10;
+        rom[1] = 0xFF; // high nibble must be IGNORED (SDK never reads it)
+        rom[2] = 0x12; // sample2 += LUT[1]=1, sample3 += LUT[2]=4
+        let mem = MemView { rom: &rom, ewram: &ewram, iwram: &iwram };
+        let mut v = Voice {
+            on: true,
+            data: 0x0800_0000,
+            size: 64,
+            compressed: true,
+            step: 1.0,
+            ..Voice::default()
+        };
+        assert_eq!(fetch(&mut v, &mem, 0), 10.0);
+        assert_eq!(fetch(&mut v, &mem, 1), 10.0 + DPCM_LUT[15] as f32); // 9
+        assert_eq!(fetch(&mut v, &mem, 2), 9.0 + 1.0);
+        assert_eq!(fetch(&mut v, &mem, 3), 10.0 + 4.0);
     }
 
     #[test]

@@ -71,6 +71,15 @@ impl Machine {
             return StepEvent::Idle;
         }
 
+        // MP2K HLE: PC landing on SoundMainRAM means the track engine
+        // has finalized this tick's channel state — snapshot it for the
+        // shadow mixer (read-only; the guest mixer still runs).
+        if let Some(h) = self.bus.mp2k.as_deref() {
+            if h.active && (self.cpu.regs[15] | self.cpu.thumb() as u32) == h.hook_key {
+                self.bus.mp2k_frame_hook();
+            }
+        }
+
         let region = (self.cpu.regs[15] >> 24) as usize & 0xF;
         let instr = exec::step_hle_cached(&mut self.cpu, &mut self.bus, &mut self.decode_cache);
         self.bus.tick(instr_cost(region, &instr));
