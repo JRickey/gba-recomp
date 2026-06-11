@@ -106,8 +106,9 @@ pub fn render_scanline(mem: &mut MemMap, line: usize) {
     // Sprites.
     let mut obj_line = [OBJ_EMPTY; VISIBLE_WIDTH];
     let mut obj_window = [false; VISIBLE_WIDTH];
+    let mut line_has_semi = false;
     if dispcnt & 0x1000 != 0 {
-        render_sprites(mem, dispcnt, line, &mut obj_line, &mut obj_window);
+        line_has_semi = render_sprites(mem, dispcnt, line, &mut obj_line, &mut obj_window);
     }
 
     // Step affine accumulators for the next line (PB/PD).
@@ -116,7 +117,7 @@ pub fn render_scanline(mem: &mut MemMap, line: usize) {
     mem.aff_ref[2] = mem.aff_ref[2].wrapping_add(io16(mem, 0x32) as i16 as i32);
     mem.aff_ref[3] = mem.aff_ref[3].wrapping_add(io16(mem, 0x36) as i16 as i32);
 
-    compose(mem, dispcnt, line, &bg_lines, &bg_used, &obj_line, &obj_window);
+    compose(mem, dispcnt, line, &bg_lines, &bg_used, &obj_line, &obj_window, line_has_semi);
 }
 
 fn read_io32(mem: &MemMap, off: usize) -> u32 {
@@ -150,10 +151,15 @@ fn render_text_bg(mem: &MemMap, bg: usize, line: usize, out: &mut Line) {
     let ty = y / 8;
     let py = y % 8;
 
-    for (sx, out_px) in out.iter_mut().enumerate() {
+    // Walk the line in tile spans: all pixels within one span share the
+    // same map entry, so fetch and decode it once (per-pixel results are
+    // identical to the previous per-pixel formulation).
+    let mut sx = 0usize;
+    while sx < VISIBLE_WIDTH {
         let x = (sx + hofs) & (w_tiles * 8 - 1);
         let tx = x / 8;
         let px = x % 8;
+        let span = (8 - px).min(VISIBLE_WIDTH - sx);
 
         // Screenblock layout: 32x32-tile blocks, left-to-right then down.
         let block = (ty / 32) * (w_tiles / 32) + tx / 32;
@@ -164,33 +170,39 @@ fn render_text_bg(mem: &MemMap, bg: usize, line: usize, out: &mut Line) {
         let tile = (entry & 0x3FF) as usize;
         let hflip = entry & 0x400 != 0;
         let vflip = entry & 0x800 != 0;
-
         let fy = if vflip { 7 - py } else { py };
-        let fx = if hflip { 7 - px } else { px };
 
-        let color_idx = if eight_bpp {
-            let addr = char_base + tile * 64 + fy * 8 + fx;
-            if addr >= 0x1_0000 {
-                0
-            } else {
-                mem.vram[addr] as usize
+        if eight_bpp {
+            let base = char_base + tile * 64 + fy * 8;
+            for i in 0..span {
+                let fx = if hflip { 7 - (px + i) } else { px + i };
+                let addr = base + fx;
+                let color_idx = if addr >= 0x1_0000 { 0 } else { mem.vram[addr] as usize };
+                out[sx + i] =
+                    if color_idx == 0 { TRANSPARENT } else { pal16(mem, color_idx) };
             }
         } else {
-            let addr = char_base + tile * 32 + fy * 4 + fx / 2;
-            if addr >= 0x1_0000 {
-                0
-            } else {
-                let b = mem.vram[addr];
-                let nib = if fx & 1 == 0 { b & 0xF } else { b >> 4 } as usize;
-                if nib == 0 {
+            let base = char_base + tile * 32 + fy * 4;
+            let pal_base = ((entry >> 12) as usize & 0xF) * 16;
+            for i in 0..span {
+                let fx = if hflip { 7 - (px + i) } else { px + i };
+                let addr = base + fx / 2;
+                let color_idx = if addr >= 0x1_0000 {
                     0
                 } else {
-                    ((entry >> 12) as usize & 0xF) * 16 + nib
-                }
+                    let b = mem.vram[addr];
+                    let nib = if fx & 1 == 0 { b & 0xF } else { b >> 4 } as usize;
+                    if nib == 0 {
+                        0
+                    } else {
+                        pal_base + nib
+                    }
+                };
+                out[sx + i] =
+                    if color_idx == 0 { TRANSPARENT } else { pal16(mem, color_idx) };
             }
-        };
-
-        *out_px = if color_idx == 0 { TRANSPARENT } else { pal16(mem, color_idx) };
+        }
+        sx += span;
     }
 }
 
@@ -276,13 +288,16 @@ const OBJ_SIZES: [[(i32, i32); 4]; 3] = [
     [(8, 16), (8, 32), (16, 32), (32, 64)],   // vertical
 ];
 
+/// Returns true if any semi-transparent sprite pixel was written
+/// (conservative: a later overwrite by an opaque sprite still counts).
 fn render_sprites(
     mem: &MemMap,
     dispcnt: u16,
     line: usize,
     out: &mut [ObjPixel; VISIBLE_WIDTH],
     window: &mut [bool; VISIBLE_WIDTH],
-) {
+) -> bool {
+    let mut any_semi = false;
     let one_dim = dispcnt & 0x40 != 0;
     let bitmap_mode = (dispcnt & 7) >= 3;
     let line = line as i32;
@@ -407,14 +422,17 @@ fn render_sprites(
                 window[sx_usize] = true;
             } else if out[sx_usize].priority == 0xFF || priority < out[sx_usize].priority {
                 out[sx_usize] = ObjPixel { color, priority, semi: mode == 1 };
+                any_semi |= mode == 1;
             }
         }
     }
+    any_semi
 }
 
 // ---- composition ----
 
 /// Layer ids for blend targeting: 0-3 BGs, 4 OBJ, 5 backdrop.
+#[allow(clippy::too_many_arguments)]
 fn compose(
     mem: &mut MemMap,
     dispcnt: u16,
@@ -423,18 +441,22 @@ fn compose(
     bg_used: &[bool; 4],
     obj_line: &[ObjPixel; VISIBLE_WIDTH],
     obj_window: &[bool; VISIBLE_WIDTH],
+    line_has_semi: bool,
 ) {
     let backdrop = pal16(mem, 0);
 
-    // Background priorities (compose ties: lower BG number wins).
-    let bg_prio: Vec<(u8, usize)> = {
-        let mut v: Vec<(u8, usize)> = (0..4)
-            .filter(|&bg| bg_used[bg])
-            .map(|bg| ((io16(mem, 0x08 + bg * 2) & 3) as u8, bg))
-            .collect();
-        v.sort();
-        v
-    };
+    // Background priorities (compose ties: lower BG number wins; sort
+    // keys are unique, so unstable sort matches the old stable sort).
+    let mut bg_prio_buf = [(0u8, 0usize); 4];
+    let mut nbg = 0;
+    for bg in 0..4 {
+        if bg_used[bg] {
+            bg_prio_buf[nbg] = ((io16(mem, 0x08 + bg * 2) & 3) as u8, bg);
+            nbg += 1;
+        }
+    }
+    bg_prio_buf[..nbg].sort_unstable();
+    let bg_prio = &bg_prio_buf[..nbg];
 
     let win0_on = dispcnt & 0x2000 != 0;
     let win1_on = dispcnt & 0x4000 != 0;
@@ -460,6 +482,48 @@ fn compose(
     let evy = (io16(mem, 0x54) & 0x1F).min(16) as u32;
 
     let row = line * VISIBLE_WIDTH;
+
+    // Fast path: no color effects and no semi-transparent sprite pixels
+    // on this line, so the second-layer search is dead code — the top
+    // layer alone decides each pixel: the first opaque BG in priority
+    // order whose window control bit allows it, beaten by the sprite
+    // when its priority is <= that BG's (sprites rank above BGs of
+    // equal priority).
+    if blend_mode == 0 && !line_has_semi {
+        for x in 0..VISIBLE_WIDTH {
+            let control: u16 = if !any_window {
+                0x3F
+            } else if in_win0_y && in_window_range((win0h >> 8) as u8, win0h as u8, x as u8) {
+                winin & 0x3F
+            } else if in_win1_y && in_window_range((win1h >> 8) as u8, win1h as u8, x as u8) {
+                (winin >> 8) & 0x3F
+            } else if objwin_on && obj_window[x] {
+                (winout >> 8) & 0x3F
+            } else {
+                winout & 0x3F
+            };
+
+            let mut color = backdrop;
+            let mut top_prio = 0xFFu8;
+            for &(bp, bg) in bg_prio {
+                if control & (1 << bg) != 0 {
+                    let c = bg_lines[bg][x];
+                    if c != TRANSPARENT {
+                        color = c;
+                        top_prio = bp;
+                        break;
+                    }
+                }
+            }
+            let obj = &obj_line[x];
+            if obj.priority != 0xFF && control & 0x10 != 0 && obj.priority <= top_prio {
+                color = obj.color;
+            }
+            mem.framebuffer[row + x] = color;
+        }
+        return;
+    }
+
     for x in 0..VISIBLE_WIDTH {
         // Window control for this pixel: bits 0-3 BGs, 4 OBJ, 5 effects.
         let control: u16 = if !any_window {
@@ -490,7 +554,7 @@ fn compose(
                     break 'outer;
                 }
             }
-            for &(bp, bg) in &bg_prio {
+            for &(bp, bg) in bg_prio {
                 if bp == p && control & (1 << bg) != 0 {
                     let c = bg_lines[bg][x];
                     if c != TRANSPARENT {
