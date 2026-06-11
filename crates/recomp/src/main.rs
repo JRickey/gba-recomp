@@ -370,25 +370,57 @@ fn cmd_play(args: &[String]) -> Result<(), String> {
         }
     };
 
+    // Bindings come from the launcher-managed config (defaults match the
+    // historical hardcoded map). Keyboard always works; a configured
+    // gamepad is OR-ed in on top.
+    let icfg = input_config::InputConfig::load();
+    let defaults = input_config::InputConfig::default();
+    let key_pairs: Vec<(Key, u16)> = input_config::Button::ALL
+        .iter()
+        .map(|b| {
+            let name = &icfg.keys[b.index()];
+            let key = minifb_key(name).unwrap_or_else(|| {
+                eprintln!("input.cfg: unknown key {name:?} for {} — using default", b.name());
+                minifb_key(&defaults.keys[b.index()]).unwrap()
+            });
+            (key, b.bit())
+        })
+        .collect();
+    let mut pad = match icfg.device {
+        input_config::Device::Gamepad => gilrs::Gilrs::new().ok(),
+        input_config::Device::Keyboard => None,
+    };
+
     let mut buf = vec![0u32; 240 * 160];
     while window.is_open() && !window.is_key_down(Key::Escape) {
         // KEYINPUT is active-low.
-        let pairs: [(Key, u16); 10] = [
-            (Key::Z, 1 << 0),         // A
-            (Key::X, 1 << 1),         // B
-            (Key::RightShift, 1 << 2), // Select
-            (Key::Enter, 1 << 3),     // Start
-            (Key::Right, 1 << 4),
-            (Key::Left, 1 << 5),
-            (Key::Up, 1 << 6),
-            (Key::Down, 1 << 7),
-            (Key::S, 1 << 8),         // R
-            (Key::A, 1 << 9),         // L
-        ];
         let mut keys = 0x3FFu16;
-        for (key, bit) in pairs {
-            if window.is_key_down(key) {
+        for (key, bit) in &key_pairs {
+            if window.is_key_down(*key) {
                 keys &= !bit;
+            }
+        }
+        if let Some(g) = pad.as_mut() {
+            while g.next_event().is_some() {}
+            let chosen = g
+                .gamepads()
+                .find(|(_, gp)| gp.name() == icfg.gamepad_name)
+                .or_else(|| g.gamepads().next());
+            if let Some((_, gp)) = chosen {
+                for b in input_config::Button::ALL {
+                    if pad_pressed(&gp, &icfg.pads[b.index()]) {
+                        keys &= !b.bit();
+                    }
+                }
+                // left stick doubles as the D-pad
+                let (x, y) = (
+                    gp.value(gilrs::Axis::LeftStickX),
+                    gp.value(gilrs::Axis::LeftStickY),
+                );
+                if x > 0.5 { keys &= !(1 << 4); }
+                if x < -0.5 { keys &= !(1 << 5); }
+                if y > 0.5 { keys &= !(1 << 6); }
+                if y < -0.5 { keys &= !(1 << 7); }
             }
         }
         m.bus.keys = keys;
@@ -419,6 +451,41 @@ fn cmd_play(args: &[String]) -> Result<(), String> {
         eprintln!("saved {sav_path}");
     }
     Ok(())
+}
+
+/// Canonical key name (see input-config) to minifb key.
+fn minifb_key(name: &str) -> Option<minifb::Key> {
+    use minifb::Key::*;
+    Some(match name {
+        "A" => A, "B" => B, "C" => C, "D" => D, "E" => E, "F" => F, "G" => G,
+        "H" => H, "I" => I, "J" => J, "K" => K, "L" => L, "M" => M, "N" => N,
+        "O" => O, "P" => P, "Q" => Q, "R" => R, "S" => S, "T" => T, "U" => U,
+        "V" => V, "W" => W, "X" => X, "Y" => Y, "Z" => Z,
+        "0" => Key0, "1" => Key1, "2" => Key2, "3" => Key3, "4" => Key4,
+        "5" => Key5, "6" => Key6, "7" => Key7, "8" => Key8, "9" => Key9,
+        "Up" => Up, "Down" => Down, "Left" => Left, "Right" => Right,
+        "Enter" => Enter, "Space" => Space, "Tab" => Tab,
+        "Backspace" => Backspace,
+        "LeftShift" => LeftShift, "RightShift" => RightShift,
+        _ => return None,
+    })
+}
+
+/// Gilrs button name (the launcher stores `{:?}` of the button) to state.
+fn pad_pressed(gp: &gilrs::Gamepad, name: &str) -> bool {
+    use gilrs::Button::*;
+    let btn = match name {
+        "South" => South, "East" => East, "North" => North, "West" => West,
+        "C" => C, "Z" => Z,
+        "LeftTrigger" => LeftTrigger, "LeftTrigger2" => LeftTrigger2,
+        "RightTrigger" => RightTrigger, "RightTrigger2" => RightTrigger2,
+        "Select" => Select, "Start" => Start, "Mode" => Mode,
+        "LeftThumb" => LeftThumb, "RightThumb" => RightThumb,
+        "DPadUp" => DPadUp, "DPadDown" => DPadDown,
+        "DPadLeft" => DPadLeft, "DPadRight" => DPadRight,
+        _ => return false,
+    };
+    gp.is_pressed(btn)
 }
 
 /// Statically recompile a ROM: analyze, emit C, compile to a shared
