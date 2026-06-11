@@ -12,18 +12,50 @@ const MAX_RECENTS: usize = 10;
 
 pub struct PlayScreen {
     recents: Vec<PathBuf>,
-    status: String,
-    /// Running play processes we spawned. Reaped as they finish; any
+    /// Live play sessions we spawned. Reaped as they finish (so "now
+    /// playing" always reflects a window that actually exists); any
     /// still alive are killed when the launcher exits — closing the
     /// launcher tears the whole product down.
-    children: Vec<std::process::Child>,
+    sessions: Vec<Session>,
+    /// Transient launch/exit problem, shown until the next launch.
+    notice: Option<String>,
+}
+
+/// What the child has told us via the `--status` protocol so far.
+enum SessionState {
+    /// Spawned; no status line yet.
+    Starting,
+    /// One-time translation in progress (0..=1).
+    Building(f32),
+    /// The game window is up.
+    Playing,
+}
+
+enum SessionMsg {
+    Building(f32),
+    Playing,
+    Stderr(String),
+}
+
+/// A running play process. State comes from reader threads draining the
+/// child's pipes into `rx`; the UI thread never blocks on the child.
+struct Session {
+    name: String,
+    child: std::process::Child,
+    state: SessionState,
+    /// Latest DEGRADED diagnostic — the product bar says surface these
+    /// loudly, so it rides along in the launcher too.
+    degraded: Option<String>,
+    /// Last stderr line, kept as the failure message if the child dies.
+    last_line: Option<String>,
+    rx: std::sync::mpsc::Receiver<SessionMsg>,
 }
 
 impl Drop for PlayScreen {
     fn drop(&mut self) {
-        for child in &mut self.children {
-            let _ = child.kill();
-            let _ = child.wait();
+        for s in &mut self.sessions {
+            let _ = s.child.kill();
+            let _ = s.child.wait();
         }
     }
 }
@@ -36,12 +68,49 @@ enum RowAction {
 
 impl PlayScreen {
     pub fn new() -> Self {
-        Self { recents: load_recents(), status: String::new(), children: Vec::new() }
+        Self { recents: load_recents(), sessions: Vec::new(), notice: None }
     }
 
     pub fn ui(&mut self, ui: &mut Ui) {
-        // Reap finished play processes so the list only holds live ones.
-        self.children.retain_mut(|c| matches!(c.try_wait(), Ok(None)));
+        // Absorb child status updates, then reap exited sessions.
+        for s in &mut self.sessions {
+            while let Ok(msg) = s.rx.try_recv() {
+                match msg {
+                    SessionMsg::Building(f) => s.state = SessionState::Building(f),
+                    SessionMsg::Playing => s.state = SessionState::Playing,
+                    SessionMsg::Stderr(line) => {
+                        if line.starts_with("DEGRADED") {
+                            s.degraded = Some(line.clone());
+                        }
+                        s.last_line = Some(line);
+                    }
+                }
+            }
+        }
+        let notice = &mut self.notice;
+        self.sessions.retain_mut(|s| match s.child.try_wait() {
+            Ok(Some(code)) if !code.success() => {
+                // Pick up any stderr that raced the exit, then report.
+                while let Ok(msg) = s.rx.try_recv() {
+                    if let SessionMsg::Stderr(line) = msg {
+                        s.last_line = Some(line);
+                    }
+                }
+                *notice = Some(format!(
+                    "\u{2716} {} stopped: {}",
+                    s.name,
+                    s.last_line.as_deref().unwrap_or("no diagnostic")
+                ));
+                false
+            }
+            Ok(Some(_)) => false,
+            Ok(None) => true,
+            Err(_) => false,
+        });
+        // Child state changes without UI input; poll while sessions live.
+        if !self.sessions.is_empty() {
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
+        }
 
         // files dropped anywhere count as an insert
         let dropped: Vec<PathBuf> = ui.ctx().input(|i| {
@@ -87,8 +156,9 @@ impl PlayScreen {
 
             let mut play: Option<PathBuf> = None;
             let mut forget: Option<usize> = None;
+            let footer = 26.0 + 32.0 * self.sessions.len() as f32;
             egui::ScrollArea::vertical()
-                .max_height(ui.available_height() - 26.0)
+                .max_height(ui.available_height() - footer)
                 .show(ui, |ui| {
                     for (i, path) in self.recents.iter().enumerate() {
                         match recent_row(ui, path) {
@@ -107,9 +177,47 @@ impl PlayScreen {
                 self.launch(&path);
             }
 
-            if !self.status.is_empty() {
+            // Session footer: build progress, live sessions, diagnostics.
+            for s in &self.sessions {
                 ui.add_space(2.0);
-                ui.label(egui::RichText::new(&self.status).size(11.0).color(theme::CYAN));
+                match s.state {
+                    SessionState::Starting => {
+                        ui.label(
+                            egui::RichText::new(format!("starting {}\u{2026}", s.name))
+                                .size(11.0)
+                                .color(theme::white(150)),
+                        );
+                    }
+                    SessionState::Building(f) => {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "building {} \u{2014} one-time translation\u{2026}",
+                                s.name
+                            ))
+                            .size(11.0)
+                            .color(theme::CYAN),
+                        );
+                        ui.add(
+                            egui::ProgressBar::new(f)
+                                .desired_height(8.0)
+                                .fill(theme::CYAN),
+                        );
+                    }
+                    SessionState::Playing => {
+                        ui.label(
+                            egui::RichText::new(format!("\u{25B6} now playing: {}", s.name))
+                                .size(11.0)
+                                .color(theme::CYAN),
+                        );
+                    }
+                }
+                if let Some(d) = &s.degraded {
+                    ui.label(egui::RichText::new(d).size(11.0).color(theme::AMBER));
+                }
+            }
+            if let Some(n) = &self.notice {
+                ui.add_space(2.0);
+                ui.label(egui::RichText::new(n).size(11.0).color(theme::AMBER));
             }
         });
     }
@@ -122,17 +230,72 @@ impl PlayScreen {
     }
 
     fn launch(&mut self, path: &Path) {
-        self.status = match platform::launch(path) {
-            Ok(child) => {
-                let pid = child.id();
-                self.children.push(child);
-                format!("\u{25B6} now playing: {} (pid {pid})", stem(path))
+        self.notice = None;
+        match platform::launch(path) {
+            Ok(mut child) => {
+                let (tx, rx) = std::sync::mpsc::channel();
+                if let Some(out) = child.stdout.take() {
+                    read_status(out, tx.clone());
+                }
+                if let Some(err) = child.stderr.take() {
+                    read_stderr(err, tx);
+                }
+                self.sessions.push(Session {
+                    name: stem(path),
+                    child,
+                    state: SessionState::Starting,
+                    degraded: None,
+                    last_line: None,
+                    rx,
+                });
             }
-            Err(e) => format!("\u{2716} {e}"),
-        };
+            Err(e) => self.notice = Some(format!("\u{2716} {e}")),
+        }
         // move to top of the shelf
         self.insert(path.to_path_buf());
     }
+}
+
+/// Drain the child's stdout on a thread: `STATUS` protocol lines update
+/// the session; anything else is developer output, echoed to our stderr
+/// so piping the child doesn't swallow its logs.
+fn read_status(out: std::process::ChildStdout, tx: std::sync::mpsc::Sender<SessionMsg>) {
+    use std::io::BufRead;
+    std::thread::spawn(move || {
+        for line in std::io::BufReader::new(out).lines().map_while(Result::ok) {
+            let Some(rest) = line.strip_prefix("STATUS ") else {
+                eprintln!("{line}");
+                continue;
+            };
+            let msg = if rest == "playing" {
+                Some(SessionMsg::Playing)
+            } else if let Some(pct) = rest.strip_prefix("building ") {
+                pct.trim().parse::<f32>().ok().map(|p| SessionMsg::Building(p / 100.0))
+            } else {
+                None
+            };
+            if let Some(msg) = msg {
+                if tx.send(msg).is_err() {
+                    break;
+                }
+            }
+        }
+    });
+}
+
+/// Drain the child's stderr on a thread: echo it (it's the runtime's
+/// diagnostic stream) and keep the session informed for DEGRADED and
+/// exit reporting.
+fn read_stderr(err: std::process::ChildStderr, tx: std::sync::mpsc::Sender<SessionMsg>) {
+    use std::io::BufRead;
+    std::thread::spawn(move || {
+        for line in std::io::BufReader::new(err).lines().map_while(Result::ok) {
+            eprintln!("{line}");
+            if tx.send(SessionMsg::Stderr(line)).is_err() {
+                break;
+            }
+        }
+    });
 }
 
 fn stem(path: &Path) -> String {

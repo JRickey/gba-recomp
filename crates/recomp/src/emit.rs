@@ -557,22 +557,24 @@ fn emit_block(out: &mut String, b: &Block, view: &crate::analyze::View) {
 /// source image by two orders of magnitude, and feeding that to cc as one
 /// unit makes its optimizer balloon. Block functions have external
 /// linkage; the final unit re-declares them and builds the lookup table.
+/// `sink` also receives the number of blocks emitted so far (out of
+/// `analysis.blocks.len()`), so callers can report build progress.
 /// Returns the number of units emitted.
 pub fn emit_c_chunked(
     analysis: &Analysis,
     view: &crate::analyze::View,
     max_bytes: usize,
-    mut sink: impl FnMut(&str) -> Result<(), String>,
+    mut sink: impl FnMut(&str, usize) -> Result<(), String>,
 ) -> Result<usize, String> {
     let mut count = 0usize;
     let mut out = String::with_capacity(4 << 20);
     out.push_str(PREAMBLE);
     out.push('\n');
 
-    for b in &analysis.blocks {
+    for (i, b) in analysis.blocks.iter().enumerate() {
         emit_block(&mut out, b, view);
         if out.len() >= max_bytes {
-            sink(&out)?;
+            sink(&out, i + 1)?;
             count += 1;
             out.clear();
             out.push_str(PREAMBLE);
@@ -600,6 +602,6 @@ pub fn emit_c_chunked(
     }
     out.push_str("};\n");
     let _ = writeln!(out, "const uint64_t rcg_block_count = {};", analysis.blocks.len());
-    sink(&out)?;
+    sink(&out, analysis.blocks.len())?;
     Ok(count + 1)
 }

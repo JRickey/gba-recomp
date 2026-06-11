@@ -31,7 +31,7 @@ fn main() -> ExitCode {
             eprintln!("       recomp entry-scan <dir>");
             eprintln!("       recomp run <rom> [--max-steps N] [--trace]");
             eprintln!("       recomp frames <rom> [--frames N] [--out img.ppm] [--keys MASK]");
-            eprintln!("       recomp play <rom>");
+            eprintln!("       recomp play <rom> [--interp] [--stats] [--status]");
             return ExitCode::FAILURE;
         }
     };
@@ -303,6 +303,9 @@ fn cmd_play(args: &[String]) -> Result<(), String> {
 
     let mut rom_path = None;
     let mut interp_only = false;
+    // Machine-readable lifecycle lines on stdout for a supervising
+    // frontend (the launcher): `STATUS building <pct>` / `STATUS playing`.
+    let mut status = false;
     // Perf instrumentation is developer tooling: always on in debug
     // builds, opt-in (--stats or GBA_RECOMP_STATS=1) in release — the
     // out-of-box experience stays clean.
@@ -311,6 +314,7 @@ fn cmd_play(args: &[String]) -> Result<(), String> {
     for arg in args {
         match arg.as_str() {
             "--interp" => interp_only = true,
+            "--status" => status = true,
             "--stats" => show_stats = true,
             other if rom_path.is_none() => rom_path = Some(other.to_string()),
             other => return Err(format!("unexpected argument {other:?}")),
@@ -329,7 +333,7 @@ fn cmd_play(args: &[String]) -> Result<(), String> {
     let native = if interp_only {
         None
     } else {
-        match ensure_native(&rom_path, &rom) {
+        match ensure_native(&rom_path, &rom, status) {
             Ok(v) => Some(v),
             Err(e) => {
                 eprintln!("DEGRADED: native translation unavailable ({e}); interpreter only");
@@ -357,6 +361,9 @@ fn cmd_play(args: &[String]) -> Result<(), String> {
     )
     .map_err(|e| e.to_string())?;
     window.set_target_fps(60);
+    if status {
+        status_line("playing");
+    }
 
 
     // Audio: cpal output stream fed from a shared ring of 32768 Hz mono
@@ -548,12 +555,24 @@ fn cmd_play(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// One machine-readable lifecycle line on stdout, for the launcher
+/// supervising a `play --status` child. Flushed immediately: the reader
+/// is a pipe, and a buffered line is a frozen progress bar.
+fn status_line(s: &str) {
+    use std::io::Write;
+    let mut out = std::io::stdout().lock();
+    let _ = writeln!(out, "STATUS {s}");
+    let _ = out.flush();
+}
+
 /// Locate (or build) the cached native translation for this image.
 /// Cache key is the ROM's SHA-256 under a translation-format revision
 /// directory, so a future emitter change can't load stale natives.
+/// With `status`, build progress is reported as `STATUS building <pct>`.
 fn ensure_native(
     rom_path: &str,
     rom: &[u8],
+    status: bool,
 ) -> Result<(libloading::Library, BlockTable), String> {
     use sha2::{Digest, Sha256};
     let sha = Sha256::digest(rom)
@@ -569,7 +588,14 @@ fn ensure_native(
     let lib_str = lib_path.to_str().ok_or("non-UTF8 cache path")?;
     if !lib_path.is_file() {
         eprintln!("first launch: translating image (one-time)...");
-        build_dylib(rom_path, true, lib_str)?;
+        if status {
+            status_line("building 0");
+        }
+        build_dylib(rom_path, true, lib_str, &mut |pct| {
+            if status {
+                status_line(&format!("building {pct}"));
+            }
+        })?;
     }
     let lib = unsafe { libloading::Library::new(&lib_path) }
         .map_err(|e| format!("{}: {e}", lib_path.display()))?;
@@ -629,13 +655,21 @@ fn cmd_build(args: &[String]) -> Result<(), String> {
     std::fs::create_dir_all("out").map_err(|e| e.to_string())?;
     let stem = Path::new(rom_path)
         .file_stem().and_then(|s| s.to_str()).unwrap_or("game").to_string();
-    build_dylib(rom_path, ram, &format!("out/{stem}.dylib"))
+    build_dylib(rom_path, ram, &format!("out/{stem}.dylib"), &mut |_| {})
 }
 
 /// The build pipeline behind `cmd_build`, parameterized on the output
 /// path so the play runtime can target its own translation cache.
 /// Intermediates land next to `lib_path` as `<stem>.<i>.{c,o}`.
-fn build_dylib(rom_path: &str, ram: bool, lib_path: &str) -> Result<(), String> {
+/// `progress` receives a whole-build percentage (monotonic, 0..=100);
+/// phase weights are rough but the dominant compile phase is exact
+/// (blocks compiled / total blocks).
+fn build_dylib(
+    rom_path: &str,
+    ram: bool,
+    lib_path: &str,
+    progress: &mut dyn FnMut(u8),
+) -> Result<(), String> {
     let rom = std::fs::read(rom_path).map_err(|e| format!("{rom_path}: {e}"))?;
 
     // Profile-guided RAM discovery: run the interpreter briefly, recording
@@ -649,8 +683,15 @@ fn build_dylib(rom_path: &str, ram: bool, lib_path: &str) -> Result<(), String> 
         let mut seeds = std::collections::BTreeSet::new();
         let mut prev_end = 0u32;
         let mut steps = 0u64;
+        let mut last_pct = 0u8;
         while m.bus.frames < 240 && steps < 60_000_000 {
             steps += 1;
+            // Profiling occupies the first 20% of the reported build.
+            let pct = (m.bus.frames * 20 / 240) as u8;
+            if pct != last_pct {
+                last_pct = pct;
+                progress(pct);
+            }
             // Seed observed control-transfer targets in IWRAM and ROM.
             // ROM targets recover code static traversal can't reach
             // (computed branches, handlers installed by RAM code) and
@@ -688,6 +729,7 @@ fn build_dylib(rom_path: &str, ram: bool, lib_path: &str) -> Result<(), String> 
     let analysis = analyze::analyze(&view, &seeds);
     let n_instrs: usize = analysis.blocks.iter().map(|b| b.instrs.len()).sum();
     println!("blocks: {} instructions: {n_instrs}", analysis.blocks.len());
+    progress(22);
 
     let prefix = lib_path.strip_suffix(".dylib").unwrap_or(lib_path);
 
@@ -696,8 +738,9 @@ fn build_dylib(rom_path: &str, ram: bool, lib_path: &str) -> Result<(), String> 
     // huge unit makes cc balloon to many GB (parallel sweeps then exhaust
     // the machine). 16 MB of C keeps each cc invocation modest.
     const MAX_UNIT: usize = 16 << 20;
+    let total_blocks = analysis.blocks.len().max(1);
     let mut objs: Vec<String> = Vec::new();
-    let chunks = emit::emit_c_chunked(&analysis, &view, MAX_UNIT, |c| {
+    let chunks = emit::emit_c_chunked(&analysis, &view, MAX_UNIT, |c, blocks_done| {
         let i = objs.len();
         let c_path = format!("{prefix}.{i}.c");
         let o_path = format!("{prefix}.{i}.o");
@@ -711,6 +754,8 @@ fn build_dylib(rom_path: &str, ram: bool, lib_path: &str) -> Result<(), String> 
             return Err(format!("cc failed on {c_path}"));
         }
         objs.push(o_path);
+        // Compiling dominates the build: it spans 22..=96 of the report.
+        progress(22 + (blocks_done * 74 / total_blocks) as u8);
         Ok(())
     })?;
 
@@ -727,6 +772,7 @@ fn build_dylib(rom_path: &str, ram: bool, lib_path: &str) -> Result<(), String> 
     if !status.success() {
         return Err("link failed".into());
     }
+    progress(100);
     println!("wrote {lib_path} ({chunks} units)");
     Ok(())
 }

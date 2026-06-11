@@ -46,12 +46,18 @@ fn recomp_bin() -> Result<PathBuf, String> {
 
 /// Launch a cartridge in the play runtime. The caller owns the child:
 /// the launcher tracks it and tears it down when the launcher exits.
+/// stdout carries the `--status` lifecycle protocol (building/playing)
+/// and stderr the runtime's diagnostics; both are piped so the launcher
+/// can reflect the session's real state instead of guessing.
 #[cfg(not(target_os = "android"))]
 pub fn launch(rom: &Path) -> Result<std::process::Child, String> {
     let bin = recomp_bin()?;
     std::process::Command::new(&bin)
         .arg("play")
+        .arg("--status")
         .arg(rom)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
         .spawn()
         .map_err(|e| format!("failed to start {}: {e}", bin.display()))
 }
