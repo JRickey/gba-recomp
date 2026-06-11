@@ -164,13 +164,18 @@ pub fn wordmark(p: &egui::Painter, pos: Pos2, text: &str, size: f32) {
 
 /// Glossy plastic capsule button: vertical two-tone body, aqua highlight
 /// band, bevel strokes, drop shadow. Selected = indigo plastic + cyan ring.
+///
+/// Every tone band is the full capsule clipped to a horizontal strip —
+/// a band drawn as its own rounded rect gets its corner radius clamped
+/// to the band's half-height by epaint, and those squarer corners poke
+/// diagonally outside the capsule arc.
 pub fn glossy_button(ui: &mut Ui, label: &str, selected: bool, size: Vec2) -> egui::Response {
     let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
     if !ui.is_rect_visible(rect) {
         return resp;
     }
     let p = ui.painter();
-    let r = (rect.height() / 2.0).min(14.0) as u8;
+    let r = (rect.height() / 2.0).min(15.0) as u8;
     let cr = CornerRadius::same(r);
     let hovered = resp.hovered();
     let pressed = resp.is_pointer_button_down_on();
@@ -184,31 +189,32 @@ pub fn glossy_button(ui: &mut Ui, label: &str, selected: bool, size: Vec2) -> eg
     };
     let body_hi = if selected { VIOLET } else { SILVER_HI };
 
-    p.rect_filled(rect.translate(Vec2::new(0.0, 2.0)), cr, black(70));
+    // capsule fill clipped to the strip between y0 and y1
+    let band = |shape: Rect, radius: CornerRadius, y0: f32, y1: f32, color: Color32| {
+        p.with_clip_rect(Rect::from_min_max(
+            Pos2::new(rect.left() - 4.0, y0),
+            Pos2::new(rect.right() + 4.0, y1),
+        ))
+        .rect_filled(shape, radius, color);
+    };
+
+    p.rect_filled(rect.shrink(1.0).translate(Vec2::new(0.0, 2.0)), cr, black(70));
     p.rect_filled(rect, cr, body);
     // upper-body tone
-    let upper = Rect::from_min_max(rect.min, Pos2::new(rect.max.x, rect.center().y + 2.0));
-    p.rect_filled(
-        upper,
-        CornerRadius { nw: r, ne: r, sw: 3, se: 3 },
-        tint(body_hi, if pressed { 90 } else { 200 }),
-    );
+    band(rect, cr, rect.top(), rect.center().y + 2.0,
+        tint(body_hi, if pressed { 90 } else { 200 }));
     // aqua gloss band
-    let gloss = Rect::from_min_max(
-        rect.min + Vec2::new(3.0, 2.0),
-        Pos2::new(rect.max.x - 3.0, rect.min.y + rect.height() * 0.45),
-    );
-    p.rect_filled(gloss, CornerRadius { nw: r.saturating_sub(2), ne: r.saturating_sub(2), sw: 2, se: 2 },
+    band(rect.shrink(3.0), CornerRadius::same(r.saturating_sub(3)),
+        rect.top(), rect.top() + rect.height() * 0.45,
         white(if selected { 70 } else { 120 }));
     // bottom shade
-    let shade = Rect::from_min_max(Pos2::new(rect.min.x, rect.max.y - rect.height() * 0.28), rect.max);
-    p.rect_filled(shade, CornerRadius { nw: 2, ne: 2, sw: r, se: r }, black(26));
+    band(rect, cr, rect.bottom() - rect.height() * 0.28, rect.bottom(), black(26));
 
     let edge = if selected { CYAN } else { black(90) };
     p.rect_stroke(rect, cr, Stroke::new(1.0, edge), StrokeKind::Inside);
     if selected {
-        p.rect_stroke(rect.expand(2.0), CornerRadius::same(r + 2), Stroke::new(1.5, tint(CYAN, 70)),
-            StrokeKind::Outside);
+        p.rect_stroke(rect.shrink(2.0), CornerRadius::same(r.saturating_sub(2)),
+            Stroke::new(1.5, tint(CYAN, 70)), StrokeKind::Inside);
     }
 
     let fg = if selected { Color32::WHITE } else { INK };

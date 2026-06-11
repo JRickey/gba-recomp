@@ -9,7 +9,8 @@ use crate::theme;
 pub enum Tab {
     Play,
     Input,
-    Av,
+    Audio,
+    Video,
 }
 
 pub struct LauncherApp {
@@ -39,15 +40,22 @@ impl LauncherApp {
         ui.painter().text(
             Pos2::new(rect.left() + 20.0, rect.center().y + 15.0),
             Align2::LEFT_CENTER,
-            "N A T I V E   P L A Y   S Y S T E M",
+            "S T A T I C   R E C O M P I L A T I O N   S Y S T E M",
             FontId::proportional(9.0),
             theme::INDIGO,
         );
 
         // tab pills, right-aligned in the strip
-        let tabs = [(Tab::Play, "PLAY"), (Tab::Input, "INPUT"), (Tab::Av, "A / V")];
-        let pill = Vec2::new(92.0, 30.0);
+        let tabs = [
+            (Tab::Play, "PLAY"),
+            (Tab::Input, "INPUT"),
+            (Tab::Audio, "AUDIO"),
+            (Tab::Video, "VIDEO"),
+        ];
+        // Shrink the pills before they can run into the wordmark block.
         let gap = 8.0;
+        let room = rect.width() - 18.0 - 300.0 - gap * (tabs.len() - 1) as f32;
+        let pill = Vec2::new((room / tabs.len() as f32).clamp(64.0, 88.0), 30.0);
         let total = pill.x * tabs.len() as f32 + gap * (tabs.len() - 1) as f32;
         let mut cursor = Pos2::new(rect.right() - 18.0 - total, rect.center().y - pill.y / 2.0);
         for (tab, label) in tabs {
@@ -61,6 +69,12 @@ impl LauncherApp {
         ui.advance_cursor_after_rect(rect);
     }
 
+    fn scrolled(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, add);
+    }
+
     fn footer(&self, ui: &mut egui::Ui) {
         let h = 22.0;
         let rect = Rect::from_min_size(
@@ -71,7 +85,7 @@ impl LauncherApp {
         ui.painter().text(
             Pos2::new(rect.left() + 10.0, rect.center().y),
             Align2::LEFT_CENTER,
-            format!("gba-recomp {} — supply your own legally dumped images", env!("CARGO_PKG_VERSION")),
+            format!("Version {} — JRickey", env!("CARGO_PKG_VERSION")),
             FontId::proportional(10.0),
             theme::INK,
         );
@@ -97,10 +111,14 @@ impl eframe::App for LauncherApp {
             ui.max_rect().max - Vec2::new(16.0, 38.0),
         );
         let mut inner = ui.new_child(egui::UiBuilder::new().max_rect(content));
+        // Nothing a screen draws may spill onto the header/footer chrome.
+        inner.shrink_clip_rect(content);
         match self.tab {
             Tab::Play => self.play.ui(&mut inner),
             Tab::Input => self.input.ui(&mut inner),
-            Tab::Av => self.av.ui(&mut inner),
+            // Settings can outgrow small windows; scroll instead of clipping.
+            Tab::Audio => Self::scrolled(&mut inner, |ui| self.av.audio_ui(ui)),
+            Tab::Video => Self::scrolled(&mut inner, |ui| self.av.video_ui(ui)),
         }
 
         // gentle ambient animation

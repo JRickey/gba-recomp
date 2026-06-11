@@ -1,7 +1,7 @@
-//! Audio / video settings. Audio holds the first premium enhancement
-//! toggle (unnamed until the feature is complete); video is the screen
-//! simulation: per-revision panel models, temporal response, pixel grid,
-//! and output-colorspace handling.
+//! Audio and video settings (one shared av.cfg, two tabs). Audio holds
+//! the first premium enhancement toggle (unnamed until the feature is
+//! complete); video is the screen simulation: per-revision panel models,
+//! temporal response, pixel grid, and output-colorspace handling.
 
 use eframe::egui::{self, Ui, Vec2};
 
@@ -22,7 +22,7 @@ impl AvScreen {
         }
     }
 
-    pub fn ui(&mut self, ui: &mut Ui) {
+    pub fn audio_ui(&mut self, ui: &mut Ui) {
         theme::glass_frame().show(ui, |ui| {
             theme::section_title(ui, "Audio");
             ui.add_space(6.0);
@@ -52,8 +52,13 @@ impl AvScreen {
                 .color(theme::white(140)),
             );
 
-            ui.add_space(14.0);
-            theme::section_title(ui, "Video \u{2014} Screen Simulation");
+            applies_note(ui);
+        });
+    }
+
+    pub fn video_ui(&mut self, ui: &mut Ui) {
+        theme::glass_frame().show(ui, |ui| {
+            theme::section_title(ui, "Screen Simulation");
             ui.add_space(6.0);
 
             // Screen model: which physical screen revision to reproduce.
@@ -192,24 +197,8 @@ impl AvScreen {
                     }
                 }
             });
-            ui.label(
-                egui::RichText::new(
-                    "Auto is right on almost every setup: where the OS \
-                     color-manages (e.g. recent laptops with wide-gamut \
-                     panels) output is tagged and matched per monitor; \
-                     elsewhere standard sRGB is assumed. Pick WIDE only for \
-                     an unmanaged wide-gamut monitor.",
-                )
-                .size(11.0)
-                .color(theme::white(140)),
-            );
 
-            ui.add_space(6.0);
-            ui.label(
-                egui::RichText::new("Applies the next time a cartridge is launched.")
-                    .size(10.0)
-                    .color(theme::white(100)),
-            );
+            applies_note(ui);
         });
     }
 
@@ -249,4 +238,14 @@ impl AvScreen {
             }
         });
     }
+}
+
+/// Shared tail line: settings take effect on the next launch.
+fn applies_note(ui: &mut Ui) {
+    ui.add_space(6.0);
+    ui.label(
+        egui::RichText::new("Applies the next time a cartridge is launched.")
+            .size(10.0)
+            .color(theme::white(100)),
+    );
 }
