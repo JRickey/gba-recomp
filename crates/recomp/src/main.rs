@@ -245,8 +245,8 @@ fn cmd_frames(args: &[String]) -> Result<(), String> {
         }
     }
     if let Some(prefix) = &dump_audio {
-        write_wav(&format!("{prefix}.mixed.wav"), &mixed, gba_core::mem::AUDIO_RATE_HZ)?;
-        write_wav(&format!("{prefix}.psg.wav"), &psg, gba_core::mem::AUDIO_RATE_HZ)?;
+        write_wav(&format!("{prefix}.mixed.wav"), &mixed, gba_core::mem::AUDIO_RATE_HZ, 2)?;
+        write_wav(&format!("{prefix}.psg.wav"), &psg, gba_core::mem::AUDIO_RATE_HZ, 2)?;
         for f in 0..2 {
             let mut raw = Vec::with_capacity(fifo_ev[f].len() * 5);
             for &(s, p) in &fifo_ev[f] {
@@ -257,8 +257,8 @@ fn cmd_frames(args: &[String]) -> Result<(), String> {
             std::fs::write(&path, raw).map_err(|e| format!("{path}: {e}"))?;
         }
         eprintln!(
-            "audio dump: {} mixed samples, fifo events A={} B={}, underruns A={} B={}, refills A={} B={}, pushes A={} B={}",
-            mixed.len(),
+            "audio dump: {} mixed stereo frames, fifo events A={} B={}, underruns A={} B={}, refills A={} B={}, pushes A={} B={}",
+            mixed.len() / 2,
             fifo_ev[0].len(),
             fifo_ev[1].len(),
             m.bus.fifo_underruns[0],
@@ -525,6 +525,23 @@ fn cmd_play(args: &[String]) -> Result<(), String> {
             fallback_run = 0;
         }
 
+        // Audio defect surfacing: ring drops and underrun holds are
+        // silent corruption — say so, with numbers, per the product bar.
+        if frames_run % 300 == 0 {
+            let (d, h) = {
+                let mut st = streams.lock().unwrap();
+                let v = (st.drops, st.holds);
+                st.drops = 0;
+                st.holds = 0;
+                v
+            };
+            if d + h > 0 {
+                eprintln!(
+                    "DEGRADED: audio ring dropped {d} / held {h} sample pairs in the last 5 s"
+                );
+            }
+        }
+
         // Flush backup media periodically when it changed, so an external
         // teardown (launcher exit kills us) can't lose more than ~5 s of
         // save progress.
@@ -539,29 +556,45 @@ fn cmd_play(args: &[String]) -> Result<(), String> {
             }
         }
 
-        // Hand this frame's audio to the consumer (caps ~250 ms each).
+        // Hand this frame's audio to the consumer (caps ~250 ms each),
+        // refresh the routing snapshot, and count anything dropped.
         {
+            use gba_core::Bus as _;
+            let cnt_h = m.bus.read16(0x0400_0082);
             let mut st = streams.lock().unwrap();
+            st.route = [(cnt_h >> 8 & 3) as u8, (cnt_h >> 12 & 3) as u8];
+            st.vol_half = [cnt_h & 4 == 0, cnt_h & 8 == 0];
             if av.audio_enhanced {
                 m.bus.audio_buf.clear();
-                for s in m.bus.psg_tap.drain(..) {
-                    if st.psg.len() < 16384 {
-                        st.psg.push_back(s);
+                for pair in m.bus.psg_tap.chunks_exact(2) {
+                    if st.psg.len() < 65536 {
+                        st.psg.push_back(pair[0]);
+                        st.psg.push_back(pair[1]);
+                    } else {
+                        st.drops += 1;
                     }
                 }
+                m.bus.psg_tap.clear();
                 for f in 0..2 {
-                    for e in m.bus.fifo_tap[f].drain(..) {
+                    let events = std::mem::take(&mut m.bus.fifo_tap[f]);
+                    for e in events {
                         if st.fifo[f].len() < 32768 {
                             st.fifo[f].push_back(e);
+                        } else {
+                            st.drops += 1;
                         }
                     }
                 }
             } else {
-                for s in m.bus.audio_buf.drain(..) {
-                    if st.mixed.len() < 16384 {
-                        st.mixed.push_back(s);
+                for pair in m.bus.audio_buf.chunks_exact(2) {
+                    if st.mixed.len() < 65536 {
+                        st.mixed.push_back(pair[0]);
+                        st.mixed.push_back(pair[1]);
+                    } else {
+                        st.drops += 1;
                     }
                 }
+                m.bus.audio_buf.clear();
             }
         }
 
@@ -655,21 +688,31 @@ fn ensure_native(
 
 /// Streams shared between the emulation loop (producer) and the cpal
 /// callback (consumer). Faithful mode uses only `mixed`; enhanced mode
-/// uses the per-channel taps.
+/// uses the per-channel taps. `mixed` and `psg` are interleaved stereo.
 #[derive(Default)]
 struct AudioStreams {
     mixed: std::collections::VecDeque<i16>,
     psg: std::collections::VecDeque<i16>,
     fifo: [std::collections::VecDeque<(i8, u32)>; 2],
+    /// SOUNDCNT_H routing snapshot for the enhanced path, refreshed
+    /// each frame by the producer: bit 0 = right side, bit 1 = left.
+    route: [u8; 2],
+    /// SOUNDCNT_H 50%-volume flags per Direct Sound channel.
+    vol_half: [bool; 2],
+    /// Producer-side ring drops and consumer-side underrun holds since
+    /// the last report. Silent audio defects are still defects — the
+    /// play loop surfaces nonzero deltas as DEGRADED.
+    drops: u64,
+    holds: u64,
 }
 
 /// The premium path's consumer state: one interpolator per Direct Sound
-/// channel at its own rate, PSG through the fixed-grid resampler, and a
-/// DC blocker on the float sum.
+/// channel at its own rate, PSG through the stereo grid resampler, and
+/// a DC blocker per side.
 struct Enhanced {
     psg: SincResampler,
     fifo: [FifoInterp; 2],
-    dc: DcBlock,
+    dc: [DcBlock; 2],
 }
 
 /// Build the cpal output stream over the shared streams. `enhanced`
@@ -690,50 +733,82 @@ fn start_audio(
         Some(Enhanced {
             psg: SincResampler::new(src, rate),
             fifo: [FifoInterp::new(rate), FifoInterp::new(rate)],
-            dc: DcBlock::new(rate),
+            dc: [DcBlock::new(rate), DcBlock::new(rate)],
         })
     } else {
         None
     };
     let step = src / rate;
     let mut frac = 0.0f64;
-    let mut last = 0i16;
+    let mut last = (0i16, 0i16);
     // The hardware output is AC-coupled: DC at the DAC never reaches
     // the speaker. Model it on the faithful path too, or PSG duty
     // offsets thump on every note edge.
-    let mut faithful_dc = DcBlock::new(rate);
+    let mut faithful_dc = [DcBlock::new(rate), DcBlock::new(rate)];
     let stream = device
         .build_output_stream(
             &cfg.into(),
             move |out: &mut [f32], _| {
                 let mut st = streams.lock().unwrap();
                 for frame in out.chunks_mut(channels) {
-                    let v = match eng.as_mut() {
+                    let (l, r) = match eng.as_mut() {
                         Some(e) => {
-                            let sum = e.psg.next(&mut st.psg)
-                                + e.fifo[0].next(&mut st.fifo[0])
-                                + e.fifo[1].next(&mut st.fifo[1]);
-                            e.dc.next(sum)
+                            let (pl, pr) = e.psg.next(&mut st.psg);
+                            let a = e.fifo[0].next(&mut st.fifo[0])
+                                * if st.vol_half[0] { 0.5 } else { 1.0 };
+                            let b = e.fifo[1].next(&mut st.fifo[1])
+                                * if st.vol_half[1] { 0.5 } else { 1.0 };
+                            let mut l = pl;
+                            let mut r = pr;
+                            if st.route[0] & 2 != 0 {
+                                l += a;
+                            }
+                            if st.route[0] & 1 != 0 {
+                                r += a;
+                            }
+                            if st.route[1] & 2 != 0 {
+                                l += b;
+                            }
+                            if st.route[1] & 1 != 0 {
+                                r += b;
+                            }
+                            (e.dc[0].next(l), e.dc[1].next(r))
                         }
                         None => {
                             // The emulated DAC runs on the 59.73 Hz frame
                             // grid while the window paces 60 — steer the
                             // faithful path too, or the ring overflows
                             // into a burst-drop buzz at the cap.
-                            let err = (st.mixed.len() as f64 - RING_TARGET as f64)
-                                / RING_TARGET as f64;
-                            frac += step * (1.0 + 0.01 * err.clamp(-1.0, 1.0));
+                            let pairs = (st.mixed.len() / 2) as f64;
+                            let err = (pairs - RING_TARGET as f64) / RING_TARGET as f64;
+                            frac += step * (1.0 + 0.02 * err.clamp(-1.0, 1.0));
                             while frac >= 1.0 {
                                 frac -= 1.0;
-                                if let Some(s) = st.mixed.pop_front() {
-                                    last = s;
+                                match (st.mixed.pop_front(), st.mixed.pop_front()) {
+                                    (Some(l), Some(r)) => last = (l, r),
+                                    _ => st.holds += 1,
                                 }
                             }
-                            faithful_dc.next(last as f32 / 32768.0)
+                            (
+                                faithful_dc[0].next(last.0 as f32 / 32768.0),
+                                faithful_dc[1].next(last.1 as f32 / 32768.0),
+                            )
                         }
                     };
-                    for ch in frame.iter_mut() {
-                        *ch = v;
+                    // Calibrate the hardware rail (±0x200 units = ±0.5
+                    // here) to device full scale, and clamp.
+                    let l = (l * 2.0).clamp(-1.0, 1.0);
+                    let r = (r * 2.0).clamp(-1.0, 1.0);
+                    match frame {
+                        [m] => *m = (l + r) * 0.5,
+                        [fl, fr, rest @ ..] => {
+                            *fl = l;
+                            *fr = r;
+                            for ch in rest {
+                                *ch = (l + r) * 0.5;
+                            }
+                        }
+                        [] => {}
                     }
                 }
             },
@@ -799,15 +874,15 @@ impl DcBlock {
     }
 }
 
-/// Fixed-ratio polyphase windowed-sinc resampler with gentle (max
-/// ±1%) consumption-rate control against the queue fill. Band-limits
-/// to the narrower of the two Nyquists, so downsampling to a 44.1/48
-/// kHz device does not fold images the way the zero-order-hold path
-/// does. Used for the PSG grid stream.
+/// Fixed-ratio polyphase windowed-sinc resampler over an interleaved
+/// stereo queue, with gentle (max ±2%) consumption-rate control against
+/// the queue fill. Band-limits to the narrower of the two Nyquists, so
+/// downsampling to a 44.1/48 kHz device does not fold images the way
+/// the zero-order-hold path does. Used for the PSG grid stream.
 struct SincResampler {
     table: Vec<f32>,
-    /// Last SINC_TAPS source samples, oldest first.
-    hist: [f32; SINC_TAPS],
+    /// Last SINC_TAPS source samples per side, oldest first.
+    hist: [[f32; SINC_TAPS]; 2],
     ratio: f64,
     frac: f64,
 }
@@ -818,28 +893,34 @@ impl SincResampler {
         // band room.
         SincResampler {
             table: build_sinc_table(0.45 * (out_hz / src_hz).min(1.0)),
-            hist: [0.0; SINC_TAPS],
+            hist: [[0.0; SINC_TAPS]; 2],
             ratio: src_hz / out_hz,
             frac: 0.0,
         }
     }
 
-    fn next(&mut self, q: &mut std::collections::VecDeque<i16>) -> f32 {
+    fn next(&mut self, q: &mut std::collections::VecDeque<i16>) -> (f32, f32) {
         // Steer consumption toward the target fill; an underrun repeats
-        // the newest sample (a one-sample ZOH the DC blocker smooths).
-        let err = (q.len() as f64 - RING_TARGET as f64) / RING_TARGET as f64;
-        self.frac += self.ratio * (1.0 + 0.01 * err.clamp(-1.0, 1.0));
+        // the newest pair (a one-sample ZOH the DC blocker smooths).
+        let pairs = (q.len() / 2) as f64;
+        let err = (pairs - RING_TARGET as f64) / RING_TARGET as f64;
+        self.frac += self.ratio * (1.0 + 0.02 * err.clamp(-1.0, 1.0));
         while self.frac >= 1.0 {
             self.frac -= 1.0;
-            let s = match q.pop_front() {
-                Some(s) => s as f32 / 32768.0,
-                None => self.hist[SINC_TAPS - 1],
+            let (l, r) = match (q.pop_front(), q.pop_front()) {
+                (Some(l), Some(r)) => (l as f32 / 32768.0, r as f32 / 32768.0),
+                _ => (self.hist[0][SINC_TAPS - 1], self.hist[1][SINC_TAPS - 1]),
             };
-            self.hist.copy_within(1.., 0);
-            self.hist[SINC_TAPS - 1] = s;
+            for (h, s) in self.hist.iter_mut().zip([l, r]) {
+                h.copy_within(1.., 0);
+                h[SINC_TAPS - 1] = s;
+            }
         }
         let row = &self.table[(self.frac * SINC_PHASES as f64) as usize * SINC_TAPS..][..SINC_TAPS];
-        row.iter().zip(self.hist.iter()).map(|(c, s)| c * s).sum()
+        (
+            row.iter().zip(self.hist[0].iter()).map(|(c, s)| c * s).sum(),
+            row.iter().zip(self.hist[1].iter()).map(|(c, s)| c * s).sum(),
+        )
     }
 }
 
@@ -892,7 +973,7 @@ impl FifoInterp {
         // Steer toward ~62 ms queued at the channel's current rate.
         let target = ((1u64 << 24) as f64 / self.period / 16.0).max(64.0);
         let err = (q.len() as f64 - target) / target;
-        let stepc = self.out_step * (1.0 + 0.01 * err.clamp(-1.0, 1.0));
+        let stepc = self.out_step * (1.0 + 0.02 * err.clamp(-1.0, 1.0));
 
         self.t_next -= stepc;
         while self.t_next <= 0.0 {
@@ -1420,19 +1501,20 @@ fn run_hash(
     Ok(fb_hash(&m))
 }
 
-/// Minimal PCM16LE mono WAV writer for audio triage dumps.
-fn write_wav(path: &str, samples: &[i16], rate: u32) -> Result<(), String> {
+/// Minimal PCM16LE WAV writer for audio triage dumps.
+fn write_wav(path: &str, samples: &[i16], rate: u32, channels: u16) -> Result<(), String> {
     let data_len = (samples.len() * 2) as u32;
+    let block = channels as u32 * 2;
     let mut w = Vec::with_capacity(44 + samples.len() * 2);
     w.extend_from_slice(b"RIFF");
     w.extend_from_slice(&(36 + data_len).to_le_bytes());
     w.extend_from_slice(b"WAVEfmt ");
     w.extend_from_slice(&16u32.to_le_bytes());
     w.extend_from_slice(&1u16.to_le_bytes()); // PCM
-    w.extend_from_slice(&1u16.to_le_bytes()); // mono
+    w.extend_from_slice(&channels.to_le_bytes());
     w.extend_from_slice(&rate.to_le_bytes());
-    w.extend_from_slice(&(rate * 2).to_le_bytes());
-    w.extend_from_slice(&2u16.to_le_bytes());
+    w.extend_from_slice(&(rate * block).to_le_bytes());
+    w.extend_from_slice(&(block as u16).to_le_bytes());
     w.extend_from_slice(&16u16.to_le_bytes());
     w.extend_from_slice(b"data");
     w.extend_from_slice(&data_len.to_le_bytes());
@@ -1476,8 +1558,9 @@ mod tests {
         for n in 0..65536 {
             let s = (2.0 * std::f64::consts::PI * 1000.0 * n as f64 / 65536.0).sin();
             q.push_back((s * 16384.0) as i16);
+            q.push_back((s * 16384.0) as i16);
         }
-        let out: Vec<f32> = (0..40000).map(|_| r.next(&mut q)).collect();
+        let out: Vec<f32> = (0..40000).map(|_| { let (l, r2) = r.next(&mut q); (l + r2) * 0.5 }).collect();
         let rms = (out[2000..38000].iter().map(|v| v * v).sum::<f32>() / 36000.0).sqrt();
         let expect = 0.5 / 2f32.sqrt(); // amplitude 0.5 sine
         assert!(

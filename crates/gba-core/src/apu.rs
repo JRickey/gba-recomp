@@ -89,10 +89,11 @@ impl Square {
         }
         self.env.step(frames64);
         if self.sweep_period > 0 && self.sweep_shift > 0 {
-            self.sweep_timer += frames64;
-            // sweep ticks at 128 Hz = 2 per frame
-            while self.sweep_timer >= self.sweep_period as u32 * 2 {
-                self.sweep_timer -= self.sweep_period as u32 * 2;
+            // Sweep clock is 128 Hz: 2 ticks per 64 Hz frame, and the
+            // period is in 128 Hz units.
+            self.sweep_timer += frames64 * 2;
+            while self.sweep_timer >= self.sweep_period as u32 {
+                self.sweep_timer -= self.sweep_period as u32;
                 let d = self.freq >> self.sweep_shift;
                 self.freq = if self.sweep_decrease {
                     self.freq.saturating_sub(d)
@@ -237,15 +238,20 @@ impl Apu {
 
     /// Produce one mixed PSG sample for `cycles` elapsed master-clock
     /// cycles, reading wave RAM / master volume from the I/O backing store.
-    pub fn sample(&mut self, io: &[u8], cycles: u32) -> i16 {
+    /// Produce one (left, right) PSG sample pair for `cycles` elapsed
+    /// master-clock cycles, honoring SOUNDCNT_L per-channel L/R enables
+    /// and master volumes, and the SOUNDCNT_H PSG ratio.
+    pub fn sample(&mut self, io: &[u8], cycles: u32) -> (i16, i16) {
         // 64 Hz frame count since last sample (almost always 0 or 1).
         self.frame_acc += cycles;
         let frames64 = self.frame_acc / 262144;
         self.frame_acc %= 262144;
 
-        let mut sum: i32 = 0;
-        sum += self.sq[0].sample(cycles, frames64) as i32;
-        sum += self.sq[1].sample(cycles, frames64) as i32;
+        // Per-channel outputs (state always advances, even when a
+        // channel is routed to neither side).
+        let mut ch: [i32; 4] = [0; 4];
+        ch[0] = self.sq[0].sample(cycles, frames64) as i32;
+        ch[1] = self.sq[1].sample(cycles, frames64) as i32;
 
         if self.wave_on && self.wave_shift != 0 {
             // 2097152/(2048-f) Hz, 32 samples per period; area-averaged
@@ -267,7 +273,7 @@ impl Apu {
                 }
             }
             let centered = area / cycles as i32;
-            sum += match self.wave_shift {
+            ch[2] = match self.wave_shift {
                 1 => centered,
                 2 => centered / 2,
                 3 => centered / 4,
@@ -299,8 +305,24 @@ impl Apu {
                     }
                 }
             }
-            sum += area / cycles as i32 * self.noise_env.volume as i32;
+            ch[3] = area / cycles as i32 * self.noise_env.volume as i32;
         }
+
+        // SOUNDCNT_L: per-channel enables (bits 8-11 right, 12-15 left)
+        // and master volumes 0-7 (bits 0-2 right, 4-6 left).
+        let cnt_l = u16::from_le_bytes([io[0x80], io[0x81]]);
+        let mut right: i32 = 0;
+        let mut left: i32 = 0;
+        for (i, &c) in ch.iter().enumerate() {
+            if cnt_l & (1 << (8 + i)) != 0 {
+                right += c;
+            }
+            if cnt_l & (1 << (12 + i)) != 0 {
+                left += c;
+            }
+        }
+        right = right * ((cnt_l & 7) as i32 + 1) / 8;
+        left = left * (((cnt_l >> 4) & 7) as i32 + 1) / 8;
 
         // SOUNDCNT_H PSG master volume: 25/50/100%.
         let vol_shift = match io[0x82] & 3 {
@@ -308,6 +330,6 @@ impl Apu {
             1 => 1,
             _ => 0,
         };
-        ((sum << 4) >> vol_shift) as i16
+        (((left << 4) >> vol_shift) as i16, ((right << 4) >> vol_shift) as i16)
     }
 }

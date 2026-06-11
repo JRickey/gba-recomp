@@ -167,14 +167,15 @@ pub struct MemMap {
     fifo: [std::collections::VecDeque<i8>; 2],
     /// Most recent sample popped from each FIFO (the DAC output level).
     pub fifo_sample: [i8; 2],
-    /// Mixed mono output collected at `AUDIO_SAMPLE_CYCLES` intervals;
-    /// drained by the frontend.
+    /// Mixed stereo output (interleaved L, R) collected at
+    /// `AUDIO_SAMPLE_CYCLES` intervals; drained by the frontend.
     pub audio_buf: Vec<i16>,
     /// Per-channel tap for the enhanced audio path (set by the frontend;
     /// observation only, never fed back). When on, every Direct Sound
     /// DAC event is recorded as (sample, driving-timer period in master
     /// cycles) — the channel's own PCM stream at its own rate — and
-    /// `psg_tap` carries the PSG mix alone on the sample grid.
+    /// `psg_tap` carries the PSG mix alone (interleaved stereo) on the
+    /// sample grid.
     pub tap_channels: bool,
     pub fifo_tap: [Vec<(i8, u32)>; 2],
     pub psg_tap: Vec<i16>,
@@ -309,15 +310,45 @@ impl MemMap {
     pub fn tick(&mut self, cycles: u64) {
         self.clock += cycles;
         while self.audio_cursor <= self.clock {
-            // Mix Direct Sound DAC levels with the PSG channels.
-            let psg = self.apu.sample(&self.io, AUDIO_SAMPLE_CYCLES as u32);
-            let s = ((self.fifo_sample[0] as i16 + self.fifo_sample[1] as i16) * 64)
-                .saturating_add(psg);
-            if self.audio_buf.len() < 0x1_0000 {
-                self.audio_buf.push(s);
+            // Mix Direct Sound DAC levels with the PSG channels into a
+            // stereo pair, honoring the SOUNDCNT routing the hardware
+            // applies: per-side FIFO enables and the 50%/100% volume
+            // bits (SOUNDCNT_H), per-channel/volume PSG routing inside
+            // the APU (SOUNDCNT_L), and the master enable (SOUNDCNT_X).
+            // Each side then clips at the hardware's 10-bit rail — that
+            // clip is canon audible behavior on hot mixes.
+            let (psg_l, psg_r) = self.apu.sample(&self.io, AUDIO_SAMPLE_CYCLES as u32);
+            let cnt_h = u16::from_le_bytes([self.io[0x82], self.io[0x83]]);
+            let a = (self.fifo_sample[0] as i32 * 64) >> ((cnt_h >> 2 & 1) ^ 1);
+            let b = (self.fifo_sample[1] as i32 * 64) >> ((cnt_h >> 3 & 1) ^ 1);
+            let mut l = psg_l as i32;
+            let mut r = psg_r as i32;
+            if cnt_h & (1 << 9) != 0 {
+                l += a;
             }
-            if self.tap_channels && self.psg_tap.len() < 0x1_0000 {
-                self.psg_tap.push(psg);
+            if cnt_h & (1 << 8) != 0 {
+                r += a;
+            }
+            if cnt_h & (1 << 13) != 0 {
+                l += b;
+            }
+            if cnt_h & (1 << 12) != 0 {
+                r += b;
+            }
+            if self.io[0x84] & 0x80 == 0 {
+                l = 0;
+                r = 0;
+            }
+            // Rail: ±0x200 hardware units; our scale is 32 per unit.
+            let l = l.clamp(-16384, 16383) as i16;
+            let r = r.clamp(-16384, 16383) as i16;
+            if self.audio_buf.len() < 0x2_0000 {
+                self.audio_buf.push(l);
+                self.audio_buf.push(r);
+            }
+            if self.tap_channels && self.psg_tap.len() < 0x2_0000 {
+                self.psg_tap.push(psg_l);
+                self.psg_tap.push(psg_r);
             }
             self.audio_cursor += AUDIO_SAMPLE_CYCLES;
         }
