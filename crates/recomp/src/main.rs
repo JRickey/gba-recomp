@@ -516,20 +516,25 @@ fn cmd_build(args: &[String]) -> Result<(), String> {
         let mut steps = 0u64;
         while m.bus.frames < 240 && steps < 60_000_000 {
             steps += 1;
+            // Seed observed control-transfer targets in IWRAM and ROM.
+            // ROM targets recover code static traversal can't reach
+            // (computed branches, handlers installed by RAM code) and
+            // need no guard — ROM is immutable. IWRAM blocks are
+            // content-guarded at execution time. EWRAM stays excluded:
+            // it commonly holds streamed overlays, which defeat entry
+            // guards; that needs write-watch invalidation first.
+            let seedable = |pc: u32| pc >> 24 == 3 || (0x08..=0x0D).contains(&(pc >> 24));
             match m.step() {
                 StepEvent::Instr(instr) => {
                     let pc = m.cpu.regs[15];
-                    // IWRAM only: EWRAM commonly holds streamed overlays,
-                    // which defeat entry guards; that needs write-watch
-                    // invalidation before it can be translated safely.
-                    if pc != prev_end && pc >> 24 == 3 {
+                    if pc != prev_end && seedable(pc) {
                         seeds.insert(pc | m.cpu.thumb() as u32);
                     }
                     prev_end = instr.addr.wrapping_add(instr.size());
                 }
                 StepEvent::Idle => {
                     let pc = m.cpu.regs[15];
-                    if pc >> 24 == 3 && pc != prev_end {
+                    if pc != prev_end && seedable(pc) {
                         seeds.insert(pc | m.cpu.thumb() as u32);
                     }
                 }
@@ -594,10 +599,80 @@ fn cmd_build(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+type BlockFn = extern "C" fn(*const gba_core::capi::RtApi, *mut std::ffi::c_void) -> u32;
+
+/// Direct-indexed block lookup. Keys are `guest address | thumb bit`;
+/// nearly all live in the ROM window (and IWRAM for --ram builds), so
+/// those get dense tables — lookup is a subtract, compare, and load —
+/// with a HashMap holding any stragglers.
+struct BlockTable {
+    rom: Vec<Option<BlockFn>>,
+    iwram: Vec<Option<BlockFn>>,
+    other: std::collections::HashMap<u32, BlockFn>,
+    len: usize,
+}
+
+const IWRAM_BASE: u32 = 0x0300_0000;
+
+impl BlockTable {
+    fn load(lib: &libloading::Library) -> Result<BlockTable, String> {
+        use gba_core::capi::RcgBlock;
+        let blocks: &[RcgBlock] = unsafe {
+            let blocks: libloading::Symbol<*const RcgBlock> =
+                lib.get(b"rcg_blocks").map_err(|e| e.to_string())?;
+            let count: libloading::Symbol<*const u64> =
+                lib.get(b"rcg_block_count").map_err(|e| e.to_string())?;
+            std::slice::from_raw_parts(*blocks, **count as usize)
+        };
+        let mut rom_max = 0usize;
+        for b in blocks {
+            let r = b.key.wrapping_sub(ROM_BASE) as usize;
+            if r < 0x0200_0000 {
+                rom_max = rom_max.max(r + 1);
+            }
+        }
+        let mut t = BlockTable {
+            rom: vec![None; rom_max],
+            iwram: vec![None; 0x8000],
+            other: std::collections::HashMap::new(),
+            len: blocks.len(),
+        };
+        for b in blocks {
+            let r = b.key.wrapping_sub(ROM_BASE) as usize;
+            let w = b.key.wrapping_sub(IWRAM_BASE) as usize;
+            if r < t.rom.len() {
+                t.rom[r] = Some(b.func);
+            } else if w < t.iwram.len() {
+                t.iwram[w] = Some(b.func);
+            } else {
+                t.other.insert(b.key, b.func);
+            }
+        }
+        Ok(t)
+    }
+
+    #[inline(always)]
+    fn get(&self, key: u32) -> Option<BlockFn> {
+        let r = key.wrapping_sub(ROM_BASE) as usize;
+        if r < self.rom.len() {
+            return self.rom[r];
+        }
+        let w = key.wrapping_sub(IWRAM_BASE) as usize;
+        if w < self.iwram.len() {
+            return self.iwram[w];
+        }
+        if self.other.is_empty() {
+            None
+        } else {
+            self.other.get(&key).copied()
+        }
+    }
+}
+
 /// Run a recompiled image: translated blocks where available, interpreter
 /// fallback elsewhere, interrupt machinery at block boundaries.
 fn cmd_runc(args: &[String]) -> Result<(), String> {
-    use gba_core::capi::{RcgBlock, RtApi, RT_API};
+    use gba_core::capi::RT_API;
 
     let mut rom_path = None;
     let mut frames = 600u64;
@@ -620,18 +695,8 @@ fn cmd_runc(args: &[String]) -> Result<(), String> {
 
     let lib = unsafe { libloading::Library::new(&lib_path) }
         .map_err(|e| format!("{lib_path}: {e}"))?;
-    let table: std::collections::HashMap<u32, extern "C" fn(*const RtApi, *mut std::ffi::c_void) -> u32> = unsafe {
-        let blocks: libloading::Symbol<*const RcgBlock> =
-            lib.get(b"rcg_blocks").map_err(|e| e.to_string())?;
-        let count: libloading::Symbol<*const u64> =
-            lib.get(b"rcg_block_count").map_err(|e| e.to_string())?;
-        let n = **count as usize;
-        std::slice::from_raw_parts(*blocks, n)
-            .iter()
-            .map(|b| (b.key, b.func))
-            .collect()
-    };
-    println!("loaded {} translated blocks", table.len());
+    let table = BlockTable::load(&lib)?;
+    println!("loaded {} translated blocks", table.len);
 
     let mut m = Machine::new(rom);
     let mptr = &mut m as *mut Machine as *mut std::ffi::c_void;
@@ -654,7 +719,7 @@ fn cmd_runc(args: &[String]) -> Result<(), String> {
             continue;
         }
         let key = m.cpu.regs[15] | m.cpu.thumb() as u32;
-        match table.get(&key) {
+        match table.get(key) {
             Some(f) => {
                 f(&RT_API, mptr);
                 native_blocks += 1;
@@ -735,7 +800,7 @@ fn fb_hash(m: &Machine) -> u64 {
 }
 
 fn run_hash(rom_path: &str, frames: u64, recompiled: bool) -> Result<u64, String> {
-    use gba_core::capi::{RcgBlock, RtApi, RT_API};
+    use gba_core::capi::RT_API;
     let rom = std::fs::read(rom_path).map_err(|e| format!("{rom_path}: {e}"))?;
     let mut m = Machine::new(rom);
     if !recompiled {
@@ -750,14 +815,7 @@ fn run_hash(rom_path: &str, frames: u64, recompiled: bool) -> Result<u64, String
     let lib_path = format!("out/{stem}.dylib");
     let lib = unsafe { libloading::Library::new(&lib_path) }
         .map_err(|e| format!("{lib_path}: {e}"))?;
-    let table: std::collections::HashMap<u32, extern "C" fn(*const RtApi, *mut std::ffi::c_void) -> u32> = unsafe {
-        let blocks: libloading::Symbol<*const RcgBlock> =
-            lib.get(b"rcg_blocks").map_err(|e| e.to_string())?;
-        let count: libloading::Symbol<*const u64> =
-            lib.get(b"rcg_block_count").map_err(|e| e.to_string())?;
-        std::slice::from_raw_parts(*blocks, **count as usize)
-            .iter().map(|b| (b.key, b.func)).collect()
-    };
+    let table = BlockTable::load(&lib)?;
     let mptr = &mut m as *mut Machine as *mut std::ffi::c_void;
     let mut guard = 0u64;
     let mut keyed_frame = u64::MAX;
@@ -779,7 +837,7 @@ fn run_hash(rom_path: &str, frames: u64, recompiled: bool) -> Result<u64, String
             continue;
         }
         let key = m.cpu.regs[15] | m.cpu.thumb() as u32;
-        match table.get(&key) {
+        match table.get(key) {
             Some(f) => {
                 f(&RT_API, mptr);
             }
