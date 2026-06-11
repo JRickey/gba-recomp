@@ -1430,6 +1430,8 @@ name = "gba-core"
 version = "0.1.0"
 dependencies = [
  "armv4t",
+ "libc",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

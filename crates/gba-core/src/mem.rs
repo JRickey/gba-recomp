@@ -168,6 +168,11 @@ pub struct MemMap {
     pub backup: BackupKind,
     pub flash: Option<Flash>,
     pub eeprom: Option<Eeprom>,
+    /// Cartridge GPIO clock chip, present when the ROM links the Seiko RTC
+    /// library. Intercepts 0x080000C4..C9 (the GPIO port) so the guest's
+    /// clock reads come from the host's clock. `None` for non-RTC carts,
+    /// whose 0xC4 region holds ordinary ROM data.
+    pub rtc: Option<crate::rtc::Rtc>,
     /// Direct Sound FIFOs A/B: byte queues fed by writes/DMA at
     /// 0x040000A0/A4, drained one sample per attached-timer overflow.
     fifo: [std::collections::VecDeque<i8>; 2],
@@ -222,6 +227,7 @@ impl MemMap {
             _ => None,
         };
         let eeprom = if backup == BackupKind::Eeprom { Some(Eeprom::new()) } else { None };
+        let rtc = if crate::rtc::detect(&rom) { Some(crate::rtc::Rtc::new()) } else { None };
         MemMap {
             bios: vec![0; 0x4000],
             ewram: vec![0; 0x4_0000],
@@ -253,6 +259,7 @@ impl MemMap {
             backup,
             flash,
             eeprom,
+            rtc,
             fifo: [std::collections::VecDeque::new(), std::collections::VecDeque::new()],
             fifo_sample: [0; 2],
             audio_buf: Vec::new(),
@@ -312,6 +319,12 @@ impl MemMap {
         self.eeprom.is_some()
             && addr >> 24 == 0x0D
             && (self.rom.len() <= 0x100_0000 || addr & 0x01FF_FF00 == 0x01FF_FF00)
+    }
+
+    /// True when `addr` hits the cartridge GPIO port (0x080000C4..C9, in any
+    /// ROM waitstate mirror) and this cart has the clock chip attached.
+    fn is_gpio(&self, addr: u32) -> bool {
+        self.rtc.is_some() && matches!(addr & 0x01FF_FFFF, 0xC4..=0xC9)
     }
 
     /// Current scanline (0..=227).
@@ -1053,6 +1066,9 @@ impl Bus for MemMap {
             0x06 => self.vram[Self::vram_index(addr)],
             0x07 => self.oam[(addr & 0x3FF) as usize],
             0x08..=0x0D => {
+                if self.is_gpio(addr) {
+                    return self.rtc.as_ref().unwrap().read(addr & 0x01FF_FFFF);
+                }
                 if self.is_eeprom_addr(addr) {
                     return if addr & 1 == 0 {
                         self.eeprom.as_mut().unwrap().read_bit() as u8
@@ -1100,8 +1116,15 @@ impl Bus for MemMap {
                 }
             }
             0x07 => {} // byte writes to OAM are ignored
-            0x0D => {
-                if self.is_eeprom_addr(addr) && addr & 1 == 0 {
+            0x08..=0x0D => {
+                // GPIO port (clock chip) is mapped into the ROM region;
+                // wider writes decompose to these byte writes.
+                if self.is_gpio(addr) {
+                    self.rtc.as_mut().unwrap().write(addr & 0x01FF_FFFF, value);
+                } else if addr >> 24 == 0x0D
+                    && self.is_eeprom_addr(addr)
+                    && addr & 1 == 0
+                {
                     self.eeprom.as_mut().unwrap().write_bit(value as u16);
                 }
             }
@@ -1165,7 +1188,7 @@ impl Bus for MemMap {
                 }
             }
             0x08..=0x0D => {
-                if self.is_eeprom_addr(addr) {
+                if self.is_gpio(addr) || self.is_eeprom_addr(addr) {
                     return self.rd16_bytes(addr);
                 }
                 let idx = Self::rom_index(addr);
@@ -1231,7 +1254,7 @@ impl Bus for MemMap {
                 }
             }
             0x08..=0x0D => {
-                if self.is_eeprom_addr(addr) {
+                if self.is_gpio(addr) || self.is_eeprom_addr(addr) {
                     return self.rd32_halves(addr);
                 }
                 let idx = Self::rom_index(addr);

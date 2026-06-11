@@ -18,11 +18,13 @@ pub mod engine;
 pub mod gax;
 pub mod exec;
 pub mod hle;
+pub mod hostclock;
 pub mod machine;
 pub mod mem;
 pub mod mp2k;
 pub mod ppu;
 pub mod rdrv;
+pub mod rtc;
 pub mod shadow;
 
 pub use bus::Bus;

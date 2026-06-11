@@ -7,3 +7,12 @@ description = "GBA machine model: ARM7TDMI interpreter, memory map, hardware"
 
 [dependencies]
 armv4t = { path = "../armv4t" }
+
+# Host clock for the cartridge RTC, per platform. Unix uses libc's
+# localtime_r (glibc/musl/bionic/BSD — no distro assumptions); Windows uses
+# GetLocalTime. Both crates are already in the workspace lockfile.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_SystemInformation"] }
