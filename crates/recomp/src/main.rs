@@ -482,23 +482,48 @@ fn cmd_build(args: &[String]) -> Result<(), String> {
     let n_instrs: usize = analysis.blocks.iter().map(|b| b.instrs.len()).sum();
     println!("blocks: {} instructions: {n_instrs}", analysis.blocks.len());
 
-    let c = emit::emit_c(&analysis, &view);
     std::fs::create_dir_all("out").map_err(|e| e.to_string())?;
     let stem = Path::new(rom_path)
         .file_stem().and_then(|s| s.to_str()).unwrap_or("game").to_string();
-    let c_path = format!("out/{stem}.c");
     let lib_path = format!("out/{stem}.dylib");
-    std::fs::write(&c_path, c).map_err(|e| e.to_string())?;
-    println!("wrote {c_path}");
+
+    // Bounded translation units, compiled one at a time: full-image
+    // translations can exceed the source image a hundredfold, and a single
+    // huge unit makes cc balloon to many GB (parallel sweeps then exhaust
+    // the machine). 16 MB of C keeps each cc invocation modest.
+    const MAX_UNIT: usize = 16 << 20;
+    let mut objs: Vec<String> = Vec::new();
+    let chunks = emit::emit_c_chunked(&analysis, &view, MAX_UNIT, |c| {
+        let i = objs.len();
+        let c_path = format!("out/{stem}.{i}.c");
+        let o_path = format!("out/{stem}.{i}.o");
+        std::fs::write(&c_path, c).map_err(|e| e.to_string())?;
+        let status = std::process::Command::new("cc")
+            .args(["-O1", "-c", "-o", &o_path, &c_path])
+            .status()
+            .map_err(|e| format!("cc: {e}"))?;
+        let _ = std::fs::remove_file(&c_path);
+        if !status.success() {
+            return Err(format!("cc failed on {c_path}"));
+        }
+        objs.push(o_path);
+        Ok(())
+    })?;
 
     let status = std::process::Command::new("cc")
-        .args(["-O1", "-shared", "-o", &lib_path, &c_path])
+        .arg("-shared")
+        .arg("-o")
+        .arg(&lib_path)
+        .args(&objs)
         .status()
         .map_err(|e| format!("cc: {e}"))?;
-    if !status.success() {
-        return Err("cc failed".into());
+    for o in &objs {
+        let _ = std::fs::remove_file(o);
     }
-    println!("wrote {lib_path}");
+    if !status.success() {
+        return Err("link failed".into());
+    }
+    println!("wrote {lib_path} ({chunks} units)");
     Ok(())
 }
 

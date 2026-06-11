@@ -389,7 +389,7 @@ fn emit_block(out: &mut String, b: &Block, view: &crate::analyze::View) {
     let region = (b.addr >> 24) as usize & 0xF;
     let _ = writeln!(
         out,
-        "static uint32_t b_{:08x}_{}(const RtApi* a, void* m) {{\n    uint32_t* c = (uint32_t*)m;\n    uint32_t pc; (void)pc;",
+        "uint32_t b_{:08x}_{}(const RtApi* a, void* m) {{\n    uint32_t* c = (uint32_t*)m;\n    uint32_t pc; (void)pc;",
         b.addr,
         if b.thumb { "t" } else { "a" }
     );
@@ -551,15 +551,43 @@ fn emit_block(out: &mut String, b: &Block, view: &crate::analyze::View) {
     out.push_str("}\n\n");
 }
 
-pub fn emit_c(analysis: &Analysis, view: &crate::analyze::View) -> String {
+/// Emit translated C in translation units of at most ~`max_bytes` each,
+/// handing each finished unit to `sink`. Bounding the unit size bounds the
+/// system C compiler's memory: a full-image translation can exceed the
+/// source image by two orders of magnitude, and feeding that to cc as one
+/// unit makes its optimizer balloon. Block functions have external
+/// linkage; the final unit re-declares them and builds the lookup table.
+/// Returns the number of units emitted.
+pub fn emit_c_chunked(
+    analysis: &Analysis,
+    view: &crate::analyze::View,
+    max_bytes: usize,
+    mut sink: impl FnMut(&str) -> Result<(), String>,
+) -> Result<usize, String> {
+    let mut count = 0usize;
     let mut out = String::with_capacity(4 << 20);
     out.push_str(PREAMBLE);
     out.push('\n');
 
     for b in &analysis.blocks {
         emit_block(&mut out, b, view);
+        if out.len() >= max_bytes {
+            sink(&out)?;
+            count += 1;
+            out.clear();
+            out.push_str(PREAMBLE);
+            out.push('\n');
+        }
     }
 
+    for b in &analysis.blocks {
+        let _ = writeln!(
+            out,
+            "extern uint32_t b_{:08x}_{}(const RtApi* a, void* m);",
+            b.addr,
+            if b.thumb { "t" } else { "a" }
+        );
+    }
     out.push_str("const RcgBlock rcg_blocks[] = {\n");
     for b in &analysis.blocks {
         let _ = writeln!(
@@ -572,5 +600,6 @@ pub fn emit_c(analysis: &Analysis, view: &crate::analyze::View) -> String {
     }
     out.push_str("};\n");
     let _ = writeln!(out, "const uint64_t rcg_block_count = {};", analysis.blocks.len());
-    out
+    sink(&out)?;
+    Ok(count + 1)
 }
