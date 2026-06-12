@@ -230,7 +230,7 @@ dependencies = [
 
 [[package]]
 name = "armv4t"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "arrayref"
@@ -1427,7 +1427,7 @@ dependencies = [
 
 [[package]]
 name = "gba-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "armv4t",
  "libc",
@@ -1436,7 +1436,7 @@ dependencies = [
 
 [[package]]
 name = "gba-launcher"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "dirs",
  "eframe",
@@ -1450,7 +1450,7 @@ dependencies = [
 
 [[package]]
 name = "gba-pack"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde",
  "sha2",
@@ -1931,7 +1931,7 @@ dependencies = [
 
 [[package]]
 name = "input-config"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "instant"
@@ -2229,7 +2229,7 @@ dependencies = [
 
 [[package]]
 name = "menu"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "input-config",
  "screen",
@@ -3225,7 +3225,7 @@ dependencies = [
 
 [[package]]
 name = "recomp"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "armv4t",
  "cpal",
@@ -3388,7 +3388,7 @@ checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 
 [[package]]
 name = "screen"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "naga 26.0.0",
  "objc2 0.6.4",
