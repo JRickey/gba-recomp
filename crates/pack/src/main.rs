@@ -105,7 +105,11 @@ fn cmd_build(args: &[String]) -> Result<(), String> {
     let mut bios = None;
     let mut out_dir = std::path::PathBuf::from("pack-out");
     let mut recomp_flag = None;
-    let mut soak = 3600u64;
+    // A deeper default soak than a quick smoke test: the gate proves
+    // covered paths, so a shallow window (a single boot) lets deep-play
+    // code slip through. 7200 frames (~2 min of play) exercises menus
+    // and the first real gameplay; --soak raises it further.
+    let mut soak = 7200u64;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
