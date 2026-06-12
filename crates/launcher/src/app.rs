@@ -35,8 +35,12 @@ impl LauncherApp {
         let h = 56.0;
         let rect = Rect::from_min_size(ui.max_rect().min, Vec2::new(ui.max_rect().width(), h));
         theme::chrome_strip(ui.painter(), rect);
-        theme::wordmark(ui.painter(), Pos2::new(rect.left() + 18.0, rect.center().y - 6.0),
-            "GBA \u{25CF} RECOMP", 24.0);
+        theme::wordmark(
+            ui.painter(),
+            Pos2::new(rect.left() + 18.0, rect.center().y - 6.0),
+            "GBA \u{25CF} RECOMP",
+            24.0,
+        );
         ui.painter().text(
             Pos2::new(rect.left() + 20.0, rect.center().y + 15.0),
             Align2::LEFT_CENTER,
@@ -122,6 +126,7 @@ impl eframe::App for LauncherApp {
         }
 
         // gentle ambient animation
-        ui.ctx().request_repaint_after(std::time::Duration::from_millis(50));
+        ui.ctx()
+            .request_repaint_after(std::time::Duration::from_millis(50));
     }
 }

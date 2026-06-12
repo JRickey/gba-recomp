@@ -69,7 +69,12 @@ pub fn detect(rom: &[u8]) -> Vec<Mp2kSig> {
     let mut off = 0usize;
     while off + 20 <= rom.len() {
         let w = |i: usize| {
-            u32::from_le_bytes([rom[off + i], rom[off + i + 1], rom[off + i + 2], rom[off + i + 3]])
+            u32::from_le_bytes([
+                rom[off + i],
+                rom[off + i + 1],
+                rom[off + i + 2],
+                rom[off + i + 3],
+            ])
         };
         if w(0) == needle_lo && w(4) == needle_hi {
             let ptr = w(8);
@@ -80,7 +85,10 @@ pub fn detect(rom: &[u8]) -> Vec<Mp2kSig> {
                 && !found.iter().any(|f| f.sound_main_ram == ptr)
                 && found.len() < 4
             {
-                found.push(Mp2kSig { sound_main_off: off, sound_main_ram: ptr });
+                found.push(Mp2kSig {
+                    sound_main_off: off,
+                    sound_main_ram: ptr,
+                });
             }
         }
         off += 4;
@@ -121,7 +129,10 @@ fn detect_by_crc(rom: &[u8]) -> Option<Mp2kSig> {
         // modified driver — leave it alone.
         let region = ptr >> 24;
         if region == 0x03 || region == 0x02 {
-            return Some(Mp2kSig { sound_main_off: off, sound_main_ram: ptr });
+            return Some(Mp2kSig {
+                sound_main_off: off,
+                sound_main_ram: ptr,
+            });
         }
         return None;
     }
@@ -146,8 +157,9 @@ const RENDER_HZ: f64 = 65536.0;
 /// interpolation span and the reverb ring's frame granularity.
 const FRAME: usize = 1097;
 /// DPCM delta table (SDK gDeltaEncodingTable).
-const DPCM_LUT: [i8; 16] =
-    [0, 1, 4, 9, 16, 25, 36, 49, -64, -49, -36, -25, -16, -9, -4, -1];
+const DPCM_LUT: [i8; 16] = [
+    0, 1, 4, 9, 16, 25, 36, 49, -64, -49, -36, -25, -16, -9, -4, -1,
+];
 
 /// Read-only view of the guest memory regions sample data can live in.
 /// Side-effect free by construction — snapshotting and rendering must
@@ -176,7 +188,8 @@ impl<'a> MemView<'a> {
     }
 
     pub fn u32(&self, addr: u32) -> Option<u32> {
-        self.slice(addr, 4).map(|s| u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
+        self.slice(addr, 4)
+            .map(|s| u32::from_le_bytes([s[0], s[1], s[2], s[3]]))
     }
 }
 
@@ -522,7 +535,11 @@ impl Mp2kHle {
                 env_now
             } else if stopping {
                 let e = (env_now * release) >> 8;
-                if e <= echo_vol { echo_vol } else { e }
+                if e <= echo_vol {
+                    echo_vol
+                } else {
+                    e
+                }
             } else {
                 match phase {
                     3 => (env_now + attack).min(0xFF),
@@ -632,7 +649,10 @@ impl Mp2kHle {
         // (saturated) copy to both the reverb ring and the self-check,
         // or hot mixes inflate the level and shred the correlation
         // against a clipping canon.
-        let sat = (chk_r.clamp(-1.0, 127.0 / 128.0), chk_l.clamp(-1.0, 127.0 / 128.0));
+        let sat = (
+            chk_r.clamp(-1.0, 127.0 / 128.0),
+            chk_l.clamp(-1.0, 127.0 / 128.0),
+        );
         self.ring[self.ring_pos] = sat;
         self.ring_pos = (self.ring_pos + 1) % self.ring.len();
 
@@ -642,9 +662,9 @@ impl Mp2kHle {
         // match what the game's own mixer produced — revert loudly.
         let canon_rl = (canon[0] as f32 / 128.0, canon[1] as f32 / 128.0);
         match self.vf.judge(canon_rl, sat) {
-            crate::shadow::Judgement::Fail { structure_at_sane_level: true }
-                if !self.vf.proven =>
-            {
+            crate::shadow::Judgement::Fail {
+                structure_at_sane_level: true,
+            } if !self.vf.proven => {
                 // Structure failure at a sane level while probing:
                 // search the known behavior axis — note-on `count`
                 // semantics split driver revisions, and the
@@ -685,7 +705,9 @@ impl Mp2kHle {
 /// per-voice and per-note (the upstream v1.8.1 hardening lesson).
 /// Free function: the caller holds a split borrow of `voices[ch]`.
 fn note_on(v: &mut Voice, mem: &MemView, ctype: u8, count: u32, wav: u32, count_mode: u8) -> bool {
-    let Some(h) = mem.slice(wav, 16) else { return false };
+    let Some(h) = mem.slice(wav, 16) else {
+        return false;
+    };
     let hdr_type = u16::from_le_bytes([h[0], h[1]]);
     let flags = u16::from_le_bytes([h[2], h[3]]);
     let loop_start = u32::from_le_bytes([h[8], h[9], h[10], h[11]]);
@@ -720,7 +742,11 @@ fn note_on(v: &mut Voice, mem: &MemView, ctype: u8, count: u32, wav: u32, count_
     // voices mid-sample or silence one-shots. Mode 0 (default) starts
     // at 0; mode 1 honors the offset. The differential self-check
     // searches the axis per image and correlation picks the winner.
-    v.pos = if count_mode == 1 { count.min(size) as f64 } else { 0.0 };
+    v.pos = if count_mode == 1 {
+        count.min(size) as f64
+    } else {
+        0.0
+    };
     v.blk_idx = u32::MAX;
     true
 }
@@ -744,7 +770,11 @@ fn sample_voice(v: &mut Voice, mem: &MemView) -> f32 {
     let frac = (v.pos - i0 as f64) as f32;
     let s0 = fetch(v, mem, i0);
     let i1 = if i0 + 1 >= v.size {
-        if v.looped { v.loop_start } else { i0 }
+        if v.looped {
+            v.loop_start
+        } else {
+            i0
+        }
     } else {
         i0 + 1
     };
@@ -764,7 +794,9 @@ fn fetch(v: &mut Voice, mem: &MemView, idx: u32) -> f32 {
     // nibble, odd k the low — byte 1's high nibble is never read.
     let blk = idx >> 6;
     if blk != v.blk_idx {
-        let Some(b) = mem.slice(v.data + blk * 33, 33) else { return 0.0 };
+        let Some(b) = mem.slice(v.data + blk * 33, 33) else {
+            return 0.0;
+        };
         let mut cur = b[0] as i8;
         v.blk[0] = cur;
         for k in 1..64usize {
@@ -802,7 +834,7 @@ mod tests {
         iwram[s + 0x0B] = 7; // pcmDmaPeriod
         iwram[s + 0x10..s + 0x14].copy_from_slice(&224u32.to_le_bytes()); // spv
         iwram[s + 0x14..s + 0x18].copy_from_slice(&13379u32.to_le_bytes()); // pcmFreq
-        // Channel 0: START, full right volume, half left, instant attack.
+                                                                            // Channel 0: START, full right volume, half left, instant attack.
         let c = s + 0x50;
         iwram[c] = 0x80;
         iwram[c + 0x02] = 255; // rightVolume
@@ -827,8 +859,15 @@ mod tests {
     fn frame_hook_mirrors_envelope_and_arms_voice() {
         let (iwram, rom, _) = synth_guest();
         let ewram = vec![0u8; 0x4_0000];
-        let mem = MemView { rom: &rom, ewram: &ewram, iwram: &iwram };
-        let mut h = Mp2kHle::new(&[Mp2kSig { sound_main_off: 0, sound_main_ram: 0x0300_2001 }]);
+        let mem = MemView {
+            rom: &rom,
+            ewram: &ewram,
+            iwram: &iwram,
+        };
+        let mut h = Mp2kHle::new(&[Mp2kSig {
+            sound_main_off: 0,
+            sound_main_ram: 0x0300_2001,
+        }]);
         h.frame_hook(&mem, 256 * 2000, 0x0300_2001);
         assert!(h.engaged);
         let v = &h.voices[0];
@@ -857,8 +896,15 @@ mod tests {
         // Parked ident ('Smsh' idle, not the +1 live value).
         iwram[s..s + 4].copy_from_slice(&0x6873_6D53u32.to_le_bytes());
         let ewram = vec![0u8; 0x4_0000];
-        let mem = MemView { rom: &rom, ewram: &ewram, iwram: &iwram };
-        let mut h = Mp2kHle::new(&[Mp2kSig { sound_main_off: 0, sound_main_ram: 0x0300_2001 }]);
+        let mem = MemView {
+            rom: &rom,
+            ewram: &ewram,
+            iwram: &iwram,
+        };
+        let mut h = Mp2kHle::new(&[Mp2kSig {
+            sound_main_off: 0,
+            sound_main_ram: 0x0300_2001,
+        }]);
         h.frame_hook(&mem, 256 * 2000, 0x0300_2001);
         assert!(!h.engaged);
         assert_eq!(h.stale_ticks, 1);
@@ -869,11 +915,17 @@ mod tests {
         let (mut iwram, rom, si) = synth_guest();
         let s = (si & 0x7FFF) as usize;
         // Wave pointer into unmapped space.
-        iwram[s + 0x50 + 0x24..s + 0x50 + 0x28]
-            .copy_from_slice(&0x0500_0000u32.to_le_bytes());
+        iwram[s + 0x50 + 0x24..s + 0x50 + 0x28].copy_from_slice(&0x0500_0000u32.to_le_bytes());
         let ewram = vec![0u8; 0x4_0000];
-        let mem = MemView { rom: &rom, ewram: &ewram, iwram: &iwram };
-        let mut h = Mp2kHle::new(&[Mp2kSig { sound_main_off: 0, sound_main_ram: 0x0300_2001 }]);
+        let mem = MemView {
+            rom: &rom,
+            ewram: &ewram,
+            iwram: &iwram,
+        };
+        let mut h = Mp2kHle::new(&[Mp2kSig {
+            sound_main_off: 0,
+            sound_main_ram: 0x0300_2001,
+        }]);
         h.frame_hook(&mem, 256 * 2000, 0x0300_2001);
         assert!(!h.voices[0].on);
         assert_eq!(h.bad_waves, 1);
@@ -887,7 +939,11 @@ mod tests {
         for (i, b) in rom.iter_mut().enumerate() {
             *b = i as u8; // ramp 0..,  values < 128 stay positive
         }
-        let mem = MemView { rom: &rom, ewram: &ewram, iwram: &iwram };
+        let mem = MemView {
+            rom: &rom,
+            ewram: &ewram,
+            iwram: &iwram,
+        };
         let mut v = Voice {
             on: true,
             data: 0x0800_0000,
@@ -925,7 +981,11 @@ mod tests {
         rom[0] = 10;
         rom[1] = 0xFF; // high nibble must be IGNORED (SDK never reads it)
         rom[2] = 0x12; // sample2 += LUT[1]=1, sample3 += LUT[2]=4
-        let mem = MemView { rom: &rom, ewram: &ewram, iwram: &iwram };
+        let mem = MemView {
+            rom: &rom,
+            ewram: &ewram,
+            iwram: &iwram,
+        };
         let mut v = Voice {
             on: true,
             data: 0x0800_0000,
@@ -945,7 +1005,9 @@ mod tests {
         // Plant a 48-byte window whose CRC we compute ourselves, then
         // verify the scanner finds it and reads the pointer at +0x74.
         let mut rom = vec![0u8; 0x1000];
-        let body: Vec<u8> = (0..SIG_LEN as u8).map(|i| i.wrapping_mul(37) ^ 0x5A).collect();
+        let body: Vec<u8> = (0..SIG_LEN as u8)
+            .map(|i| i.wrapping_mul(37) ^ 0x5A)
+            .collect();
         rom[0x200..0x200 + SIG_LEN].copy_from_slice(&body);
         rom[0x200 + SOUND_MAIN_RAM_PTR_OFF..0x200 + SOUND_MAIN_RAM_PTR_OFF + 4]
             .copy_from_slice(&0x0300_2C01u32.to_le_bytes());
@@ -958,8 +1020,12 @@ mod tests {
         for off in (0..rom.len() - SIG_LEN - 4).step_by(2) {
             if crc32(&rom[off..off + SIG_LEN]) == crc && off == 0x200 {
                 let p = off + SOUND_MAIN_RAM_PTR_OFF;
-                found =
-                    Some(u32::from_le_bytes([rom[p], rom[p + 1], rom[p + 2], rom[p + 3]]));
+                found = Some(u32::from_le_bytes([
+                    rom[p],
+                    rom[p + 1],
+                    rom[p + 2],
+                    rom[p + 3],
+                ]));
                 break;
             }
         }

@@ -62,7 +62,9 @@ impl Default for DecodeCache {
             raw: 0,
             instr: decode_arm(0, 0),
         };
-        DecodeCache { entries: vec![empty; CACHE_SLOTS].into_boxed_slice() }
+        DecodeCache {
+            entries: vec![empty; CACHE_SLOTS].into_boxed_slice(),
+        }
     }
 }
 
@@ -75,7 +77,11 @@ impl DecodeCache {
             return e.instr;
         }
         let instr = decode_thumb(raw, addr);
-        *e = CacheEntry { key, raw: raw as u32, instr };
+        *e = CacheEntry {
+            key,
+            raw: raw as u32,
+            instr,
+        };
         instr
     }
 
@@ -86,7 +92,11 @@ impl DecodeCache {
             return e.instr;
         }
         let instr = decode_arm(raw, addr);
-        *e = CacheEntry { key: addr, raw, instr };
+        *e = CacheEntry {
+            key: addr,
+            raw,
+            instr,
+        };
         instr
     }
 }
@@ -193,7 +203,14 @@ fn write_reg(cpu: &mut Cpu, r: u8, value: u32) {
 fn exec<B: Bus>(cpu: &mut Cpu, bus: &mut B, instr: &Instr) {
     match instr.op {
         Op::Alu { op, s, rd, rn, op2 } => exec_alu(cpu, instr, op, s, rd, rn, op2),
-        Op::Mul { acc, s, rd, rn, rs, rm } => {
+        Op::Mul {
+            acc,
+            s,
+            rd,
+            rn,
+            rs,
+            rm,
+        } => {
             let mut result = cpu.regs[rm as usize].wrapping_mul(cpu.regs[rs as usize]);
             if acc {
                 result = result.wrapping_add(cpu.regs[rn as usize]);
@@ -205,7 +222,15 @@ fn exec<B: Bus>(cpu: &mut Cpu, bus: &mut B, instr: &Instr) {
                 cpu.set_flag(FLAG_Z, result == 0);
             }
         }
-        Op::MulLong { signed, acc, s, rd_hi, rd_lo, rs, rm } => {
+        Op::MulLong {
+            signed,
+            acc,
+            s,
+            rd_hi,
+            rd_lo,
+            rs,
+            rm,
+        } => {
             let a = cpu.regs[rm as usize];
             let b = cpu.regs[rs as usize];
             let mut result = if signed {
@@ -257,20 +282,38 @@ fn exec<B: Bus>(cpu: &mut Cpu, bus: &mut B, instr: &Instr) {
             cpu.regs[LR as usize] = instr.addr.wrapping_add(2) | 1;
             cpu.branch = Some(target);
         }
-        Op::Mem { load, width, signed, rd, rn, offset, pre, up, writeback } => {
-            exec_mem(cpu, bus, instr, load, width, signed, rd, rn, offset, pre, up, writeback)
-        }
-        Op::BlockMem { load, rn, rlist, pre, up, s_bit, writeback } => {
-            exec_block(cpu, bus, instr, load, rn, rlist, pre, up, s_bit, writeback)
-        }
+        Op::Mem {
+            load,
+            width,
+            signed,
+            rd,
+            rn,
+            offset,
+            pre,
+            up,
+            writeback,
+        } => exec_mem(
+            cpu, bus, instr, load, width, signed, rd, rn, offset, pre, up, writeback,
+        ),
+        Op::BlockMem {
+            load,
+            rn,
+            rlist,
+            pre,
+            up,
+            s_bit,
+            writeback,
+        } => exec_block(cpu, bus, instr, load, rn, rlist, pre, up, s_bit, writeback),
         Op::Mrs { spsr, rd } => {
             let value = if spsr { cpu.spsr() } else { cpu.cpsr };
             write_reg(cpu, rd, value);
         }
-        Op::MsrReg { spsr, fields, rm } => {
-            exec_msr(cpu, spsr, fields, read_reg(cpu, instr, rm, 0))
-        }
-        Op::MsrImm { spsr, fields, value } => exec_msr(cpu, spsr, fields, value),
+        Op::MsrReg { spsr, fields, rm } => exec_msr(cpu, spsr, fields, read_reg(cpu, instr, rm, 0)),
+        Op::MsrImm {
+            spsr,
+            fields,
+            value,
+        } => exec_msr(cpu, spsr, fields, value),
         Op::Swi { .. } => {
             cpu.enter_exception(Exception::Swi, instr.addr.wrapping_add(instr.size()));
         }
@@ -285,7 +328,11 @@ fn eval_op2(cpu: &Cpu, instr: &Instr, op2: Operand2) -> (u32, bool) {
     let c_in = cpu.flag(FLAG_C);
     match op2 {
         Operand2::Imm { value, ror } => {
-            let carry = if ror != 0 { value & (1 << 31) != 0 } else { c_in };
+            let carry = if ror != 0 {
+                value & (1 << 31) != 0
+            } else {
+                c_in
+            };
             (value, carry)
         }
         Operand2::Reg { rm, shift } => match shift {
@@ -326,7 +373,10 @@ fn shift_imm(value: u32, kind: ShiftKind, amount: u8, c_in: bool) -> (u32, bool)
                 let sign = value & (1 << 31) != 0;
                 (if sign { 0xFFFF_FFFF } else { 0 }, sign)
             } else {
-                ((value as i32 >> amount) as u32, value & (1 << (amount - 1)) != 0)
+                (
+                    (value as i32 >> amount) as u32,
+                    value & (1 << (amount - 1)) != 0,
+                )
             }
         }
         ShiftKind::Ror => {
@@ -335,7 +385,10 @@ fn shift_imm(value: u32, kind: ShiftKind, amount: u8, c_in: bool) -> (u32, bool)
                 let out = ((c_in as u32) << 31) | (value >> 1);
                 (out, value & 1 != 0)
             } else {
-                (value.rotate_right(amount as u32), value & (1 << (amount - 1)) != 0)
+                (
+                    value.rotate_right(amount as u32),
+                    value & (1 << (amount - 1)) != 0,
+                )
             }
         }
     }
@@ -359,7 +412,10 @@ fn shift_reg(value: u32, kind: ShiftKind, amount: u32, c_in: bool) -> (u32, bool
             _ => (0, false),
         },
         ShiftKind::Asr => match amount {
-            1..=31 => ((value as i32 >> amount) as u32, value & (1 << (amount - 1)) != 0),
+            1..=31 => (
+                (value as i32 >> amount) as u32,
+                value & (1 << (amount - 1)) != 0,
+            ),
             _ => {
                 let sign = value & (1 << 31) != 0;
                 (if sign { 0xFFFF_FFFF } else { 0 }, sign)
@@ -378,14 +434,28 @@ fn shift_reg(value: u32, kind: ShiftKind, amount: u32, c_in: bool) -> (u32, bool
 
 fn exec_alu(cpu: &mut Cpu, instr: &Instr, op: AluOp, s: bool, rd: u8, rn: u8, op2: Operand2) {
     // With a register-specified shift, *all* PC operand reads see +12.
-    let pc_extra = if matches!(op2, Operand2::Reg { shift: Shift::Reg { .. }, .. }) { 4 } else { 0 };
+    let pc_extra = if matches!(
+        op2,
+        Operand2::Reg {
+            shift: Shift::Reg { .. },
+            ..
+        }
+    ) {
+        4
+    } else {
+        0
+    };
     let (b, shifter_c) = eval_op2(cpu, instr, op2);
     let a = read_reg(cpu, instr, rn, pc_extra);
     let c_in = cpu.flag(FLAG_C) as u32;
 
     enum Out {
         Logic(u32),
-        Arith { result: u32, carry: bool, overflow: bool },
+        Arith {
+            result: u32,
+            carry: bool,
+            overflow: bool,
+        },
     }
     use Out::*;
 
@@ -435,7 +505,9 @@ fn exec_alu(cpu: &mut Cpu, instr: &Instr, op: AluOp, s: bool, rd: u8, rn: u8, op
             cpu.set_flag(FLAG_Z, result == 0);
             match out {
                 Logic(_) => cpu.set_flag(FLAG_C, shifter_c),
-                Arith { carry, overflow, .. } => {
+                Arith {
+                    carry, overflow, ..
+                } => {
                     cpu.set_flag(FLAG_C, carry);
                     cpu.set_flag(FLAG_V, overflow);
                 }
@@ -478,7 +550,11 @@ fn exec_mem<B: Bus>(
             Shift::Reg { .. } => unreachable!("reg-shifted mem offset"),
         },
     };
-    let offset_base = if up { base.wrapping_add(off) } else { base.wrapping_sub(off) };
+    let offset_base = if up {
+        base.wrapping_add(off)
+    } else {
+        base.wrapping_sub(off)
+    };
     let addr = if pre { offset_base } else { base };
     // Post-indexed transfers always write back; pre-indexed only with W.
     let do_writeback = !pre || writeback;
@@ -486,9 +562,7 @@ fn exec_mem<B: Bus>(
     if load {
         let value = match (width, signed) {
             (MemWidth::Word, _) => bus.read32(addr & !3).rotate_right((addr & 3) * 8),
-            (MemWidth::Half, false) => {
-                (bus.read16(addr & !1) as u32).rotate_right((addr & 1) * 8)
-            }
+            (MemWidth::Half, false) => (bus.read16(addr & !1) as u32).rotate_right((addr & 1) * 8),
             (MemWidth::Half, true) => {
                 // LDRSH at an odd address degrades to LDRSB.
                 if addr & 1 != 0 {
@@ -546,9 +620,12 @@ fn exec_block<B: Bus>(
     // Lowest address transferred, and the final base value. Registers are
     // always transferred lowest-register-at-lowest-address.
     let (mut addr, wb_val) = match (up, pre) {
-        (true, false) => (base, base.wrapping_add(total)),  // IA
+        (true, false) => (base, base.wrapping_add(total)), // IA
         (true, true) => (base.wrapping_add(4), base.wrapping_add(total)), // IB
-        (false, false) => (base.wrapping_sub(total).wrapping_add(4), base.wrapping_sub(total)), // DA
+        (false, false) => (
+            base.wrapping_sub(total).wrapping_add(4),
+            base.wrapping_sub(total),
+        ), // DA
         (false, true) => (base.wrapping_sub(total), base.wrapping_sub(total)), // DB
     };
 
@@ -591,7 +668,11 @@ fn exec_block<B: Bus>(
             } else if r == rn {
                 // Storing the base: old value if rn is the first register
                 // in the list, written-back value otherwise.
-                if r == lowest { base } else { wb_val }
+                if r == lowest {
+                    base
+                } else {
+                    wb_val
+                }
             } else if user_bank {
                 cpu.user_reg(r)
             } else {
@@ -647,7 +728,9 @@ mod tests {
 
     impl FlatBus {
         fn new() -> FlatBus {
-            FlatBus { ram: vec![0; 0x10000] }
+            FlatBus {
+                ram: vec![0; 0x10000],
+            }
         }
     }
 
@@ -733,7 +816,12 @@ mod tests {
         // mov r0, #1; mov r1, #2; stmdb sp!, {r0, r1}; mov r0, #0; mov r1, #0;
         // ldmia sp!, {r0, r1}
         let (cpu, _) = run_arm(&[
-            0xE3A0_0001, 0xE3A0_1002, 0xE92D_0003, 0xE3A0_0000, 0xE3A0_1000, 0xE8BD_0003,
+            0xE3A0_0001,
+            0xE3A0_1002,
+            0xE92D_0003,
+            0xE3A0_0000,
+            0xE3A0_1000,
+            0xE8BD_0003,
         ]);
         assert_eq!(cpu.regs[0], 1);
         assert_eq!(cpu.regs[1], 2);
@@ -764,7 +852,10 @@ mod tests {
         let mut cpu = Cpu::new();
         cpu.regs[15] = 0;
         let mut bus = FlatBus::new();
-        for (i, w) in [0xE3A0_0E10u32, 0xE380_0001, 0xE12F_FF10].iter().enumerate() {
+        for (i, w) in [0xE3A0_0E10u32, 0xE380_0001, 0xE12F_FF10]
+            .iter()
+            .enumerate()
+        {
             bus.ram[i * 4..i * 4 + 4].copy_from_slice(&w.to_le_bytes());
         }
         // At 0x100 (thumb): bx lr equivalent... use: mov r0, #7 (0x2007), then bx r2.
@@ -806,7 +897,11 @@ mod tests {
         // mov r0, #0xD2 (IRQ|I|F); msr cpsr_c, r0; mov sp, #0x40
         // then back to system: mov r0, #0xDF; msr cpsr_c, r0
         let (cpu, _) = run_arm(&[
-            0xE3A0_00D2, 0xE129_F000, 0xE3A0_D040, 0xE3A0_00DF, 0xE129_F000,
+            0xE3A0_00D2,
+            0xE129_F000,
+            0xE3A0_D040,
+            0xE3A0_00DF,
+            0xE129_F000,
         ]);
         assert_eq!(cpu.regs[13], 0x8000); // back to system sp
         assert_eq!(cpu.mode(), crate::cpu::Mode::Sys);

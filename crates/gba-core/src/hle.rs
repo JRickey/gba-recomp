@@ -273,7 +273,11 @@ fn lz77_uncomp<B: Bus>(cpu: &mut Cpu, bus: &mut B) {
                     if out.len() >= size {
                         break;
                     }
-                    let v = if disp <= out.len() { out[out.len() - disp] } else { 0 };
+                    let v = if disp <= out.len() {
+                        out[out.len() - disp]
+                    } else {
+                        0
+                    };
                     out.push(v);
                 }
             }
@@ -413,7 +417,11 @@ fn cpu_set<B: Bus>(cpu: &mut Cpu, bus: &mut B) -> bool {
         let dst = dst & !3;
         let fill_val = if fill { bus.read32(src) } else { 0 };
         for i in 0..count {
-            let v = if fill { fill_val } else { bus.read32(src + i * 4) };
+            let v = if fill {
+                fill_val
+            } else {
+                bus.read32(src + i * 4)
+            };
             bus.write32(dst + i * 4, v);
         }
     } else {
@@ -421,7 +429,11 @@ fn cpu_set<B: Bus>(cpu: &mut Cpu, bus: &mut B) -> bool {
         let dst = dst & !1;
         let fill_val = if fill { bus.read16(src) } else { 0 };
         for i in 0..count {
-            let v = if fill { fill_val } else { bus.read16(src + i * 2) };
+            let v = if fill {
+                fill_val
+            } else {
+                bus.read16(src + i * 2)
+            };
             bus.write16(dst + i * 2, v);
         }
     }
@@ -438,7 +450,11 @@ fn cpu_fast_set<B: Bus>(cpu: &mut Cpu, bus: &mut B) -> bool {
 
     let fill_val = if fill { bus.read32(src) } else { 0 };
     for i in 0..count {
-        let v = if fill { fill_val } else { bus.read32(src + i * 4) };
+        let v = if fill {
+            fill_val
+        } else {
+            bus.read32(src + i * 4)
+        };
         bus.write32(dst + i * 4, v);
     }
     true

@@ -244,8 +244,7 @@ impl Cpu {
             Exception::Irq => Mode::Irq,
         };
         let old_cpsr = self.cpsr;
-        let new_cpsr =
-            (self.cpsr & !0x1F & !FLAG_T) | target_mode as u32 | FLAG_I;
+        let new_cpsr = (self.cpsr & !0x1F & !FLAG_T) | target_mode as u32 | FLAG_I;
         self.set_cpsr(new_cpsr);
         self.spsr[target_mode.bank()] = old_cpsr;
         self.regs[14] = return_addr;

@@ -133,7 +133,10 @@ pub struct Output {
 
 impl Default for Output {
     fn default() -> Self {
-        Output { binary: true, c_source: false }
+        Output {
+            binary: true,
+            c_source: false,
+        }
     }
 }
 
@@ -153,8 +156,7 @@ impl PackConfig {
     /// Parse and validate. Path-relative fields resolve against the
     /// config file's directory.
     pub fn load(path: &Path) -> Result<PackConfig, String> {
-        let text =
-            std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
         let mut cfg: PackConfig =
             toml::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
         if cfg.package.name.is_empty() {
@@ -188,13 +190,9 @@ impl PackConfig {
             }
             // Validate it's actually a PNG by magic — a mislabeled JPEG or
             // a .ico would silently break the per-platform conversion later.
-            let head = std::fs::read(&*icon)
-                .map_err(|e| format!("{}: {e}", icon.display()))?;
+            let head = std::fs::read(&*icon).map_err(|e| format!("{}: {e}", icon.display()))?;
             if !head.starts_with(&[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]) {
-                return Err(format!(
-                    "package.icon must be a PNG: {}",
-                    icon.display()
-                ));
+                return Err(format!("package.icon must be a PNG: {}", icon.display()));
             }
         }
         Ok(cfg)
@@ -219,7 +217,11 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         // 8-byte PNG signature is all the loader checks; the rest is
         // exercised at build time by the real encoder/decoder.
-        std::fs::write(dir.join(name), [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]).unwrap();
+        std::fs::write(
+            dir.join(name),
+            [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a],
+        )
+        .unwrap();
         name.to_string()
     }
 
@@ -255,7 +257,10 @@ mod tests {
         );
         let c = PackConfig::load(&ok).unwrap();
         let icon = c.package.icon.unwrap();
-        assert!(icon.is_absolute(), "relative icon should resolve against config dir");
+        assert!(
+            icon.is_absolute(),
+            "relative icon should resolve against config dir"
+        );
         assert!(icon.is_file());
 
         // Missing file is rejected.
@@ -343,7 +348,10 @@ c-source = true
             ),
         );
         let c = PackConfig::load(&p).unwrap();
-        assert_eq!(c.package.platforms, vec![Platform::Linux, Platform::Windows]);
+        assert_eq!(
+            c.package.platforms,
+            vec![Platform::Linux, Platform::Windows]
+        );
         assert_eq!(c.runtime.engine_hle, EngineHle::Gax);
         assert!(!c.runtime.menu);
         assert!(c.output.c_source);

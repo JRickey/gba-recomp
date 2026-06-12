@@ -10,8 +10,8 @@ use crate::*;
 use std::fmt::Write as _;
 
 const REG_NAMES: [&str; 16] = [
-    "r0", "r1", "r2", "r3", "r4", "r5", "r6", "r7",
-    "r8", "r9", "r10", "r11", "r12", "sp", "lr", "pc",
+    "r0", "r1", "r2", "r3", "r4", "r5", "r6", "r7", "r8", "r9", "r10", "r11", "r12", "sp", "lr",
+    "pc",
 ];
 
 fn reg(r: Reg) -> &'static str {
@@ -20,17 +20,35 @@ fn reg(r: Reg) -> &'static str {
 
 fn cond_suffix(c: Cond) -> &'static str {
     match c {
-        Cond::Eq => "eq", Cond::Ne => "ne", Cond::Cs => "cs", Cond::Cc => "cc",
-        Cond::Mi => "mi", Cond::Pl => "pl", Cond::Vs => "vs", Cond::Vc => "vc",
-        Cond::Hi => "hi", Cond::Ls => "ls", Cond::Ge => "ge", Cond::Lt => "lt",
-        Cond::Gt => "gt", Cond::Le => "le", Cond::Al => "", Cond::Nv => "nv",
+        Cond::Eq => "eq",
+        Cond::Ne => "ne",
+        Cond::Cs => "cs",
+        Cond::Cc => "cc",
+        Cond::Mi => "mi",
+        Cond::Pl => "pl",
+        Cond::Vs => "vs",
+        Cond::Vc => "vc",
+        Cond::Hi => "hi",
+        Cond::Ls => "ls",
+        Cond::Ge => "ge",
+        Cond::Lt => "lt",
+        Cond::Gt => "gt",
+        Cond::Le => "le",
+        Cond::Al => "",
+        Cond::Nv => "nv",
     }
 }
 
 fn shift_str(shift: Shift) -> String {
     match shift {
-        Shift::Imm { kind: ShiftKind::Lsl, amount: 0 } => String::new(),
-        Shift::Imm { kind: ShiftKind::Ror, amount: 0 } => ", rrx".into(),
+        Shift::Imm {
+            kind: ShiftKind::Lsl,
+            amount: 0,
+        } => String::new(),
+        Shift::Imm {
+            kind: ShiftKind::Ror,
+            amount: 0,
+        } => ", rrx".into(),
         Shift::Imm { kind, amount } => {
             // lsr/asr #0 encode shifts by 32.
             let amount = if amount == 0 { 32 } else { amount as u32 };
@@ -95,18 +113,44 @@ impl Instr {
                 } else if op.is_unary() {
                     format!("{mnem}{c}{s_suffix} {}, {}", reg(rd), op2_str(op2))
                 } else {
-                    format!("{mnem}{c}{s_suffix} {}, {}, {}", reg(rd), reg(rn), op2_str(op2))
+                    format!(
+                        "{mnem}{c}{s_suffix} {}, {}, {}",
+                        reg(rd),
+                        reg(rn),
+                        op2_str(op2)
+                    )
                 }
             }
-            Op::Mul { acc, s, rd, rn, rs, rm } => {
+            Op::Mul {
+                acc,
+                s,
+                rd,
+                rn,
+                rs,
+                rm,
+            } => {
                 let s_suffix = if s { "s" } else { "" };
                 if acc {
-                    format!("mla{c}{s_suffix} {}, {}, {}, {}", reg(rd), reg(rm), reg(rs), reg(rn))
+                    format!(
+                        "mla{c}{s_suffix} {}, {}, {}, {}",
+                        reg(rd),
+                        reg(rm),
+                        reg(rs),
+                        reg(rn)
+                    )
                 } else {
                     format!("mul{c}{s_suffix} {}, {}, {}", reg(rd), reg(rm), reg(rs))
                 }
             }
-            Op::MulLong { signed, acc, s, rd_hi, rd_lo, rs, rm } => {
+            Op::MulLong {
+                signed,
+                acc,
+                s,
+                rd_hi,
+                rd_lo,
+                rs,
+                rm,
+            } => {
                 let mnem = match (signed, acc) {
                     (false, false) => "umull",
                     (false, true) => "umlal",
@@ -114,7 +158,13 @@ impl Instr {
                     (true, true) => "smlal",
                 };
                 let s_suffix = if s { "s" } else { "" };
-                format!("{mnem}{c}{s_suffix} {}, {}, {}, {}", reg(rd_lo), reg(rd_hi), reg(rm), reg(rs))
+                format!(
+                    "{mnem}{c}{s_suffix} {}, {}, {}, {}",
+                    reg(rd_lo),
+                    reg(rd_hi),
+                    reg(rm),
+                    reg(rs)
+                )
             }
             Op::Swap { byte, rd, rm, rn } => {
                 let b = if byte { "b" } else { "" };
@@ -127,7 +177,17 @@ impl Instr {
             }
             Op::ThumbBlHigh { lr_partial } => format!("bl.hi lr=0x{lr_partial:08x}"),
             Op::ThumbBlLow { off } => format!("bl.lo off=0x{off:x}"),
-            Op::Mem { load, width, signed, rd, rn, offset, pre, up, writeback } => {
+            Op::Mem {
+                load,
+                width,
+                signed,
+                rd,
+                rn,
+                offset,
+                pre,
+                up,
+                writeback,
+            } => {
                 let mnem = match (load, width, signed) {
                     (true, MemWidth::Word, _) => "ldr",
                     (true, MemWidth::Half, false) => "ldrh",
@@ -159,7 +219,15 @@ impl Instr {
                 }
                 out
             }
-            Op::BlockMem { load, rn, rlist, pre, up, s_bit, writeback } => {
+            Op::BlockMem {
+                load,
+                rn,
+                rlist,
+                pre,
+                up,
+                s_bit,
+                writeback,
+            } => {
                 let mnem = if load { "ldm" } else { "stm" };
                 let mode = match (pre, up) {
                     (false, true) => "ia",
@@ -169,7 +237,11 @@ impl Instr {
                 };
                 let wb = if writeback { "!" } else { "" };
                 let user = if s_bit { "^" } else { "" };
-                format!("{mnem}{mode}{c} {}{wb}, {}{user}", reg(rn), rlist_str(rlist))
+                format!(
+                    "{mnem}{mode}{c} {}{wb}, {}{user}",
+                    reg(rn),
+                    rlist_str(rlist)
+                )
             }
             Op::Mrs { spsr, rd } => {
                 format!("mrs{c} {}, {}", reg(rd), if spsr { "spsr" } else { "cpsr" })
@@ -177,7 +249,11 @@ impl Instr {
             Op::MsrReg { spsr, fields, rm } => {
                 format!("msr{c} {}, {}", psr_str(spsr, fields), reg(rm))
             }
-            Op::MsrImm { spsr, fields, value } => {
+            Op::MsrImm {
+                spsr,
+                fields,
+                value,
+            } => {
                 format!("msr{c} {}, #0x{value:x}", psr_str(spsr, fields))
             }
             Op::Swi { imm } => format!("swi{c} 0x{imm:x}"),
@@ -206,7 +282,11 @@ mod tests {
             (0xE1A0_1102, "mov r1, r2, lsl #2"),
         ];
         for &(word, expected) in cases {
-            assert_eq!(decode_arm(word, 0x0800_0000).disasm(), expected, "word {word:08X}");
+            assert_eq!(
+                decode_arm(word, 0x0800_0000).disasm(),
+                expected,
+                "word {word:08X}"
+            );
         }
     }
 
@@ -223,7 +303,11 @@ mod tests {
             (0x4904, "ldr r1, [pc, #0x10] ; =[0x08000014]"),
         ];
         for &(half, expected) in cases {
-            assert_eq!(decode_thumb(half, 0x0800_0000).disasm(), expected, "half {half:04X}");
+            assert_eq!(
+                decode_thumb(half, 0x0800_0000).disasm(),
+                expected,
+                "half {half:04X}"
+            );
         }
     }
 }

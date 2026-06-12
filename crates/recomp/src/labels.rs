@@ -87,7 +87,10 @@ pub const IWRAM_LEN: usize = 0x8000;
 
 impl Blob {
     pub fn new() -> Blob {
-        Blob { img: vec![0; IWRAM_LEN], mask: vec![0; IWRAM_LEN] }
+        Blob {
+            img: vec![0; IWRAM_LEN],
+            mask: vec![0; IWRAM_LEN],
+        }
     }
 
     pub fn load(path: &std::path::Path) -> Option<Blob> {
@@ -96,7 +99,10 @@ impl Blob {
         if body.len() != 2 * IWRAM_LEN {
             return None;
         }
-        Some(Blob { img: body[..IWRAM_LEN].to_vec(), mask: body[IWRAM_LEN..].to_vec() })
+        Some(Blob {
+            img: body[..IWRAM_LEN].to_vec(),
+            mask: body[IWRAM_LEN..].to_vec(),
+        })
     }
 
     pub fn save(&self, path: &std::path::Path) -> Result<(), String> {
@@ -150,7 +156,11 @@ impl Labels {
     ) -> Result<Labels, String> {
         let mut lines = text.lines();
         lines.next(); // the validated magic line
-        match lines.next().map(str::trim).and_then(|l| l.strip_prefix("rom-sha256 ")) {
+        match lines
+            .next()
+            .map(str::trim)
+            .and_then(|l| l.strip_prefix("rom-sha256 "))
+        {
             Some(s) if s == sha => {}
             Some(s) => {
                 return Err(format!(
@@ -207,7 +217,10 @@ impl Labels {
         rom_len: usize,
     ) -> Result<Labels, String> {
         let doc: toml::Value = text.parse().map_err(|e| {
-            format!("{}: not a gba-labels file (no v1 magic; TOML: {e})", path.display())
+            format!(
+                "{}: not a gba-labels file (no v1 magic; TOML: {e})",
+                path.display()
+            )
         })?;
         let t = doc
             .as_table()
@@ -238,14 +251,20 @@ impl Labels {
         }
         let mut out = Labels::default();
         let empty = Vec::new();
-        let fns = t.get("functions").and_then(toml::Value::as_array).unwrap_or(&empty);
+        let fns = t
+            .get("functions")
+            .and_then(toml::Value::as_array)
+            .unwrap_or(&empty);
         for f in fns {
             let addr = f.get("address").and_then(addr_value);
-            let thumb = f.get("mode").and_then(toml::Value::as_str).and_then(|m| match m {
-                "arm" | "a" => Some(0u32),
-                "thumb" | "t" => Some(1),
-                _ => None,
-            });
+            let thumb = f
+                .get("mode")
+                .and_then(toml::Value::as_str)
+                .and_then(|m| match m {
+                    "arm" | "a" => Some(0u32),
+                    "thumb" | "t" => Some(1),
+                    _ => None,
+                });
             let (Some(addr), Some(thumb)) = (addr, thumb) else {
                 out.skipped += 1;
                 continue;
@@ -268,8 +287,10 @@ impl Labels {
                     // Reserved records keep their v1 spelling so the
                     // accumulator round-trips them; enrichment fields
                     // are dropped with the rest of ewram support.
-                    out.reserved
-                        .push(format!("ewram {addr:08x} {}", if thumb != 0 { "t" } else { "a" }));
+                    out.reserved.push(format!(
+                        "ewram {addr:08x} {}",
+                        if thumb != 0 { "t" } else { "a" }
+                    ));
                     continue;
                 }
                 _ => false,
@@ -318,10 +339,20 @@ impl Labels {
         let _ = writeln!(s, "gba-labels v1");
         let _ = writeln!(s, "rom-sha256 {sha}");
         for &key in &self.rom {
-            let _ = writeln!(s, "rom {:08x} {}", key & !1, if key & 1 != 0 { "t" } else { "a" });
+            let _ = writeln!(
+                s,
+                "rom {:08x} {}",
+                key & !1,
+                if key & 1 != 0 { "t" } else { "a" }
+            );
         }
         for &key in &self.iwram {
-            let _ = writeln!(s, "iwram {:08x} {}", key & !1, if key & 1 != 0 { "t" } else { "a" });
+            let _ = writeln!(
+                s,
+                "iwram {:08x} {}",
+                key & !1,
+                if key & 1 != 0 { "t" } else { "a" }
+            );
         }
         for l in &self.reserved {
             let _ = writeln!(s, "{l}");
@@ -344,13 +375,21 @@ impl Labels {
         let emit = |s: &mut String, key: u32| {
             let _ = writeln!(s, "\n[[functions]]");
             if let Some(n) = self.names.get(&key) {
-                let _ = writeln!(s, "name = \"{}\"", n.replace('\\', "\\\\").replace('"', "\\\""));
+                let _ = writeln!(
+                    s,
+                    "name = \"{}\"",
+                    n.replace('\\', "\\\\").replace('"', "\\\"")
+                );
             }
             let _ = writeln!(s, "address = 0x{:08x}", key & !1);
             if let Some(&e) = self.ends.get(&key) {
                 let _ = writeln!(s, "end = 0x{e:08x}");
             }
-            let _ = writeln!(s, "mode = \"{}\"", if key & 1 != 0 { "thumb" } else { "arm" });
+            let _ = writeln!(
+                s,
+                "mode = \"{}\"",
+                if key & 1 != 0 { "thumb" } else { "arm" }
+            );
         };
         for &key in self.rom.iter().chain(&self.iwram) {
             emit(&mut s, key);
@@ -360,7 +399,11 @@ impl Labels {
             if let (Some(addr), Some(mode)) = (f.next(), f.next()) {
                 let _ = writeln!(s, "\n[[functions]]");
                 let _ = writeln!(s, "address = 0x{addr}");
-                let _ = writeln!(s, "mode = \"{}\"", if mode == "t" { "thumb" } else { "arm" });
+                let _ = writeln!(
+                    s,
+                    "mode = \"{}\"",
+                    if mode == "t" { "thumb" } else { "arm" }
+                );
             }
         }
         if let Some(dir) = path.parent() {
@@ -402,7 +445,10 @@ fn addr_value(v: &toml::Value) -> Option<u32> {
         toml::Value::Integer(i) => u32::try_from(*i).ok(),
         toml::Value::String(s) => {
             let s = s.trim();
-            let s = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")).unwrap_or(s);
+            let s = s
+                .strip_prefix("0x")
+                .or_else(|| s.strip_prefix("0X"))
+                .unwrap_or(s);
             u32::from_str_radix(&s.replace('_', ""), 16).ok()
         }
         _ => None,
@@ -564,7 +610,10 @@ mode = "arm"
         assert_eq!(l.rom.len(), 2);
         assert!(l.rom.contains(&0x0800_1235)); // thumb bit folded in
         assert!(l.rom.contains(&0x0800_2000));
-        assert_eq!(l.names.get(&0x0800_1235).map(String::as_str), Some("AgbMain"));
+        assert_eq!(
+            l.names.get(&0x0800_1235).map(String::as_str),
+            Some("AgbMain")
+        );
         assert_eq!(l.ends.get(&0x0800_1235), Some(&0x0800_1268));
         assert_eq!(l.reserved, vec!["ewram 02000420 a".to_string()]);
         assert_eq!(l.skipped, 1);

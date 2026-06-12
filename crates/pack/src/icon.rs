@@ -85,7 +85,10 @@ pub fn load_master(custom: Option<&Path>) -> Result<Rgba, String> {
     };
     let img = decode_png(&bytes)?;
     if img.w != img.h {
-        return Err(format!("icon master must be square, got {}×{}", img.w, img.h));
+        return Err(format!(
+            "icon master must be square, got {}×{}",
+            img.w, img.h
+        ));
     }
     if img.w < 256 {
         return Err(format!(
@@ -248,7 +251,11 @@ fn crc32(data: &[u8]) -> u32 {
     for &byte in data {
         crc ^= byte as u32;
         for _ in 0..8 {
-            crc = if crc & 1 != 0 { (crc >> 1) ^ 0xedb8_8320 } else { crc >> 1 };
+            crc = if crc & 1 != 0 {
+                (crc >> 1) ^ 0xedb8_8320
+            } else {
+                crc >> 1
+            };
         }
     }
     !crc
@@ -292,8 +299,10 @@ pub fn build_icns(master: &Rgba) -> Vec<u8> {
 /// payload is tiny at icon sizes.
 pub fn build_ico(master: &Rgba) -> Vec<u8> {
     const SIZES: &[u32] = &[16, 32, 48, 64, 128, 256];
-    let images: Vec<(u32, Vec<u8>)> =
-        SIZES.iter().map(|&s| (s, bmp_dib(&master.resized(s)))).collect();
+    let images: Vec<(u32, Vec<u8>)> = SIZES
+        .iter()
+        .map(|&s| (s, bmp_dib(&master.resized(s))))
+        .collect();
 
     let mut out = Vec::new();
     // ICONDIR
@@ -339,7 +348,7 @@ fn bmp_dib(img: &Rgba) -> Vec<u8> {
     out.extend_from_slice(&0i32.to_le_bytes()); // y ppm
     out.extend_from_slice(&0u32.to_le_bytes()); // palette
     out.extend_from_slice(&0u32.to_le_bytes()); // important
-    // BGRA pixels, bottom-up
+                                                // BGRA pixels, bottom-up
     for y in (0..h).rev() {
         for x in 0..w {
             let [r, g, b, a] = img.at(x, y);
@@ -430,9 +439,15 @@ mod tests {
         let icns = build_icns(&m);
         assert_eq!(&icns[0..4], b"icns");
         let declared = u32::from_be_bytes(icns[4..8].try_into().unwrap()) as usize;
-        assert_eq!(declared, icns.len(), "icns header length must equal file size");
+        assert_eq!(
+            declared,
+            icns.len(),
+            "icns header length must equal file size"
+        );
         // Each entry's PNG payload should itself be a valid PNG.
-        assert!(icns.windows(8).any(|w| w == [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]));
+        assert!(icns
+            .windows(8)
+            .any(|w| w == [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]));
     }
 
     #[test]
@@ -443,7 +458,7 @@ mod tests {
         assert_eq!(u16::from_le_bytes(ico[2..4].try_into().unwrap()), 1); // type icon
         let count = u16::from_le_bytes(ico[4..6].try_into().unwrap());
         assert_eq!(count, 6); // SIZES.len()
-        // First directory entry's offset/length must land inside the file.
+                              // First directory entry's offset/length must land inside the file.
         let off = u32::from_le_bytes(ico[18..22].try_into().unwrap()) as usize;
         let len = u32::from_le_bytes(ico[14..18].try_into().unwrap()) as usize;
         assert!(off + len <= ico.len());
@@ -477,7 +492,11 @@ mod tests {
         assert!(load_master(Some(&notpng)).is_err());
 
         // A valid but tiny PNG (32²) must be rejected as too small.
-        let small = Rgba { w: 32, h: 32, px: vec![0x80; 32 * 32 * 4] };
+        let small = Rgba {
+            w: 32,
+            h: 32,
+            px: vec![0x80; 32 * 32 * 4],
+        };
         let tiny = dir.join("tiny.png");
         std::fs::write(&tiny, encode_png(&small)).unwrap();
         assert!(load_master(Some(&tiny)).is_err());

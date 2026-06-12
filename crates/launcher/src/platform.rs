@@ -45,7 +45,11 @@ fn recomp_bin() -> Result<PathBuf, String> {
     }
     if let Ok(me) = std::env::current_exe() {
         if let Some(dir) = me.parent() {
-            let sib = dir.join(if cfg!(windows) { "recomp.exe" } else { "recomp" });
+            let sib = dir.join(if cfg!(windows) {
+                "recomp.exe"
+            } else {
+                "recomp"
+            });
             if sib.is_file() {
                 return Ok(sib);
             }

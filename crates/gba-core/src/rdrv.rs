@@ -29,8 +29,7 @@ use crate::shadow::Verifier;
 /// ARM prologue of the blob's note-on routine — the blob base. Present
 /// in ROM (copy source) and IWRAM (live) in every known build.
 const NOTE_ON_SIG: [u8; 16] = [
-    0x00, 0x40, 0x2D, 0xE9, 0x03, 0x30, 0xC5, 0xE5, 0x24, 0x10, 0x85, 0xE5, 0x01, 0x70,
-    0xC5, 0xE5,
+    0x00, 0x40, 0x2D, 0xE9, 0x03, 0x30, 0xC5, 0xE5, 0x24, 0x10, 0x85, 0xE5, 0x01, 0x70, 0xC5, 0xE5,
 ];
 
 /// Voice struct layout (stride 0x28), identical across the family.
@@ -230,7 +229,9 @@ impl RdrvHle {
         if self.engage_backoff % 16 != 0 {
             return;
         }
-        let Some(off) = find(mem.iwram, &NOTE_ON_SIG) else { return };
+        let Some(off) = find(mem.iwram, &NOTE_ON_SIG) else {
+            return;
+        };
         let blob = 0x0300_0000 + off as u32;
         if let Some(lay) = harvest(mem, blob) {
             self.lay = lay;
@@ -264,8 +265,11 @@ impl RdrvHle {
         self.last_hook_cursor = audio_cursor;
         if (256..=4096).contains(&gap) {
             let step = gap as f64 / chunk;
-            self.mix_step =
-                if self.hooks < 8 { step } else { self.mix_step * 0.9 + step * 0.1 };
+            self.mix_step = if self.hooks < 8 {
+                step
+            } else {
+                self.mix_step * 0.9 + step * 0.1
+            };
         }
 
         let gate_music = mem.u32(self.lay.gate) == Some(1);
@@ -298,8 +302,13 @@ impl RdrvHle {
                 // address) — the baseline for position telemetry.
                 let prev = prev_snap[n];
                 n += 1;
-                *v = Voice { addr: va, ..Voice::default() };
-                let Some(state) = mem.u8(va + V_STATE) else { continue };
+                *v = Voice {
+                    addr: va,
+                    ..Voice::default()
+                };
+                let Some(state) = mem.u8(va + V_STATE) else {
+                    continue;
+                };
                 if state != 0x11 && state != 0x12 {
                     continue;
                 }
@@ -312,7 +321,9 @@ impl RdrvHle {
                 let env = mem.u32(va + V_ENV).unwrap_or(0);
                 let pos = mem.u32(va + V_POS).unwrap_or(0);
                 let frac = mem.u32(va + V_FRAC).unwrap_or(0) & 0x7F_FFFF;
-                let Some(instr) = mem.u32(va + V_INSTR) else { continue };
+                let Some(instr) = mem.u32(va + V_INSTR) else {
+                    continue;
+                };
                 let (Some(end), Some(loop_len)) =
                     (mem.u32(instr + I_END), mem.u32(instr + I_LOOP_LEN))
                 else {
@@ -442,8 +453,7 @@ impl RdrvHle {
         // The music pass runs first and sees both arrays intact; the fx
         // pass only commits when music didn't run this tick (paused).
         if key == self.lay.adv_fx
-            && audio_cursor.saturating_sub(self.steps_cursor)
-                < crate::mem::AUDIO_SAMPLE_CYCLES * 64
+            && audio_cursor.saturating_sub(self.steps_cursor) < crate::mem::AUDIO_SAMPLE_CYCLES * 64
         {
             return;
         }
@@ -567,7 +577,11 @@ fn pc_literals(mem: &MemView, start: u32, end: u32) -> Vec<u32> {
         if let Some(w) = mem.u32(a) {
             if w & 0xFF7F_0000 == 0xE51F_0000 {
                 let imm = w & 0xFFF;
-                let lit = if w & 0x0080_0000 != 0 { a + 8 + imm } else { a + 8 - imm };
+                let lit = if w & 0x0080_0000 != 0 {
+                    a + 8 + imm
+                } else {
+                    a + 8 - imm
+                };
                 if let Some(v) = mem.u32(lit) {
                     out.push(v);
                 }
@@ -586,12 +600,10 @@ fn harvest(mem: &MemView, blob: u32) -> Option<Layout> {
     let mut mix_all = 0u32;
     let mut a = blob;
     while a < blob + 0x200 {
-        let (Some(w0), Some(w1), Some(w2)) = (mem.u32(a), mem.u32(a + 4), mem.u32(a + 8))
-        else {
+        let (Some(w0), Some(w1), Some(w2)) = (mem.u32(a), mem.u32(a + 4), mem.u32(a + 8)) else {
             return None;
         };
-        if w0 & 0xFFFF_F000 == 0xE24D_D000 && w1 == 0xE58D_E008 && w2 & 0xFFFF_F000 == 0xE59F_5000
-        {
+        if w0 & 0xFFFF_F000 == 0xE24D_D000 && w1 == 0xE58D_E008 && w2 & 0xFFFF_F000 == 0xE59F_5000 {
             mix_all = a;
             break;
         }
@@ -632,8 +644,11 @@ fn harvest(mem: &MemView, blob: u32) -> Option<Layout> {
     let fx_i = lits.iter().position(|&v| in_rom(v))?;
     let fx_cnt_ptr = lits[fx_i];
     let fx_base = *lits[fx_i + 1..].iter().find(|&&v| in_iwram(v))?;
-    let mus_i =
-        fx_i + 1 + lits[fx_i + 1..].iter().position(|&v| in_rom(v) && v != fx_cnt_ptr)?;
+    let mus_i = fx_i
+        + 1
+        + lits[fx_i + 1..]
+            .iter()
+            .position(|&v| in_rom(v) && v != fx_cnt_ptr)?;
     let mus_cnt_ptr = lits[mus_i];
     let music_base = *lits[mus_i + 1..].iter().find(|&&v| in_iwram(v))?;
     let gate = *lits[fx_i + 1..mus_i]
@@ -685,7 +700,11 @@ fn harvest(mem: &MemView, blob: u32) -> Option<Layout> {
         }
         a += 4;
     }
-    let chanvol2 = if ldrb_r6 >= 2 { *mv_lits.get(3).filter(|&&v| in_iwram(v))? } else { 0 };
+    let chanvol2 = if ldrb_r6 >= 2 {
+        *mv_lits.get(3).filter(|&&v| in_iwram(v))?
+    } else {
+        0
+    };
 
     // Inner-loop sanity: the interp/accumulate opcode run must appear
     // (store + accumulate variants) or this is not the family we know.
@@ -773,7 +792,11 @@ mod tests {
         for (i, b) in rom.iter_mut().enumerate() {
             *b = (i as u8) & 0x3F;
         }
-        let mem = MemView { rom: &rom, ewram: &ewram, iwram: &iwram };
+        let mem = MemView {
+            rom: &rom,
+            ewram: &ewram,
+            iwram: &iwram,
+        };
         let mut v = Voice {
             on: true,
             pos: 0x0800_0000u32 as f64,
@@ -792,7 +815,10 @@ mod tests {
         }
         assert!(!v.dead);
         // One-shot: dies at the end address.
-        let mut v2 = Voice { looping: false, ..v };
+        let mut v2 = Voice {
+            looping: false,
+            ..v
+        };
         v2.pos = 0x0800_000Eu32 as f64;
         v2.end = 0x0800_0010u32 as f64;
         for _ in 0..4 {
@@ -811,7 +837,11 @@ mod tests {
         iwram[12..16].copy_from_slice(&0xDEAD_BEEFu32.to_le_bytes());
         let rom = vec![0u8; 4];
         let ewram = vec![0u8; 4];
-        let mem = MemView { rom: &rom, ewram: &ewram, iwram: &iwram };
+        let mem = MemView {
+            rom: &rom,
+            ewram: &ewram,
+            iwram: &iwram,
+        };
         let lits = pc_literals(&mem, 0x0300_0000, 0x0300_0008);
         assert_eq!(lits, vec![0xDEAD_BEEF, 0xE51F_1008]);
     }

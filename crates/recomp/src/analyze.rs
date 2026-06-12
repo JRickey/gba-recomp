@@ -98,9 +98,9 @@ fn successors(instr: &Instr, thumb: bool) -> (Vec<u32>, bool) {
         Op::Undefined { .. } => (vec![], false),
         Op::Alu { rd, .. } if rd == PC => (vec![], cond_can_fall),
         Op::Mem { load: true, rd, .. } if rd == PC => (vec![], cond_can_fall),
-        Op::BlockMem { load: true, rlist, .. } if rlist & (1 << PC) != 0 => {
-            (vec![], cond_can_fall)
-        }
+        Op::BlockMem {
+            load: true, rlist, ..
+        } if rlist & (1 << PC) != 0 => (vec![], cond_can_fall),
         _ => (vec![], true),
     }
 }
@@ -245,9 +245,18 @@ pub fn analyze(view: &View, seeds: &[u32]) -> Analysis {
         }
 
         if !instrs.is_empty() {
-            blocks.insert(key, Block { addr: start, thumb, instrs });
+            blocks.insert(
+                key,
+                Block {
+                    addr: start,
+                    thumb,
+                    instrs,
+                },
+            );
         }
     }
 
-    Analysis { blocks: blocks.into_values().collect() }
+    Analysis {
+        blocks: blocks.into_values().collect(),
+    }
 }

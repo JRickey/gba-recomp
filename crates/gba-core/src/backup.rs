@@ -46,13 +46,13 @@ pub fn detect(rom: &[u8]) -> BackupKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FlashState {
     Ready,
-    Cmd1,     // saw AA @ 5555
-    Cmd2,     // saw 55 @ 2AAA
-    Erase,    // 0x80 armed: expect AA, 55, then 0x10/0x30
+    Cmd1,  // saw AA @ 5555
+    Cmd2,  // saw 55 @ 2AAA
+    Erase, // 0x80 armed: expect AA, 55, then 0x10/0x30
     EraseCmd1,
     EraseCmd2,
-    Write,    // next byte write goes to the array
-    Bank,     // next write to 0x0E000000 selects the bank
+    Write, // next byte write goes to the array
+    Bank,  // next write to 0x0E000000 selects the bank
 }
 
 pub struct Flash {
@@ -162,7 +162,12 @@ pub struct Eeprom {
 
 impl Eeprom {
     pub fn new() -> Eeprom {
-        Eeprom { data: vec![0xFF; 0x2000], in_bits: Vec::new(), mode: EepromMode::Idle, wide: false }
+        Eeprom {
+            data: vec![0xFF; 0x2000],
+            in_bits: Vec::new(),
+            mode: EepromMode::Idle,
+            wide: false,
+        }
     }
 
     pub fn write_bit(&mut self, value: u16) {

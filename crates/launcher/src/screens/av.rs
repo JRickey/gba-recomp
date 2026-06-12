@@ -13,7 +13,9 @@ pub struct AvScreen {
 
 impl AvScreen {
     pub fn new() -> Self {
-        Self { av: input_config::AvConfig::load() }
+        Self {
+            av: input_config::AvConfig::load(),
+        }
     }
 
     fn save(&self) {
@@ -33,8 +35,8 @@ impl AvScreen {
                 } else {
                     "ENHANCED AUDIO \u{2014} OFF"
                 };
-                if theme::glossy_button(ui, label, self.av.audio_enhanced,
-                    Vec2::new(240.0, 34.0)).clicked()
+                if theme::glossy_button(ui, label, self.av.audio_enhanced, Vec2::new(240.0, 34.0))
+                    .clicked()
                 {
                     self.av.audio_enhanced = !self.av.audio_enhanced;
                     self.save();
@@ -71,8 +73,8 @@ impl AvScreen {
                     ("classic", "CLASSIC"),
                 ] {
                     let selected = self.av.screen == token;
-                    if theme::glossy_button(ui, label, selected, Vec2::new(106.0, 30.0))
-                        .clicked() && !selected
+                    if theme::glossy_button(ui, label, selected, Vec2::new(106.0, 30.0)).clicked()
+                        && !selected
                     {
                         self.av.screen = token.into();
                         self.save();
@@ -117,9 +119,11 @@ impl AvScreen {
                     "video.darken",
                     0.0..=1.0,
                     |av| &mut av.screen_darken,
-                    |s| screen::ScreenKind::by_name(s)
-                        .map(|k| k.default_darken() as f32)
-                        .unwrap_or(0.0),
+                    |s| {
+                        screen::ScreenKind::by_name(s)
+                            .map(|k| k.default_darken() as f32)
+                            .unwrap_or(0.0)
+                    },
                 );
             }
 
@@ -127,7 +131,9 @@ impl AvScreen {
             ui.add_space(8.0);
             ui.horizontal_wrapped(|ui| {
                 ui.label(
-                    egui::RichText::new("RESPONSE").size(11.0).color(theme::white(160)),
+                    egui::RichText::new("RESPONSE")
+                        .size(11.0)
+                        .color(theme::white(160)),
                 );
                 for (token, label) in [
                     ("off", "OFF"),
@@ -136,8 +142,8 @@ impl AvScreen {
                     ("persistence", "GHOST"),
                 ] {
                     let selected = self.av.response == token;
-                    if theme::glossy_button(ui, label, selected, Vec2::new(88.0, 26.0))
-                        .clicked() && !selected
+                    if theme::glossy_button(ui, label, selected, Vec2::new(88.0, 26.0)).clicked()
+                        && !selected
                     {
                         self.av.response = token.into();
                         self.save();
@@ -163,9 +169,11 @@ impl AvScreen {
                 "video.grid",
                 0.0..=1.0,
                 |av| &mut av.grid,
-                |s| screen::ScreenKind::by_name(s)
-                    .map(screen::ScreenKind::default_grid_strength)
-                    .unwrap_or(0.0),
+                |s| {
+                    screen::ScreenKind::by_name(s)
+                        .map(screen::ScreenKind::default_grid_strength)
+                        .unwrap_or(0.0)
+                },
             );
             ui.label(
                 egui::RichText::new(
@@ -181,7 +189,9 @@ impl AvScreen {
             ui.add_space(8.0);
             ui.horizontal_wrapped(|ui| {
                 ui.label(
-                    egui::RichText::new("DISPLAY").size(11.0).color(theme::white(160)),
+                    egui::RichText::new("DISPLAY")
+                        .size(11.0)
+                        .color(theme::white(160)),
                 );
                 for (token, label) in [
                     ("auto", "AUTO"),
@@ -189,8 +199,8 @@ impl AvScreen {
                     ("display-p3", "WIDE (P3)"),
                 ] {
                     let selected = self.av.display_gamut == token;
-                    if theme::glossy_button(ui, label, selected, Vec2::new(96.0, 26.0))
-                        .clicked() && !selected
+                    if theme::glossy_button(ui, label, selected, Vec2::new(96.0, 26.0)).clicked()
+                        && !selected
                     {
                         self.av.display_gamut = token.into();
                         self.save();
@@ -224,7 +234,9 @@ impl AvScreen {
                     .color(theme::white(160)),
             );
             let slider = ui.add(
-                egui::Slider::new(&mut value, range).show_value(true).fixed_decimals(2),
+                egui::Slider::new(&mut value, range)
+                    .show_value(true)
+                    .fixed_decimals(2),
             );
             if slider.changed() {
                 *field(&mut self.av) = format!("{value:.2}");

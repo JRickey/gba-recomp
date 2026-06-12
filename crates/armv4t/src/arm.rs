@@ -17,7 +17,12 @@ pub fn decode_arm(w: u32, addr: u32) -> Instr {
     } else {
         decode_op(w, addr)
     };
-    Instr { addr, cond, op, thumb: false }
+    Instr {
+        addr,
+        cond,
+        op,
+        thumb: false,
+    }
 }
 
 fn decode_op(w: u32, addr: u32) -> Op {
@@ -54,7 +59,9 @@ fn decode_op(w: u32, addr: u32) -> Op {
         0b110 => Op::Undefined { raw: w },
         0b111 => {
             if bit(w, 24) {
-                Op::Swi { imm: bits(w, 0, 23) }
+                Op::Swi {
+                    imm: bits(w, 0, 23),
+                }
             } else {
                 Op::Undefined { raw: w }
             }
@@ -67,7 +74,9 @@ fn decode_op(w: u32, addr: u32) -> Op {
 /// halfword/signed transfers, MRS/MSR-from-register.
 fn decode_class_000(w: u32) -> Op {
     if w & 0x0FFF_FFF0 == 0x012F_FF10 {
-        return Op::Bx { rm: bits(w, 0, 3) as Reg };
+        return Op::Bx {
+            rm: bits(w, 0, 3) as Reg,
+        };
     }
     if w & 0x0FC0_00F0 == 0x0000_0090 {
         return Op::Mul {
@@ -122,7 +131,10 @@ fn decode_half_transfer(w: u32) -> Op {
     let offset = if bit(w, 22) {
         MemOffset::Imm((bits(w, 8, 11) << 4 | bits(w, 0, 3)) as u16)
     } else {
-        MemOffset::Reg { rm: bits(w, 0, 3) as Reg, shift: Shift::NONE }
+        MemOffset::Reg {
+            rm: bits(w, 0, 3) as Reg,
+            shift: Shift::NONE,
+        }
     };
     Op::Mem {
         load,
@@ -147,9 +159,10 @@ fn decode_dp_or_psr(w: u32, imm_class: bool) -> Op {
         let spsr = bit(w, 22);
         return match (opcode & 1 != 0, imm_class) {
             // MRS: opcode 8 (CPSR) / 10 (SPSR); register class only.
-            (false, false) if w & 0x0FBF_0FFF == 0x010F_0000 => {
-                Op::Mrs { spsr, rd: bits(w, 12, 15) as Reg }
-            }
+            (false, false) if w & 0x0FBF_0FFF == 0x010F_0000 => Op::Mrs {
+                spsr,
+                rd: bits(w, 12, 15) as Reg,
+            },
             // MSR from register: opcode 9 / 11.
             (true, false) if w & 0x0FB0_FFF0 == 0x0120_F000 => Op::MsrReg {
                 spsr,
@@ -171,7 +184,10 @@ fn decode_dp_or_psr(w: u32, imm_class: bool) -> Op {
 
     let op2 = if imm_class {
         let ror = (bits(w, 8, 11) * 2) as u8;
-        Operand2::Imm { value: bits(w, 0, 7).rotate_right(ror as u32), ror }
+        Operand2::Imm {
+            value: bits(w, 0, 7).rotate_right(ror as u32),
+            ror,
+        }
     } else {
         let rm = bits(w, 0, 3) as Reg;
         let shift = if bit(w, 4) {
@@ -213,7 +229,11 @@ fn decode_single_transfer(w: u32, reg_offset: bool) -> Op {
     };
     Op::Mem {
         load: bit(w, 20),
-        width: if bit(w, 22) { MemWidth::Byte } else { MemWidth::Word },
+        width: if bit(w, 22) {
+            MemWidth::Byte
+        } else {
+            MemWidth::Word
+        },
         signed: false,
         rd: bits(w, 12, 15) as Reg,
         rn: bits(w, 16, 19) as Reg,
@@ -237,7 +257,13 @@ mod tests {
         // mov r0, #0
         assert_eq!(
             op(0xE3A0_0000),
-            Op::Alu { op: AluOp::Mov, s: false, rd: 0, rn: 0, op2: Operand2::imm(0) }
+            Op::Alu {
+                op: AluOp::Mov,
+                s: false,
+                rd: 0,
+                rn: 0,
+                op2: Operand2::imm(0)
+            }
         );
     }
 
@@ -245,7 +271,11 @@ mod tests {
     fn imm_rotation() {
         // mov r0, #0x80000000 (imm8=2, ror=2*1... encoding: 0xE3A00102 = mov r0, #0x80000000)
         match op(0xE3A0_0102) {
-            Op::Alu { op: AluOp::Mov, op2: Operand2::Imm { value, ror }, .. } => {
+            Op::Alu {
+                op: AluOp::Mov,
+                op2: Operand2::Imm { value, ror },
+                ..
+            } => {
                 assert_eq!(value, 0x8000_0000);
                 assert_eq!(ror, 2);
             }
@@ -270,16 +300,26 @@ mod tests {
         assert_eq!(
             op(0xE92D_4010),
             Op::BlockMem {
-                load: false, rn: SP, rlist: 0x4010,
-                pre: true, up: false, s_bit: false, writeback: true,
+                load: false,
+                rn: SP,
+                rlist: 0x4010,
+                pre: true,
+                up: false,
+                s_bit: false,
+                writeback: true,
             }
         );
         // pop {r4, pc} == ldmia sp!, {r4, pc}
         assert_eq!(
             op(0xE8BD_8010),
             Op::BlockMem {
-                load: true, rn: SP, rlist: 0x8010,
-                pre: false, up: true, s_bit: false, writeback: true,
+                load: true,
+                rn: SP,
+                rlist: 0x8010,
+                pre: false,
+                up: true,
+                s_bit: false,
+                writeback: true,
             }
         );
     }
@@ -287,11 +327,29 @@ mod tests {
     #[test]
     fn branch_target_resolution() {
         // Typical cartridge header entry: b 0x080000C0 encoded at 0x08000000.
-        assert_eq!(op(0xEA00_002E), Op::Branch { link: false, target: 0x0800_00C0 });
+        assert_eq!(
+            op(0xEA00_002E),
+            Op::Branch {
+                link: false,
+                target: 0x0800_00C0
+            }
+        );
         // Backwards branch: b . (infinite loop) = 0xEAFFFFFE.
-        assert_eq!(op(0xEAFF_FFFE), Op::Branch { link: false, target: 0x0800_0000 });
+        assert_eq!(
+            op(0xEAFF_FFFE),
+            Op::Branch {
+                link: false,
+                target: 0x0800_0000
+            }
+        );
         // bl with the link bit.
-        assert!(matches!(op(0xEB00_002E), Op::Branch { link: true, target: 0x0800_00C0 }));
+        assert!(matches!(
+            op(0xEB00_002E),
+            Op::Branch {
+                link: true,
+                target: 0x0800_00C0
+            }
+        ));
     }
 
     #[test]
@@ -301,9 +359,15 @@ mod tests {
         assert!(matches!(
             i.op,
             Op::Mem {
-                load: true, width: MemWidth::Word, signed: false,
-                rd: 1, rn: PC, offset: MemOffset::Imm(0x18),
-                pre: true, up: true, writeback: false,
+                load: true,
+                width: MemWidth::Word,
+                signed: false,
+                rd: 1,
+                rn: PC,
+                offset: MemOffset::Imm(0x18),
+                pre: true,
+                up: true,
+                writeback: false,
             }
         ));
         // Literal address = addr + 8 + 0x18.
@@ -315,7 +379,14 @@ mod tests {
         // mul r1, r2, r3
         assert_eq!(
             op(0xE001_0392),
-            Op::Mul { acc: false, s: false, rd: 1, rn: 0, rs: 3, rm: 2 }
+            Op::Mul {
+                acc: false,
+                s: false,
+                rd: 1,
+                rn: 0,
+                rs: 3,
+                rm: 2
+            }
         );
     }
 
@@ -324,7 +395,15 @@ mod tests {
         // umull r0, r1, r2, r3: rd_lo=r0, rd_hi=r1, rm=r2, rs=r3
         assert_eq!(
             op(0xE081_0392),
-            Op::MulLong { signed: false, acc: false, s: false, rd_hi: 1, rd_lo: 0, rs: 3, rm: 2 }
+            Op::MulLong {
+                signed: false,
+                acc: false,
+                s: false,
+                rd_hi: 1,
+                rd_lo: 0,
+                rs: 3,
+                rm: 2
+            }
         );
     }
 
@@ -333,9 +412,23 @@ mod tests {
         // mrs r0, cpsr
         assert_eq!(op(0xE10F_0000), Op::Mrs { spsr: false, rd: 0 });
         // msr cpsr_fc, r0 (fields f|c = 0b1001)
-        assert_eq!(op(0xE129_F000), Op::MsrReg { spsr: false, fields: 0b1001, rm: 0 });
+        assert_eq!(
+            op(0xE129_F000),
+            Op::MsrReg {
+                spsr: false,
+                fields: 0b1001,
+                rm: 0
+            }
+        );
         // msr spsr_fsxc, r0
-        assert_eq!(op(0xE16F_F000), Op::MsrReg { spsr: true, fields: 0b1111, rm: 0 });
+        assert_eq!(
+            op(0xE16F_F000),
+            Op::MsrReg {
+                spsr: true,
+                fields: 0b1111,
+                rm: 0
+            }
+        );
     }
 
     #[test]
@@ -344,18 +437,30 @@ mod tests {
         assert_eq!(
             op(0xE1C1_00B0),
             Op::Mem {
-                load: false, width: MemWidth::Half, signed: false,
-                rd: 0, rn: 1, offset: MemOffset::Imm(0),
-                pre: true, up: true, writeback: false,
+                load: false,
+                width: MemWidth::Half,
+                signed: false,
+                rd: 0,
+                rn: 1,
+                offset: MemOffset::Imm(0),
+                pre: true,
+                up: true,
+                writeback: false,
             }
         );
         // ldrsh r2, [r3, #4] = 0xE1D320F4
         assert_eq!(
             op(0xE1D3_20F4),
             Op::Mem {
-                load: true, width: MemWidth::Half, signed: true,
-                rd: 2, rn: 3, offset: MemOffset::Imm(4),
-                pre: true, up: true, writeback: false,
+                load: true,
+                width: MemWidth::Half,
+                signed: true,
+                rd: 2,
+                rn: 3,
+                offset: MemOffset::Imm(4),
+                pre: true,
+                up: true,
+                writeback: false,
             }
         );
     }
@@ -369,7 +474,15 @@ mod tests {
     #[test]
     fn swp() {
         // swp r0, r1, [r2]
-        assert_eq!(op(0xE102_0091), Op::Swap { byte: false, rd: 0, rm: 1, rn: 2 });
+        assert_eq!(
+            op(0xE102_0091),
+            Op::Swap {
+                byte: false,
+                rd: 0,
+                rm: 1,
+                rn: 2
+            }
+        );
     }
 
     #[test]
@@ -377,7 +490,10 @@ mod tests {
         // movne r0, #0
         assert_eq!(decode_arm(0x13A0_0000, 0).cond, Cond::Ne);
         // 0b1111 condition is undefined on v4.
-        assert!(matches!(decode_arm(0xF3A0_0000, 0).op, Op::Undefined { .. }));
+        assert!(matches!(
+            decode_arm(0xF3A0_0000, 0).op,
+            Op::Undefined { .. }
+        ));
     }
 
     #[test]
@@ -392,10 +508,16 @@ mod tests {
         assert_eq!(
             op(0xE081_0312),
             Op::Alu {
-                op: AluOp::Add, s: false, rd: 0, rn: 1,
+                op: AluOp::Add,
+                s: false,
+                rd: 0,
+                rn: 1,
                 op2: Operand2::Reg {
                     rm: 2,
-                    shift: Shift::Reg { kind: ShiftKind::Lsl, rs: 3 },
+                    shift: Shift::Reg {
+                        kind: ShiftKind::Lsl,
+                        rs: 3
+                    },
                 },
             }
         );

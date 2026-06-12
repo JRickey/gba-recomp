@@ -22,7 +22,10 @@ pub struct Primaries {
     pub white: Xy,
 }
 
-pub const D65: Xy = Xy { x: 0.3127, y: 0.3290 };
+pub const D65: Xy = Xy {
+    x: 0.3127,
+    y: 0.3290,
+};
 
 /// sRGB / Rec.709 primaries, D65.
 pub const SRGB: Primaries = Primaries {
@@ -45,8 +48,7 @@ pub const DISPLAY_P3: Primaries = Primaries {
 pub struct Mat3(pub [[f64; 3]; 3]);
 
 impl Mat3 {
-    pub const IDENTITY: Mat3 =
-        Mat3([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]);
+    pub const IDENTITY: Mat3 = Mat3([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]);
 
     pub fn mul(&self, rhs: &Mat3) -> Mat3 {
         let mut out = [[0.0; 3]; 3];
@@ -133,7 +135,9 @@ pub fn rgb_to_rgb(src: &Primaries, dst: &Primaries) -> Mat3 {
     if src.white == dst.white {
         from_xyz.mul(&to_xyz)
     } else {
-        from_xyz.mul(&bradford_adaptation(src.white, dst.white)).mul(&to_xyz)
+        from_xyz
+            .mul(&bradford_adaptation(src.white, dst.white))
+            .mul(&to_xyz)
     }
 }
 

@@ -3,8 +3,9 @@
 
 use std::path::{Path, PathBuf};
 
-use eframe::egui::{self, Align2, CornerRadius, FontId, Pos2, Rect, Sense, Stroke, StrokeKind, Ui,
-    Vec2};
+use eframe::egui::{
+    self, Align2, CornerRadius, FontId, Pos2, Rect, Sense, Stroke, StrokeKind, Ui, Vec2,
+};
 
 use crate::{platform, theme};
 
@@ -192,12 +193,17 @@ impl PlayScreen {
         });
         // Child state changes without UI input; poll while sessions live.
         if !self.sessions.is_empty() {
-            ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(100));
         }
 
         // files dropped anywhere count as an insert
         let dropped: Vec<PathBuf> = ui.ctx().input(|i| {
-            i.raw.dropped_files.iter().filter_map(|f| f.path.clone()).collect()
+            i.raw
+                .dropped_files
+                .iter()
+                .filter_map(|f| f.path.clone())
+                .collect()
         });
         for path in dropped {
             self.insert(path);
@@ -211,7 +217,8 @@ impl PlayScreen {
             // the big inviting button
             ui.vertical_centered(|ui| {
                 let size = Vec2::new(260.0, 46.0);
-                if theme::glossy_button(ui, "\u{25B6}  LOAD CARTRIDGE\u{2026}", true, size).clicked()
+                if theme::glossy_button(ui, "\u{25B6}  LOAD CARTRIDGE\u{2026}", true, size)
+                    .clicked()
                 {
                     if let Some(path) = platform::pick_rom() {
                         self.insert(path);
@@ -391,7 +398,9 @@ fn read_stderr(err: std::process::ChildStderr, tx: std::sync::mpsc::Sender<Sessi
 }
 
 fn stem(path: &Path) -> String {
-    path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default()
+    path.file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default()
 }
 
 /// One shelf row: orb, name, location, hover PLAY chevron, forget cross.
@@ -407,14 +416,22 @@ fn recent_row(ui: &mut Ui, path: &Path) -> RowAction {
 
     let cr = CornerRadius::same(9);
     p.rect_filled(rect, cr, theme::white(if hovered { 30 } else { 12 }));
-    p.rect_stroke(rect, cr, Stroke::new(1.0, theme::white(if hovered { 90 } else { 30 })),
-        StrokeKind::Inside);
+    p.rect_stroke(
+        rect,
+        cr,
+        Stroke::new(1.0, theme::white(if hovered { 90 } else { 30 })),
+        StrokeKind::Inside,
+    );
 
     theme::orb(
         p,
         Pos2::new(rect.left() + 20.0, rect.center().y),
         7.0,
-        if exists { theme::LIME } else { theme::SILVER_LO },
+        if exists {
+            theme::LIME
+        } else {
+            theme::SILVER_LO
+        },
     );
     p.text(
         Pos2::new(rect.left() + 38.0, rect.center().y - 8.0),
@@ -424,7 +441,9 @@ fn recent_row(ui: &mut Ui, path: &Path) -> RowAction {
         theme::SILVER_HI,
     );
     let location = if exists {
-        path.parent().map(|d| d.display().to_string()).unwrap_or_default()
+        path.parent()
+            .map(|d| d.display().to_string())
+            .unwrap_or_default()
     } else {
         "missing — was it moved?".to_string()
     };
@@ -442,11 +461,20 @@ fn recent_row(ui: &mut Ui, path: &Path) -> RowAction {
         Vec2::splat(16.0),
     );
     let cross_resp = ui.interact(cross, resp.id.with("forget"), Sense::click());
-    let cc = if cross_resp.hovered() { theme::AMBER } else { theme::white(90) };
-    p.line_segment([cross.min + Vec2::splat(4.0), cross.max - Vec2::splat(4.0)],
-        Stroke::new(1.6, cc));
+    let cc = if cross_resp.hovered() {
+        theme::AMBER
+    } else {
+        theme::white(90)
+    };
     p.line_segment(
-        [Pos2::new(cross.min.x + 4.0, cross.max.y - 4.0), Pos2::new(cross.max.x - 4.0, cross.min.y + 4.0)],
+        [cross.min + Vec2::splat(4.0), cross.max - Vec2::splat(4.0)],
+        Stroke::new(1.6, cc),
+    );
+    p.line_segment(
+        [
+            Pos2::new(cross.min.x + 4.0, cross.max.y - 4.0),
+            Pos2::new(cross.max.x - 4.0, cross.min.y + 4.0),
+        ],
         Stroke::new(1.6, cc),
     );
 
@@ -474,15 +502,25 @@ fn recents_file() -> Option<PathBuf> {
 }
 
 fn load_recents() -> Vec<PathBuf> {
-    let Some(f) = recents_file() else { return Vec::new() };
-    let Ok(text) = std::fs::read_to_string(f) else { return Vec::new() };
-    text.lines().filter(|l| !l.trim().is_empty()).map(PathBuf::from).take(MAX_RECENTS).collect()
+    let Some(f) = recents_file() else {
+        return Vec::new();
+    };
+    let Ok(text) = std::fs::read_to_string(f) else {
+        return Vec::new();
+    };
+    text.lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(PathBuf::from)
+        .take(MAX_RECENTS)
+        .collect()
 }
 
 fn save_recents(recents: &[PathBuf]) {
     if let Some(f) = recents_file() {
-        let text: String =
-            recents.iter().map(|p| format!("{}\n", p.display())).collect();
+        let text: String = recents
+            .iter()
+            .map(|p| format!("{}\n", p.display()))
+            .collect();
         let _ = std::fs::write(f, text);
     }
 }

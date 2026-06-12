@@ -16,8 +16,7 @@ fn main() {
         .map(PathBuf::from)
         // CARGO_MANIFEST_DIR is crates/launcher; the master lives two up.
         .unwrap_or_else(|| {
-            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("../../assets/icon/app-icon.png")
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../assets/icon/app-icon.png")
         });
     let size: usize = args.next().and_then(|s| s.parse().ok()).unwrap_or(1024);
 
@@ -28,5 +27,11 @@ fn main() {
         std::fs::create_dir_all(parent).expect("create assets/icon");
     }
     std::fs::write(&out, &png).expect("write master PNG");
-    println!("wrote {} ({}×{}, {} bytes)", out.display(), size, size, png.len());
+    println!(
+        "wrote {} ({}×{}, {} bytes)",
+        out.display(),
+        size,
+        size,
+        png.len()
+    );
 }

@@ -16,18 +16,36 @@ use crate::color::{Primaries, Xy, D65};
 /// the deliberately weak color filters of a reflective LCD. Entirely inside
 /// sRGB — reproducing it is a matter of correct mapping, not wide gamut.
 pub const PANEL_REFLECTIVE: Primaries = Primaries {
-    red: Xy { x: 0.4925, y: 0.3100 },
-    green: Xy { x: 0.3150, y: 0.4825 },
-    blue: Xy { x: 0.1625, y: 0.1925 },
+    red: Xy {
+        x: 0.4925,
+        y: 0.3100,
+    },
+    green: Xy {
+        x: 0.3150,
+        y: 0.4825,
+    },
+    blue: Xy {
+        x: 0.1625,
+        y: 0.1925,
+    },
     white: D65,
 };
 
 /// Backlit-revision panel, recovered from the public-domain measured
 /// transform (it is near-sRGB; late titles were authored against it).
 pub const PANEL_BACKLIT: Primaries = Primaries {
-    red: Xy { x: 0.6191, y: 0.3454 },
-    green: Xy { x: 0.3269, y: 0.6003 },
-    blue: Xy { x: 0.1436, y: 0.0893 },
+    red: Xy {
+        x: 0.6191,
+        y: 0.3454,
+    },
+    green: Xy {
+        x: 0.3269,
+        y: 0.6003,
+    },
+    blue: Xy {
+        x: 0.1436,
+        y: 0.0893,
+    },
     white: D65,
 };
 
@@ -160,8 +178,11 @@ pub enum DisplayTarget {
 }
 
 impl DisplayTarget {
-    pub const ALL: [DisplayTarget; 3] =
-        [DisplayTarget::Auto, DisplayTarget::Srgb, DisplayTarget::DisplayP3];
+    pub const ALL: [DisplayTarget; 3] = [
+        DisplayTarget::Auto,
+        DisplayTarget::Srgb,
+        DisplayTarget::DisplayP3,
+    ];
 
     pub fn name(self) -> &'static str {
         match self {

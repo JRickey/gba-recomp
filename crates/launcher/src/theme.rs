@@ -70,7 +70,11 @@ pub fn glow(p: &egui::Painter, center: Pos2, radius: f32, color: Color32, alpha:
     const STEPS: u8 = 6;
     for i in 0..STEPS {
         let f = 1.0 - i as f32 / STEPS as f32;
-        p.circle_filled(center, radius * f, tint(color, (alpha as f32 / STEPS as f32) as u8));
+        p.circle_filled(
+            center,
+            radius * f,
+            tint(color, (alpha as f32 / STEPS as f32) as u8),
+        );
     }
 }
 
@@ -88,7 +92,11 @@ pub fn orb(p: &egui::Painter, center: Pos2, r: f32, color: Color32) {
     m.add_triangle(0, 2, 3);
     p.add(m);
     // highlight dot
-    p.circle_filled(center + Vec2::new(-r * 0.35, -r * 0.4), r * 0.28, white(190));
+    p.circle_filled(
+        center + Vec2::new(-r * 0.35, -r * 0.4),
+        r * 0.28,
+        white(190),
+    );
     p.circle_stroke(center, r, Stroke::new(1.0, black(80)));
 }
 
@@ -122,22 +130,34 @@ pub fn paint_background(ui: &Ui, t: f64) {
     let pulse = (0.5 + 0.5 * (t * 0.8).sin()) as f32;
     glow(
         p,
-        Pos2::new(rect.right() - rect.width() * 0.18, rect.top() + rect.height() * 0.12),
+        Pos2::new(
+            rect.right() - rect.width() * 0.18,
+            rect.top() + rect.height() * 0.12,
+        ),
         rect.width() * 0.30,
         CYAN,
         (26.0 + 14.0 * pulse) as u8,
     );
     glow(
         p,
-        Pos2::new(rect.left() + rect.width() * 0.1, rect.bottom() - rect.height() * 0.08),
+        Pos2::new(
+            rect.left() + rect.width() * 0.1,
+            rect.bottom() - rect.height() * 0.08,
+        ),
         rect.width() * 0.22,
         VIOLET,
         30,
     );
 
     // swoosh arcs: big offscreen-centered circles, thin chrome strokes
-    let c1 = Pos2::new(rect.center().x - rect.width() * 0.55, rect.bottom() + rect.height() * 0.9);
-    let c2 = Pos2::new(rect.center().x + rect.width() * 0.7, rect.top() - rect.height() * 0.75);
+    let c1 = Pos2::new(
+        rect.center().x - rect.width() * 0.55,
+        rect.bottom() + rect.height() * 0.9,
+    );
+    let c2 = Pos2::new(
+        rect.center().x + rect.width() * 0.7,
+        rect.top() - rect.height() * 0.75,
+    );
     p.circle_stroke(c1, rect.width() * 1.05, Stroke::new(2.0, white(14)));
     p.circle_stroke(c1, rect.width() * 1.12, Stroke::new(1.0, white(9)));
     p.circle_stroke(c2, rect.width() * 0.95, Stroke::new(2.0, tint(CYAN, 16)));
@@ -149,7 +169,10 @@ pub fn paint_background(ui: &Ui, t: f64) {
     {
         let dx = ((t * 0.31 + i as f64 * 2.1).sin() * 9.0) as f32;
         let dy = ((t * 0.23 + i as f64 * 1.4).cos() * 6.0) as f32;
-        let c = Pos2::new(rect.left() + rect.width() * fx + dx, rect.top() + rect.height() * fy + dy);
+        let c = Pos2::new(
+            rect.left() + rect.width() * fx + dx,
+            rect.top() + rect.height() * fy + dy,
+        );
         orb(p, c, *r, tint(SILVER, 120));
     }
 }
@@ -157,8 +180,20 @@ pub fn paint_background(ui: &Ui, t: f64) {
 /// Embossed chrome wordmark with a soft accent glow.
 pub fn wordmark(p: &egui::Painter, pos: Pos2, text: &str, size: f32) {
     let font = FontId::proportional(size);
-    p.text(pos + Vec2::new(1.0, 2.0), Align2::LEFT_CENTER, text, font.clone(), black(140));
-    p.text(pos + Vec2::new(0.0, -1.0), Align2::LEFT_CENTER, text, font.clone(), white(60));
+    p.text(
+        pos + Vec2::new(1.0, 2.0),
+        Align2::LEFT_CENTER,
+        text,
+        font.clone(),
+        black(140),
+    );
+    p.text(
+        pos + Vec2::new(0.0, -1.0),
+        Align2::LEFT_CENTER,
+        text,
+        font.clone(),
+        white(60),
+    );
     p.text(pos, Align2::LEFT_CENTER, text, font, SILVER_HI);
 }
 
@@ -198,29 +233,57 @@ pub fn glossy_button(ui: &mut Ui, label: &str, selected: bool, size: Vec2) -> eg
         .rect_filled(shape, radius, color);
     };
 
-    p.rect_filled(rect.shrink(1.0).translate(Vec2::new(0.0, 2.0)), cr, black(70));
+    p.rect_filled(
+        rect.shrink(1.0).translate(Vec2::new(0.0, 2.0)),
+        cr,
+        black(70),
+    );
     p.rect_filled(rect, cr, body);
     // upper-body tone
-    band(rect, cr, rect.top(), rect.center().y + 2.0,
-        tint(body_hi, if pressed { 90 } else { 200 }));
+    band(
+        rect,
+        cr,
+        rect.top(),
+        rect.center().y + 2.0,
+        tint(body_hi, if pressed { 90 } else { 200 }),
+    );
     // aqua gloss band
-    band(rect.shrink(3.0), CornerRadius::same(r.saturating_sub(3)),
-        rect.top(), rect.top() + rect.height() * 0.45,
-        white(if selected { 70 } else { 120 }));
+    band(
+        rect.shrink(3.0),
+        CornerRadius::same(r.saturating_sub(3)),
+        rect.top(),
+        rect.top() + rect.height() * 0.45,
+        white(if selected { 70 } else { 120 }),
+    );
     // bottom shade
-    band(rect, cr, rect.bottom() - rect.height() * 0.28, rect.bottom(), black(26));
+    band(
+        rect,
+        cr,
+        rect.bottom() - rect.height() * 0.28,
+        rect.bottom(),
+        black(26),
+    );
 
     let edge = if selected { CYAN } else { black(90) };
     p.rect_stroke(rect, cr, Stroke::new(1.0, edge), StrokeKind::Inside);
     if selected {
-        p.rect_stroke(rect.shrink(2.0), CornerRadius::same(r.saturating_sub(2)),
-            Stroke::new(1.5, tint(CYAN, 70)), StrokeKind::Inside);
+        p.rect_stroke(
+            rect.shrink(2.0),
+            CornerRadius::same(r.saturating_sub(2)),
+            Stroke::new(1.5, tint(CYAN, 70)),
+            StrokeKind::Inside,
+        );
     }
 
     let fg = if selected { Color32::WHITE } else { INK };
     let font = FontId::proportional(rect.height().mul_add(0.38, 4.0).min(16.0));
-    p.text(rect.center() + Vec2::new(0.0, 1.0), Align2::CENTER_CENTER, label, font.clone(),
-        if selected { black(120) } else { white(110) });
+    p.text(
+        rect.center() + Vec2::new(0.0, 1.0),
+        Align2::CENTER_CENTER,
+        label,
+        font.clone(),
+        if selected { black(120) } else { white(110) },
+    );
     p.text(rect.center(), Align2::CENTER_CENTER, label, font, fg);
     resp
 }
@@ -239,12 +302,21 @@ pub fn chrome_strip(p: &egui::Painter, rect: Rect) {
     vgrad(p, rect, SILVER_HI, SILVER_LO);
     vgrad(
         p,
-        Rect::from_min_max(rect.min, Pos2::new(rect.max.x, rect.min.y + rect.height() * 0.45)),
+        Rect::from_min_max(
+            rect.min,
+            Pos2::new(rect.max.x, rect.min.y + rect.height() * 0.45),
+        ),
         white(150),
         white(20),
     );
-    p.line_segment([rect.left_bottom(), rect.right_bottom()], Stroke::new(1.0, black(120)));
-    p.line_segment([rect.left_top(), rect.right_top()], Stroke::new(1.0, white(200)));
+    p.line_segment(
+        [rect.left_bottom(), rect.right_bottom()],
+        Stroke::new(1.0, black(120)),
+    );
+    p.line_segment(
+        [rect.left_top(), rect.right_top()],
+        Stroke::new(1.0, white(200)),
+    );
 }
 
 /// Classic diagonal hazard stripes, clipped to `rect`. Currently between
@@ -271,7 +343,12 @@ pub fn hazard_stripes(p: &egui::Painter, rect: Rect) {
         on = !on;
         x += w;
     }
-    p.rect_stroke(rect, CornerRadius::ZERO, Stroke::new(1.0, black(150)), StrokeKind::Inside);
+    p.rect_stroke(
+        rect,
+        CornerRadius::ZERO,
+        Stroke::new(1.0, black(150)),
+        StrokeKind::Inside,
+    );
 }
 
 /// Section heading: orb bullet + spaced uppercase chrome text.
@@ -279,10 +356,7 @@ pub fn section_title(ui: &mut Ui, title: &str) {
     ui.horizontal(|ui| {
         let (rect, _) = ui.allocate_exact_size(Vec2::splat(14.0), Sense::hover());
         orb(ui.painter(), rect.center(), 6.0, CYAN);
-        let spaced: String = title
-            .chars()
-            .flat_map(|c| [c, '\u{2009}'])
-            .collect();
+        let spaced: String = title.chars().flat_map(|c| [c, '\u{2009}']).collect();
         ui.label(
             egui::RichText::new(spaced.to_uppercase())
                 .size(15.0)

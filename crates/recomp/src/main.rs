@@ -21,7 +21,9 @@ fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     // `recomp help [cmd]`, `recomp <cmd> --help`, and bare `--help`/`-h`
     // all land in help; the first non-help token names the topic.
-    if args.iter().any(|a| a == "--help" || a == "-h") || args.first().map(String::as_str) == Some("help") {
+    if args.iter().any(|a| a == "--help" || a == "-h")
+        || args.first().map(String::as_str) == Some("help")
+    {
         let topic = args
             .iter()
             .find(|a| *a != "--help" && *a != "-h" && *a != "help")
@@ -186,10 +188,14 @@ impl InputScript {
             if l.is_empty() {
                 continue;
             }
-            let (f, k) = l.split_once(' ').ok_or_else(|| format!("{path}: bad line {l:?}"))?;
+            let (f, k) = l
+                .split_once(' ')
+                .ok_or_else(|| format!("{path}: bad line {l:?}"))?;
             points.push((
-                f.parse().map_err(|e| format!("{path}: bad frame in {l:?}: {e}"))?,
-                u16::from_str_radix(k, 16).map_err(|e| format!("{path}: bad mask in {l:?}: {e}"))?,
+                f.parse()
+                    .map_err(|e| format!("{path}: bad frame in {l:?}: {e}"))?,
+                u16::from_str_radix(k, 16)
+                    .map_err(|e| format!("{path}: bad mask in {l:?}: {e}"))?,
             ));
         }
         points.sort();
@@ -244,8 +250,11 @@ fn cmd_dis(args: &[String]) -> Result<(), String> {
         match arg.as_str() {
             "--addr" => addr = parse_hex(it.next().ok_or("--addr needs a value")?)?,
             "--count" => {
-                count = it.next().ok_or("--count needs a value")?
-                    .parse().map_err(|e| format!("bad count: {e}"))?
+                count = it
+                    .next()
+                    .ok_or("--count needs a value")?
+                    .parse()
+                    .map_err(|e| format!("bad count: {e}"))?
             }
             "--thumb" => thumb = true,
             other if rom_path.is_none() => rom_path = Some(other.to_string()),
@@ -259,13 +268,17 @@ fn cmd_dis(args: &[String]) -> Result<(), String> {
     for _ in 0..count {
         let off = pc.wrapping_sub(ROM_BASE) as usize;
         if thumb {
-            let Some(bytes) = rom.get(off..off + 2) else { break };
+            let Some(bytes) = rom.get(off..off + 2) else {
+                break;
+            };
             let half = u16::from_le_bytes([bytes[0], bytes[1]]);
             let instr = decode_thumb(half, pc);
             println!("{pc:08x}:     {half:04x}  {}", instr.disasm());
             pc += 2;
         } else {
-            let Some(bytes) = rom.get(off..off + 4) else { break };
+            let Some(bytes) = rom.get(off..off + 4) else {
+                break;
+            };
             let word = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
             let instr = decode_arm(word, pc);
             println!("{pc:08x}: {word:08x}  {}", instr.disasm());
@@ -322,8 +335,11 @@ fn cmd_run(args: &[String]) -> Result<(), String> {
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "--max-steps" => {
-                max_steps = it.next().ok_or("--max-steps needs a value")?
-                    .parse().map_err(|e| format!("bad max-steps: {e}"))?
+                max_steps = it
+                    .next()
+                    .ok_or("--max-steps needs a value")?
+                    .parse()
+                    .map_err(|e| format!("bad max-steps: {e}"))?
             }
             "--trace" => trace = true,
             "--hist" => hist = true,
@@ -372,7 +388,12 @@ fn cmd_run(args: &[String]) -> Result<(), String> {
             println!();
         }
     }
-    println!("cpsr={:08x} mode={:?} thumb={}", m.cpu.cpsr, m.cpu.mode(), m.cpu.thumb());
+    println!(
+        "cpsr={:08x} mode={:?} thumb={}",
+        m.cpu.cpsr,
+        m.cpu.mode(),
+        m.cpu.thumb()
+    );
     {
         use gba_core::Bus as _;
         println!("ewram[0]={:08x}", m.bus.read32(0x0200_0000));
@@ -399,14 +420,19 @@ fn cmd_frames(args: &[String]) -> Result<(), String> {
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "--frames" => {
-                frames = it.next().ok_or("--frames needs a value")?
-                    .parse().map_err(|e| format!("bad frames: {e}"))?
+                frames = it
+                    .next()
+                    .ok_or("--frames needs a value")?
+                    .parse()
+                    .map_err(|e| format!("bad frames: {e}"))?
             }
             "--out" => out = Some(it.next().ok_or("--out needs a value")?.to_string()),
             "--keys" => keys = parse_hex(it.next().ok_or("--keys needs a value")?)? as u16,
             "--demo" => demo = true,
             "--input" => {
-                input = Some(InputScript::load(it.next().ok_or("--input needs a value")?)?)
+                input = Some(InputScript::load(
+                    it.next().ok_or("--input needs a value")?,
+                )?)
             }
             "--sav" => sav = Some(it.next().ok_or("--sav needs a value")?.to_string()),
             "--bios" => bios = Some(load_bios_file(it.next().ok_or("--bios needs a value")?)?),
@@ -446,7 +472,9 @@ fn cmd_frames(args: &[String]) -> Result<(), String> {
     }
     // Diagnostic (RECOMP_COST_FROM=N): from frame N on, attribute charged
     // cycles to the PC that incurred them; dump the histogram at exit.
-    let cost_from: Option<u64> = std::env::var("RECOMP_COST_FROM").ok().and_then(|v| v.parse().ok());
+    let cost_from: Option<u64> = std::env::var("RECOMP_COST_FROM")
+        .ok()
+        .and_then(|v| v.parse().ok());
     let mut cost: std::collections::HashMap<u32, u64> = std::collections::HashMap::new();
     // Triage (RECOMP_WATCH=hexaddr): print a guest word at every frame
     // where it changes — pairs with the reference harness's REF_WATCH
@@ -559,14 +587,29 @@ fn cmd_frames(args: &[String]) -> Result<(), String> {
         );
     }
     if let Some(prefix) = &dump_audio {
-        write_wav(&format!("{prefix}.mixed.wav"), &mixed, gba_core::mem::AUDIO_RATE_HZ, 2)?;
-        write_wav(&format!("{prefix}.psg.wav"), &psg, gba_core::mem::AUDIO_RATE_HZ, 2)?;
+        write_wav(
+            &format!("{prefix}.mixed.wav"),
+            &mixed,
+            gba_core::mem::AUDIO_RATE_HZ,
+            2,
+        )?;
+        write_wav(
+            &format!("{prefix}.psg.wav"),
+            &psg,
+            gba_core::mem::AUDIO_RATE_HZ,
+            2,
+        )?;
         if !hle.is_empty() {
             let pcm: Vec<i16> = hle
                 .iter()
                 .map(|v| (v * 32768.0).clamp(-32768.0, 32767.0) as i16)
                 .collect();
-            write_wav(&format!("{prefix}.hle.wav"), &pcm, gba_core::mem::AUDIO_RATE_HZ, 2)?;
+            write_wav(
+                &format!("{prefix}.hle.wav"),
+                &pcm,
+                gba_core::mem::AUDIO_RATE_HZ,
+                2,
+            )?;
         }
         for f in 0..2 {
             let mut raw = Vec::with_capacity(fifo_ev[f].len() * 5);
@@ -689,7 +732,11 @@ fn cmd_mp2k_scan(args: &[String]) -> Result<(), String> {
                     format!(
                         "{:#010x} ({})",
                         sig.sound_main_ram & !1,
-                        if sig.sound_main_ram & 1 != 0 { "thumb" } else { "arm" },
+                        if sig.sound_main_ram & 1 != 0 {
+                            "thumb"
+                        } else {
+                            "arm"
+                        },
                     )
                 })
                 .collect::<Vec<_>>()
@@ -704,7 +751,6 @@ fn cmd_mp2k_scan(args: &[String]) -> Result<(), String> {
     println!("\n{hits}/{total} images carry the stock MP2K driver signature");
     Ok(())
 }
-
 
 /// Arm the appropriate engine HLE shadow for this image (enhanced
 /// path). Returns a description line for diagnostics.
@@ -774,7 +820,9 @@ fn cmd_engine_scan(args: &[String]) -> Result<(), String> {
         let rom = std::fs::read(f).map_err(|e| format!("{}: {e}", f.display()))?;
         let engine = gba_core::engine::classify(&rom);
         let d = engine.describe();
-        *tally.entry(d.split(' ').next().unwrap_or("?").to_string()).or_default() += 1;
+        *tally
+            .entry(d.split(' ').next().unwrap_or("?").to_string())
+            .or_default() += 1;
         println!("{:24} {}", d, file_name(f));
     }
     println!();
@@ -795,7 +843,10 @@ fn check_entry(path: &Path) -> Result<String, String> {
     let word = u32::from_le_bytes(header);
     let instr = decode_arm(word, ROM_BASE);
     match instr.op {
-        Op::Branch { link: false, target } => Ok(format!("{word:08x} -> {target:08x}")),
+        Op::Branch {
+            link: false,
+            target,
+        } => Ok(format!("{word:08x} -> {target:08x}")),
         _ => Err(format!("{word:08x} decoded as {:?}", instr.disasm())),
     }
 }
@@ -816,8 +867,7 @@ fn cmd_play(args: &[String]) -> Result<(), String> {
     // Perf instrumentation is developer tooling: always on in debug
     // builds, opt-in (--stats or GBA_RECOMP_STATS=1) in release — the
     // out-of-box experience stays clean.
-    let mut show_stats =
-        cfg!(debug_assertions) || std::env::var_os("GBA_RECOMP_STATS").is_some();
+    let mut show_stats = cfg!(debug_assertions) || std::env::var_os("GBA_RECOMP_STATS").is_some();
     let mut bios_arg: Option<String> = None;
     let mut no_bios = false;
     let mut it = args.iter();
@@ -826,9 +876,7 @@ fn cmd_play(args: &[String]) -> Result<(), String> {
             "--interp" => interp_only = true,
             "--status" => status = true,
             "--stats" => show_stats = true,
-            "--record-labels" => {
-                FALLBACK_COLLECT.store(true, std::sync::atomic::Ordering::Relaxed)
-            }
+            "--record-labels" => FALLBACK_COLLECT.store(true, std::sync::atomic::Ordering::Relaxed),
             "--bios" => bios_arg = Some(it.next().ok_or("--bios needs a value")?.to_string()),
             "--no-bios" => no_bios = true,
             other if rom_path.is_none() => rom_path = Some(other.to_string()),
@@ -896,7 +944,10 @@ fn cmd_play(args: &[String]) -> Result<(), String> {
     };
     if let Some(b) = &bios {
         use sha2::{Digest, Sha256};
-        let sha = Sha256::digest(b).iter().map(|x| format!("{x:02x}")).collect::<String>();
+        let sha = Sha256::digest(b)
+            .iter()
+            .map(|x| format!("{x:02x}"))
+            .collect::<String>();
         if let Some(m) = &manifest {
             if sha != m.bios_sha256 {
                 return Err(format!(
@@ -992,7 +1043,10 @@ Place your own dump as gba_bios.bin next to the executable:\n  {}",
         &title,
         240 * 3,
         160 * 3,
-        WindowOptions { resize: true, ..WindowOptions::default() },
+        WindowOptions {
+            resize: true,
+            ..WindowOptions::default()
+        },
     )
     .map_err(|e| e.to_string())?;
     // Pacing is audio-clock driven (below), not display driven: a 120 Hz
@@ -1001,7 +1055,6 @@ Place your own dump as gba_bios.bin next to the executable:\n  {}",
     if status {
         status_line("playing");
     }
-
 
     // Audio. The A/V config selects the output path: hardware-faithful
     // zero-order hold of the mixed 65536 Hz tap, or the premium path
@@ -1035,7 +1088,10 @@ Place your own dump as gba_bios.bin next to the executable:\n  {}",
         .map(|b| {
             let name = &icfg.keys[b.index()];
             let key = minifb_key(name).unwrap_or_else(|| {
-                eprintln!("input.cfg: unknown key {name:?} for {} — using default", b.name());
+                eprintln!(
+                    "input.cfg: unknown key {name:?} for {} — using default",
+                    b.name()
+                );
                 minifb_key(&defaults.keys[b.index()]).unwrap()
             });
             (key, b.bit())
@@ -1054,14 +1110,19 @@ Place your own dump as gba_bios.bin next to the executable:\n  {}",
     // screen objects derived from it rebuild in place on a change.
     let mut av = av;
     let mut screen_kind = screen::ScreenKind::by_name(&av.screen).unwrap_or_else(|| {
-        eprintln!("av.cfg: unknown video.screen {:?} — using frontlit", av.screen);
+        eprintln!(
+            "av.cfg: unknown video.screen {:?} — using frontlit",
+            av.screen
+        );
         screen::ScreenKind::Frontlit
     });
-    let display_target = screen::DisplayTarget::by_name(&av.display_gamut)
-        .unwrap_or_else(|| {
-            eprintln!("av.cfg: unknown video.gamut {:?} — using auto", av.display_gamut);
-            screen::DisplayTarget::Auto
-        });
+    let display_target = screen::DisplayTarget::by_name(&av.display_gamut).unwrap_or_else(|| {
+        eprintln!(
+            "av.cfg: unknown video.gamut {:?} — using auto",
+            av.display_gamut
+        );
+        screen::DisplayTarget::Auto
+    });
     let mut lut = screen::ColorLut::build(&screen::ColorSettings {
         screen: screen_kind,
         darken: input_config::AvConfig::knob(&av.screen_darken)
@@ -1070,7 +1131,10 @@ Place your own dump as gba_bios.bin next to the executable:\n  {}",
         target: display_target,
     });
     let mut response = screen::ResponseMode::by_name(&av.response).unwrap_or_else(|| {
-        eprintln!("av.cfg: unknown video.response {:?} — using smart", av.response);
+        eprintln!(
+            "av.cfg: unknown video.response {:?} — using smart",
+            av.response
+        );
         screen::ResponseMode::Smart
     });
     let mut temporal = screen::Temporal::new(
@@ -1086,14 +1150,13 @@ Place your own dump as gba_bios.bin next to the executable:\n  {}",
     );
     // GPU presenter on this window; if unavailable, the minifb CPU blit
     // below still carries the full color + response simulation (no grid).
-    let mut presenter =
-        match screen::present::Presenter::new(&window, 240, 160, display_target) {
-            Ok(p) => Some(p),
-            Err(e) => {
-                eprintln!("video: GPU presenter unavailable ({e}); basic scaling active");
-                None
-            }
-        };
+    let mut presenter = match screen::present::Presenter::new(&window, 240, 160, display_target) {
+        Ok(p) => Some(p),
+        Err(e) => {
+            eprintln!("video: GPU presenter unavailable ({e}); basic scaling active");
+            None
+        }
+    };
 
     let mut buf = vec![0u32; 240 * 160];
     let mut rgba = vec![[0u8; 4]; 240 * 160];
@@ -1180,10 +1243,18 @@ Place your own dump as gba_bios.bin next to the executable:\n  {}",
                         (gilrs::Axis::LeftStickX, gilrs::Axis::LeftStickY)
                     };
                     let (x, y) = (gp.value(ax), gp.value(ay));
-                    if x > dz { keys &= !(1 << 4); } // Right
-                    if x < -dz { keys &= !(1 << 5); } // Left
-                    if y > dz { keys &= !(1 << 6); } // Up
-                    if y < -dz { keys &= !(1 << 7); } // Down
+                    if x > dz {
+                        keys &= !(1 << 4);
+                    } // Right
+                    if x < -dz {
+                        keys &= !(1 << 5);
+                    } // Left
+                    if y > dz {
+                        keys &= !(1 << 6);
+                    } // Up
+                    if y < -dz {
+                        keys &= !(1 << 7);
+                    } // Down
                 }
                 // Menu nav from the pad: d-pad and sticks move the cursor;
                 // South confirms, East backs out. These steer the menu
@@ -1218,16 +1289,15 @@ Place your own dump as gba_bios.bin next to the executable:\n  {}",
         // rising edge quits instead, preserving the historical Escape =
         // quit behavior.
         let toggle_edge = nav.open && !nav_prev.open;
-        let reset_audio_counters =
-            |streams: &std::sync::Arc<std::sync::Mutex<AudioStreams>>| {
-                // Crossing the pause boundary, clear the audio defect
-                // counters so the drained-ring underruns during pause
-                // don't false-fire the DEGRADED alarm next report window.
-                let mut st = streams.lock().unwrap();
-                st.drops = 0;
-                st.holds = 0;
-                st.clipped = 0;
-            };
+        let reset_audio_counters = |streams: &std::sync::Arc<std::sync::Mutex<AudioStreams>>| {
+            // Crossing the pause boundary, clear the audio defect
+            // counters so the drained-ring underruns during pause
+            // don't false-fire the DEGRADED alarm next report window.
+            let mut st = streams.lock().unwrap();
+            st.drops = 0;
+            st.holds = 0;
+            st.clipped = 0;
+        };
         if toggle_edge {
             if !menu_enabled {
                 break;
@@ -1325,7 +1395,9 @@ Place your own dump as gba_bios.bin next to the executable:\n  {}",
                 for (dst, px) in buf.iter_mut().zip(rgba.iter()) {
                     *dst = (px[0] as u32) << 16 | (px[1] as u32) << 8 | px[2] as u32;
                 }
-                window.update_with_buffer(&buf, 240, 160).map_err(|e| e.to_string())?;
+                window
+                    .update_with_buffer(&buf, 240, 160)
+                    .map_err(|e| e.to_string())?;
             } else {
                 window.update();
             }
@@ -1384,7 +1456,11 @@ Place your own dump as gba_bios.bin next to the executable:\n  {}",
             // emulation cost approaches it, the product promise is broken —
             // say so once, with the number.
             let dt_ms = emu_t0.elapsed().as_secs_f64() * 1e3;
-            emu_ema_ms = if frames_run == 0 { dt_ms } else { emu_ema_ms * 0.95 + dt_ms * 0.05 };
+            emu_ema_ms = if frames_run == 0 {
+                dt_ms
+            } else {
+                emu_ema_ms * 0.95 + dt_ms * 0.05
+            };
             frames_run += 1;
             if !slow_warned && frames_run > 120 && emu_ema_ms > 15.0 {
                 slow_warned = true;
@@ -1400,7 +1476,11 @@ Place your own dump as gba_bios.bin next to the executable:\n  {}",
             // experience unless explicitly requested.
             if show_stats && frames_run % 60 == 0 {
                 let total = native_run + fallback_run;
-                let share = if total == 0 { 0.0 } else { native_run as f64 * 100.0 / total as f64 };
+                let share = if total == 0 {
+                    0.0
+                } else {
+                    native_run as f64 * 100.0 / total as f64
+                };
                 window.set_title(&format!(
                     "recomp · {emu_ema_ms:.2} ms/frame ({:.1}x headroom) · native {share:.0}%",
                     16.7 / emu_ema_ms.max(0.01),
@@ -1495,9 +1575,7 @@ Place your own dump as gba_bios.bin next to the executable:\n  {}",
                     };
                     if let Some((msg, pauses)) = pause_msg {
                         if pauses <= 3 {
-                            eprintln!(
-                                "DEGRADED: engine HLE paused (probing continues): {msg}"
-                            );
+                            eprintln!("DEGRADED: engine HLE paused (probing continues): {msg}");
                         } else if pauses == 4 {
                             eprintln!(
                                 "DEGRADED: engine HLE paused again: {msg} (further pauses unlogged)"
@@ -1590,7 +1668,9 @@ Place your own dump as gba_bios.bin next to the executable:\n  {}",
         for (dst, px) in buf.iter_mut().zip(rgba.iter()) {
             *dst = (px[0] as u32) << 16 | (px[1] as u32) << 8 | px[2] as u32;
         }
-        window.update_with_buffer(&buf, 240, 160).map_err(|e| e.to_string())?;
+        window
+            .update_with_buffer(&buf, 240, 160)
+            .map_err(|e| e.to_string())?;
     }
 
     if let Some(data) = m.bus.save_data() {
@@ -1655,10 +1735,10 @@ fn apply_av_change(
             // presenter mid-session.
         }
         menu::Changed::Video => {
-            *screen_kind = screen::ScreenKind::by_name(&av.screen)
-                .unwrap_or(screen::ScreenKind::Frontlit);
-            *response = screen::ResponseMode::by_name(&av.response)
-                .unwrap_or(screen::ResponseMode::Smart);
+            *screen_kind =
+                screen::ScreenKind::by_name(&av.screen).unwrap_or(screen::ScreenKind::Frontlit);
+            *response =
+                screen::ResponseMode::by_name(&av.response).unwrap_or(screen::ResponseMode::Smart);
             *lut = screen::ColorLut::build(&screen::ColorSettings {
                 screen: *screen_kind,
                 darken: input_config::AvConfig::knob(&av.screen_darken)
@@ -1858,9 +1938,7 @@ struct Enhanced {
 /// Build the cpal output stream over the shared streams. `enhanced`
 /// selects the premium output path; off reproduces the original
 /// zero-order-hold behavior exactly.
-fn start_audio(
-    streams: std::sync::Arc<std::sync::Mutex<AudioStreams>>,
-) -> Option<cpal::Stream> {
+fn start_audio(streams: std::sync::Arc<std::sync::Mutex<AudioStreams>>) -> Option<cpal::Stream> {
     use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
     let device = cpal::default_host().default_output_device()?;
     let cfg = device.default_output_config().ok()?;
@@ -1880,7 +1958,11 @@ fn start_audio(
     // Faithful↔enhanced crossfade: start matched to the loaded setting so
     // there's no fade at launch, then slew (~40 ms) whenever the menu
     // flips `enhanced_on`.
-    let mut mode_x: f32 = if streams.lock().unwrap().enhanced_on { 1.0 } else { 0.0 };
+    let mut mode_x: f32 = if streams.lock().unwrap().enhanced_on {
+        1.0
+    } else {
+        0.0
+    };
     let mode_k = (1.0 / (0.040 * rate)) as f32;
     let step = src / rate;
     let mut frac = 0.0f64;
@@ -2060,7 +2142,11 @@ fn build_sinc_table(fc: f64) -> Vec<f32> {
             } else {
                 (2.0 * PI * fc * t).sin() / (PI * t)
             };
-            let win = if t.abs() < half { 0.5 * (1.0 + (PI * t / half).cos()) } else { 0.0 };
+            let win = if t.abs() < half {
+                0.5 * (1.0 + (PI * t / half).cos())
+            } else {
+                0.0
+            };
             *c = sinc * win;
             sum += *c;
         }
@@ -2079,7 +2165,11 @@ struct DcBlock {
 
 impl DcBlock {
     fn new(out_hz: f64) -> DcBlock {
-        DcBlock { r: 1.0 - (2.0 * std::f64::consts::PI * 10.0 / out_hz) as f32, x1: 0.0, y1: 0.0 }
+        DcBlock {
+            r: 1.0 - (2.0 * std::f64::consts::PI * 10.0 / out_hz) as f32,
+            x1: 0.0,
+            y1: 0.0,
+        }
     }
 
     fn next(&mut self, x: f32) -> f32 {
@@ -2134,8 +2224,14 @@ impl SincResampler {
         }
         let row = &self.table[(self.frac * SINC_PHASES as f64) as usize * SINC_TAPS..][..SINC_TAPS];
         (
-            row.iter().zip(self.hist[0].iter()).map(|(c, s)| c * s).sum(),
-            row.iter().zip(self.hist[1].iter()).map(|(c, s)| c * s).sum(),
+            row.iter()
+                .zip(self.hist[0].iter())
+                .map(|(c, s)| c * s)
+                .sum(),
+            row.iter()
+                .zip(self.hist[1].iter())
+                .map(|(c, s)| c * s)
+                .sum(),
         )
     }
 }
@@ -2206,8 +2302,8 @@ impl FifoInterp {
             let delta = new_level - self.level;
             self.level = new_level;
             if delta != 0.0 {
-                let row = &self.table
-                    [(phi * SINC_PHASES as f64) as usize * SINC_TAPS..][..SINC_TAPS];
+                let row =
+                    &self.table[(phi * SINC_PHASES as f64) as usize * SINC_TAPS..][..SINC_TAPS];
                 for (k, c) in row.iter().enumerate() {
                     self.fut[(self.pos + k) % (SINC_TAPS * 2)] += delta * c;
                 }
@@ -2226,16 +2322,52 @@ impl FifoInterp {
 fn minifb_key(name: &str) -> Option<minifb::Key> {
     use minifb::Key::*;
     Some(match name {
-        "A" => A, "B" => B, "C" => C, "D" => D, "E" => E, "F" => F, "G" => G,
-        "H" => H, "I" => I, "J" => J, "K" => K, "L" => L, "M" => M, "N" => N,
-        "O" => O, "P" => P, "Q" => Q, "R" => R, "S" => S, "T" => T, "U" => U,
-        "V" => V, "W" => W, "X" => X, "Y" => Y, "Z" => Z,
-        "0" => Key0, "1" => Key1, "2" => Key2, "3" => Key3, "4" => Key4,
-        "5" => Key5, "6" => Key6, "7" => Key7, "8" => Key8, "9" => Key9,
-        "Up" => Up, "Down" => Down, "Left" => Left, "Right" => Right,
-        "Enter" => Enter, "Space" => Space, "Tab" => Tab,
+        "A" => A,
+        "B" => B,
+        "C" => C,
+        "D" => D,
+        "E" => E,
+        "F" => F,
+        "G" => G,
+        "H" => H,
+        "I" => I,
+        "J" => J,
+        "K" => K,
+        "L" => L,
+        "M" => M,
+        "N" => N,
+        "O" => O,
+        "P" => P,
+        "Q" => Q,
+        "R" => R,
+        "S" => S,
+        "T" => T,
+        "U" => U,
+        "V" => V,
+        "W" => W,
+        "X" => X,
+        "Y" => Y,
+        "Z" => Z,
+        "0" => Key0,
+        "1" => Key1,
+        "2" => Key2,
+        "3" => Key3,
+        "4" => Key4,
+        "5" => Key5,
+        "6" => Key6,
+        "7" => Key7,
+        "8" => Key8,
+        "9" => Key9,
+        "Up" => Up,
+        "Down" => Down,
+        "Left" => Left,
+        "Right" => Right,
+        "Enter" => Enter,
+        "Space" => Space,
+        "Tab" => Tab,
         "Backspace" => Backspace,
-        "LeftShift" => LeftShift, "RightShift" => RightShift,
+        "LeftShift" => LeftShift,
+        "RightShift" => RightShift,
         _ => return None,
     })
 }
@@ -2264,14 +2396,25 @@ fn build_gilrs() -> Option<gilrs::Gilrs> {
 fn gilrs_button(name: &str) -> Option<gilrs::Button> {
     use gilrs::Button::*;
     Some(match name {
-        "South" => South, "East" => East, "North" => North, "West" => West,
-        "C" => C, "Z" => Z,
-        "LeftTrigger" => LeftTrigger, "LeftTrigger2" => LeftTrigger2,
-        "RightTrigger" => RightTrigger, "RightTrigger2" => RightTrigger2,
-        "Select" => Select, "Start" => Start, "Mode" => Mode,
-        "LeftThumb" => LeftThumb, "RightThumb" => RightThumb,
-        "DPadUp" => DPadUp, "DPadDown" => DPadDown,
-        "DPadLeft" => DPadLeft, "DPadRight" => DPadRight,
+        "South" => South,
+        "East" => East,
+        "North" => North,
+        "West" => West,
+        "C" => C,
+        "Z" => Z,
+        "LeftTrigger" => LeftTrigger,
+        "LeftTrigger2" => LeftTrigger2,
+        "RightTrigger" => RightTrigger,
+        "RightTrigger2" => RightTrigger2,
+        "Select" => Select,
+        "Start" => Start,
+        "Mode" => Mode,
+        "LeftThumb" => LeftThumb,
+        "RightThumb" => RightThumb,
+        "DPadUp" => DPadUp,
+        "DPadDown" => DPadDown,
+        "DPadLeft" => DPadLeft,
+        "DPadRight" => DPadRight,
         _ => return None,
     })
 }
@@ -2289,13 +2432,19 @@ fn stick_token_active(gp: &gilrs::Gamepad, tok: input_config::StickToken, deadzo
         (false, false) => RightStickY,
     };
     let v = gp.value(axis);
-    if positive { v > deadzone } else { v < -deadzone }
+    if positive {
+        v > deadzone
+    } else {
+        v < -deadzone
+    }
 }
 
 /// Is the configured pad binding (button name or stick token) active?
 fn pad_pressed(gp: &gilrs::Gamepad, name: &str, deadzone: f32) -> bool {
     match input_config::pad_binding(name) {
-        input_config::PadBinding::Button(b) => gilrs_button(b).is_some_and(|btn| gp.is_pressed(btn)),
+        input_config::PadBinding::Button(b) => {
+            gilrs_button(b).is_some_and(|btn| gp.is_pressed(btn))
+        }
         input_config::PadBinding::Stick(t) => stick_token_active(gp, t, deadzone),
     }
 }
@@ -2322,7 +2471,10 @@ fn cmd_build(args: &[String]) -> Result<(), String> {
     let rom_path = &rom_path.ok_or("missing ROM path")?;
     std::fs::create_dir_all("out").map_err(|e| e.to_string())?;
     let stem = Path::new(rom_path)
-        .file_stem().and_then(|s| s.to_str()).unwrap_or("game").to_string();
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("game")
+        .to_string();
     // Real-BIOS builds get their own artifact: the translation bakes in
     // different boot/SWI semantics, so it must never shadow an HLE build.
     let suffix = if bios.is_some() { "-bios" } else { "" };
@@ -2488,12 +2640,23 @@ fn build_dylib(
                 prev_end = e;
             }
         }
-        println!("profiled {} RAM entry points over {} frames", seeds.len(), m.bus.frames);
+        println!(
+            "profiled {} RAM entry points over {} frames",
+            seeds.len(),
+            m.bus.frames
+        );
         progress(
             prof_end,
-            &format!("test drive done \u{2014} {} live code paths spotted", seeds.len()),
+            &format!(
+                "test drive done \u{2014} {} live code paths spotted",
+                seeds.len()
+            ),
         );
-        (seeds.into_iter().collect::<Vec<u32>>(), m.bus.ewram.clone(), m.bus.iwram.clone())
+        (
+            seeds.into_iter().collect::<Vec<u32>>(),
+            m.bus.ewram.clone(),
+            m.bus.iwram.clone(),
+        )
     };
 
     // Label-file seeds: runtime-discovered entry points (recorded
@@ -2533,9 +2696,7 @@ fn build_dylib(
                 }
                 dense += 1;
             }
-            println!(
-                "labels: exhaustive in-function seeding over {dense} bounded functions"
-            );
+            println!("labels: exhaustive in-function seeding over {dense} bounded functions");
         }
         let rom_added = set.len() - before;
         let mut iw_added = 0usize;
@@ -2592,8 +2753,16 @@ run play/runc --record-labels to capture one"
 
     let view = analyze::View {
         rom: &rom,
-        ewram: if ram && ewram_xlat { Some(&ewram) } else { None },
-        iwram: if !iwram.is_empty() { Some(&iwram) } else { None },
+        ewram: if ram && ewram_xlat {
+            Some(&ewram)
+        } else {
+            None
+        },
+        iwram: if !iwram.is_empty() {
+            Some(&iwram)
+        } else {
+            None
+        },
         bios,
     };
     progress(prof_end + 1, "charting every reachable code path\u{2026}");
@@ -2602,7 +2771,10 @@ run play/runc --record-labels to capture one"
     println!("blocks: {} instructions: {n_instrs}", analysis.blocks.len());
     progress(
         prof_end + 2,
-        &format!("map drawn: {} code blocks to translate", analysis.blocks.len()),
+        &format!(
+            "map drawn: {} code blocks to translate",
+            analysis.blocks.len()
+        ),
     );
 
     let prefix = lib_path.strip_suffix(".dylib").unwrap_or(lib_path);
@@ -2645,7 +2817,8 @@ run play/runc --record-labels to capture one"
                 None => {
                     let frac = (t0.elapsed().as_secs_f64() / est_secs).min(0.95);
                     let pct = p0 + ((p1.saturating_sub(p0)) as f64 * frac) as u8;
-                    let dots = ["\u{2026}", "\u{2026}\u{2026}", "\u{2026}\u{2026}\u{2026}"][spin % 3];
+                    let dots =
+                        ["\u{2026}", "\u{2026}\u{2026}", "\u{2026}\u{2026}\u{2026}"][spin % 3];
                     spin += 1;
                     progress(
                         pct,
@@ -2667,7 +2840,10 @@ run play/runc --record-labels to capture one"
             return Err(format!("cc failed on {c_path}"));
         }
         objs.push(o_path);
-        progress(p1, &format!("{blocks_done} of {total_blocks} blocks translated"));
+        progress(
+            p1,
+            &format!("{blocks_done} of {total_blocks} blocks translated"),
+        );
         Ok(())
     })?;
 
@@ -3011,7 +3187,9 @@ fn record_labels(rom_len: usize, sha: &str) -> Result<(), String> {
     // session's bytes override prior sessions where captured (they
     // reflect the overlays actually seen; guards reject the rest).
     IWRAM_CAP.with(|c| -> Result<(), String> {
-        let Some(cap) = c.borrow_mut().take() else { return Ok(()) };
+        let Some(cap) = c.borrow_mut().take() else {
+            return Ok(());
+        };
         let bp = labels::blob_path(sha);
         let mut blob = labels::Blob::load(&bp).unwrap_or_else(labels::Blob::new);
         for i in 0..labels::IWRAM_LEN {
@@ -3021,7 +3199,10 @@ fn record_labels(rom_len: usize, sha: &str) -> Result<(), String> {
             }
         }
         blob.save(&bp)?;
-        eprintln!("labels: iwram snapshot updated ({} bytes valid)", blob.valid_bytes());
+        eprintln!(
+            "labels: iwram snapshot updated ({} bytes valid)",
+            blob.valid_bytes()
+        );
         Ok(())
     })?;
     eprintln!(
@@ -3152,7 +3333,10 @@ fn term_progress(pct: u8, msg: &str) {
 /// SHA-256 of the image, hex — the cross-tool image identity.
 fn rom_sha256(rom: &[u8]) -> String {
     use sha2::{Digest, Sha256};
-    Sha256::digest(rom).iter().map(|b| format!("{b:02x}")).collect()
+    Sha256::digest(rom)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 /// Dump the fallback-entry census: per-region totals plus the hottest
@@ -3197,7 +3381,6 @@ fn print_fallback_census() {
 /// Run a recompiled image: translated blocks where available, interpreter
 /// fallback elsewhere, interrupt machinery at block boundaries.
 fn cmd_runc(args: &[String]) -> Result<(), String> {
-
     let mut rom_path = None;
     let mut frames = 600u64;
     let mut out: Option<String> = None;
@@ -3207,16 +3390,19 @@ fn cmd_runc(args: &[String]) -> Result<(), String> {
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "--frames" => {
-                frames = it.next().ok_or("--frames needs a value")?
-                    .parse().map_err(|e| format!("bad frames: {e}"))?
+                frames = it
+                    .next()
+                    .ok_or("--frames needs a value")?
+                    .parse()
+                    .map_err(|e| format!("bad frames: {e}"))?
             }
             "--out" => out = Some(it.next().ok_or("--out needs a value")?.to_string()),
             "--input" => {
-                input = Some(InputScript::load(it.next().ok_or("--input needs a value")?)?)
+                input = Some(InputScript::load(
+                    it.next().ok_or("--input needs a value")?,
+                )?)
             }
-            "--record-labels" => {
-                FALLBACK_COLLECT.store(true, std::sync::atomic::Ordering::Relaxed)
-            }
+            "--record-labels" => FALLBACK_COLLECT.store(true, std::sync::atomic::Ordering::Relaxed),
             "--bios" => bios = Some(load_bios_file(it.next().ok_or("--bios needs a value")?)?),
             other if rom_path.is_none() => rom_path = Some(other.to_string()),
             other => return Err(format!("unexpected argument {other:?}")),
@@ -3225,12 +3411,15 @@ fn cmd_runc(args: &[String]) -> Result<(), String> {
     let rom_path = rom_path.ok_or("missing ROM path")?;
     let rom = std::fs::read(&rom_path).map_err(|e| format!("{rom_path}: {e}"))?;
     let stem = Path::new(&rom_path)
-        .file_stem().and_then(|s| s.to_str()).unwrap_or("game").to_string();
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("game")
+        .to_string();
     let suffix = if bios.is_some() { "-bios" } else { "" };
     let lib_path = format!("out/{stem}{suffix}.dylib");
 
-    let lib = unsafe { libloading::Library::new(&lib_path) }
-        .map_err(|e| format!("{lib_path}: {e}"))?;
+    let lib =
+        unsafe { libloading::Library::new(&lib_path) }.map_err(|e| format!("{lib_path}: {e}"))?;
     let table = BlockTable::load(&lib)?;
     println!("loaded {} translated blocks", table.len);
 
@@ -3248,7 +3437,9 @@ fn cmd_runc(args: &[String]) -> Result<(), String> {
     // Diagnostic (RECOMP_COST_FROM=N): from frame N on, attribute charged
     // cycles to the dispatch key (block entry or interp PC) that incurred
     // them; dump the histogram at exit.
-    let cost_from: Option<u64> = std::env::var("RECOMP_COST_FROM").ok().and_then(|v| v.parse().ok());
+    let cost_from: Option<u64> = std::env::var("RECOMP_COST_FROM")
+        .ok()
+        .and_then(|v| v.parse().ok());
     let mut cost: std::collections::HashMap<u32, u64> = std::collections::HashMap::new();
     while m.bus.frames < frames {
         let before = m.bus.frames;
@@ -3406,20 +3597,19 @@ fn cmd_verify(args: &[String]) -> Result<(), String> {
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "--frames" => {
-                frames = it.next().ok_or("--frames needs a value")?
-                    .parse().map_err(|e| format!("bad frames: {e}"))?
+                frames = it
+                    .next()
+                    .ok_or("--frames needs a value")?
+                    .parse()
+                    .map_err(|e| format!("bad frames: {e}"))?
             }
             // Triage helpers: --reuse skips the rebuild when out/<stem>.dylib
             // already exists; --dump <prefix> writes both final frames as
             // <prefix>.interp.ppm / <prefix>.recomp.ppm.
             "--reuse" => reuse = true,
             "--dump" => dump = Some(it.next().ok_or("--dump needs a value")?.to_string()),
-            "--input" => {
-                input = Some(it.next().ok_or("--input needs a value")?.to_string())
-            }
-            "--bios" => {
-                bios_path = Some(it.next().ok_or("--bios needs a value")?.to_string())
-            }
+            "--input" => input = Some(it.next().ok_or("--input needs a value")?.to_string()),
+            "--bios" => bios_path = Some(it.next().ok_or("--bios needs a value")?.to_string()),
             other if rom_path.is_none() => rom_path = Some(other.to_string()),
             other => return Err(format!("unexpected argument {other:?}")),
         }
@@ -3428,7 +3618,10 @@ fn cmd_verify(args: &[String]) -> Result<(), String> {
     let bios = bios_path.as_deref().map(load_bios_file).transpose()?;
 
     let stem = Path::new(&rom_path)
-        .file_stem().and_then(|s| s.to_str()).unwrap_or("game").to_string();
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("game")
+        .to_string();
     let suffix = if bios.is_some() { "-bios" } else { "" };
     if !(reuse && Path::new(&format!("out/{stem}{suffix}.dylib")).is_file()) {
         let mut build_args = vec![rom_path.clone()];
@@ -3438,15 +3631,34 @@ fn cmd_verify(args: &[String]) -> Result<(), String> {
         cmd_build(&build_args)?;
     }
     let script = input.as_deref().map(InputScript::load).transpose()?;
-    let interp = run_hash(&rom_path, frames, false, script.as_ref(), bios.as_deref(),
-        dump.as_ref().map(|p| format!("{p}.interp.ppm")))?;
-    let recomp = run_hash(&rom_path, frames, true, script.as_ref(), bios.as_deref(),
-        dump.as_ref().map(|p| format!("{p}.recomp.ppm")))?;
-    let verdict = if interp == recomp { "MATCH" } else { "MISMATCH" };
+    let interp = run_hash(
+        &rom_path,
+        frames,
+        false,
+        script.as_ref(),
+        bios.as_deref(),
+        dump.as_ref().map(|p| format!("{p}.interp.ppm")),
+    )?;
+    let recomp = run_hash(
+        &rom_path,
+        frames,
+        true,
+        script.as_ref(),
+        bios.as_deref(),
+        dump.as_ref().map(|p| format!("{p}.recomp.ppm")),
+    )?;
+    let verdict = if interp == recomp {
+        "MATCH"
+    } else {
+        "MISMATCH"
+    };
     println!("verify {verdict} interp={interp:016x} recomp={recomp:016x}");
-    if interp == recomp { Ok(()) } else { Err("differential mismatch".into()) }
+    if interp == recomp {
+        Ok(())
+    } else {
+        Err("differential mismatch".into())
+    }
 }
-
 
 /// Deterministic demo input for differential runs: taps Start, then A,
 /// periodically — enough to leave title screens and menus in most games.
@@ -3507,11 +3719,14 @@ fn run_hash(
         return Ok(fb_hash(&m));
     }
     let stem = Path::new(rom_path)
-        .file_stem().and_then(|s| s.to_str()).unwrap_or("game").to_string();
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("game")
+        .to_string();
     let suffix = if bios.is_some() { "-bios" } else { "" };
     let lib_path = format!("out/{stem}{suffix}.dylib");
-    let lib = unsafe { libloading::Library::new(&lib_path) }
-        .map_err(|e| format!("{lib_path}: {e}"))?;
+    let lib =
+        unsafe { libloading::Library::new(&lib_path) }.map_err(|e| format!("{lib_path}: {e}"))?;
     let table = BlockTable::load(&lib)?;
     let mptr = &mut m as *mut Machine as *mut std::ffi::c_void;
     while m.bus.frames < frames {
@@ -3585,7 +3800,12 @@ mod tests {
             q.push_back(s as f32 * 0.5);
             q.push_back(s as f32 * 0.5);
         }
-        let out: Vec<f32> = (0..40000).map(|_| { let (l, r2) = r.next(&mut q); (l + r2) * 0.5 }).collect();
+        let out: Vec<f32> = (0..40000)
+            .map(|_| {
+                let (l, r2) = r.next(&mut q);
+                (l + r2) * 0.5
+            })
+            .collect();
         let rms = (out[2000..38000].iter().map(|v| v * v).sum::<f32>() / 36000.0).sqrt();
         let expect = 0.5 / 2f32.sqrt(); // amplitude 0.5 sine
         assert!(
@@ -3615,7 +3835,10 @@ mod tests {
         let out: Vec<f32> = (0..96000).map(|_| f.next(&mut q)).collect();
         let rms = (out[2000..90000].iter().map(|v| v * v).sum::<f32>() / 88000.0).sqrt();
         let expect = (100.0 * 64.0 / 32768.0) / 2f32.sqrt();
-        assert!((rms - expect).abs() / expect < 0.05, "rms {rms} vs {expect}");
+        assert!(
+            (rms - expect).abs() / expect < 0.05,
+            "rms {rms} vs {expect}"
+        );
     }
 
     #[test]

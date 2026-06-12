@@ -130,7 +130,11 @@ fn sample(x: f32, y: f32) -> [f32; 4] {
 /// 64×64 window icon for egui's `ViewportBuilder::with_icon`.
 pub fn app_icon() -> egui::IconData {
     const S: u32 = 64;
-    egui::IconData { rgba: render_icon_rgba(S as usize), width: S, height: S }
+    egui::IconData {
+        rgba: render_icon_rgba(S as usize),
+        width: S,
+        height: S,
+    }
 }
 
 /// Encode an 8-bit RGBA buffer as a PNG (truecolor + alpha). Used by the
@@ -140,7 +144,11 @@ pub fn encode_png_rgba(rgba: &[u8], width: u32, height: u32) -> Vec<u8> {
     use flate2::{write::ZlibEncoder, Compression};
     use std::io::Write;
 
-    assert_eq!(rgba.len(), (width * height * 4) as usize, "rgba size mismatch");
+    assert_eq!(
+        rgba.len(),
+        (width * height * 4) as usize,
+        "rgba size mismatch"
+    );
     // Filter byte 0 (None) per scanline, then zlib-compress the lot.
     let mut raw = Vec::with_capacity((width * height * 4 + height) as usize);
     let stride = (width * 4) as usize;
@@ -179,7 +187,11 @@ fn crc32(data: &[u8]) -> u32 {
     for &byte in data {
         crc ^= byte as u32;
         for _ in 0..8 {
-            crc = if crc & 1 != 0 { (crc >> 1) ^ 0xedb8_8320 } else { crc >> 1 };
+            crc = if crc & 1 != 0 {
+                (crc >> 1) ^ 0xedb8_8320
+            } else {
+                crc >> 1
+            };
         }
     }
     !crc

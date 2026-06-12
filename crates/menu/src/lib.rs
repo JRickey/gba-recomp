@@ -131,7 +131,11 @@ impl Menu {
     /// `gamut_live` tell the menu whether those settings take effect
     /// immediately (it annotates the rows that don't).
     pub fn new(audio_live: bool, gamut_live: bool) -> Menu {
-        Menu { selected: 0, audio_live, gamut_live }
+        Menu {
+            selected: 0,
+            audio_live,
+            gamut_live,
+        }
     }
 
     /// Reset selection to the top (called on each open so the cursor
@@ -217,14 +221,32 @@ impl Menu {
         draw_text(rgba, w, h, tx, ty, "PAUSED", TITLE_FG, 1);
         ty += line_h;
         // Title rule, in the launcher's accent — ties the surfaces together.
-        fill_rect(rgba, w, h, panel_x + pad, ty, panel_w - pad * 2, 1, PANEL_EDGE);
+        fill_rect(
+            rgba,
+            w,
+            h,
+            panel_x + pad,
+            ty,
+            panel_w - pad * 2,
+            1,
+            PANEL_EDGE,
+        );
         ty += 6;
 
         for (i, row) in Row::ALL.iter().enumerate() {
             let sel = i == self.selected;
             if sel {
                 // Selection highlight bar behind the row.
-                fill_rect(rgba, w, h, panel_x + 2, ty - 2, panel_w - 4, line_h, SELECT_BAR);
+                fill_rect(
+                    rgba,
+                    w,
+                    h,
+                    panel_x + 2,
+                    ty - 2,
+                    panel_w - 4,
+                    line_h,
+                    SELECT_BAR,
+                );
             }
             let fg = if sel { SELECT_FG } else { ROW_FG };
             let cursor = if sel { ">" } else { " " };
@@ -245,9 +267,9 @@ impl Menu {
             let val = value_of(*row, av);
             let glyph = font::W + 1;
             let lx = tx + glyph;
-            let val_left = val.as_ref().map(|v| {
-                panel_x + panel_w - pad - v.chars().count() * glyph
-            });
+            let val_left = val
+                .as_ref()
+                .map(|v| panel_x + panel_w - pad - v.chars().count() * glyph);
             let label_cap = match val_left {
                 Some(vl) if vl > lx => (vl - lx) / glyph,
                 Some(_) => 0,
@@ -258,7 +280,16 @@ impl Menu {
             }
             draw_text(rgba, w, h, lx, ty, &label, fg, 1);
             if let (Some(v), Some(vx)) = (val, val_left) {
-                draw_text(rgba, w, h, vx, ty, &v, if sel { SELECT_FG } else { VALUE_FG }, 1);
+                draw_text(
+                    rgba,
+                    w,
+                    h,
+                    vx,
+                    ty,
+                    &v,
+                    if sel { SELECT_FG } else { VALUE_FG },
+                    1,
+                );
             }
             ty += line_h;
         }
@@ -345,7 +376,11 @@ fn step_knob(cur: &str, forward: bool) -> String {
 fn step_enum<T: Copy + PartialEq>(all: &[T], cur: T, forward: bool) -> T {
     let i = all.iter().position(|&x| x == cur).unwrap_or(0);
     let n = all.len();
-    if forward { all[(i + 1) % n] } else { all[(i + n - 1) % n] }
+    if forward {
+        all[(i + 1) % n]
+    } else {
+        all[(i + n - 1) % n]
+    }
 }
 
 fn screen_kind(av: &AvConfig) -> ScreenKind {
@@ -432,14 +467,7 @@ fn draw_text(
                 if bits & (0x80 >> col) != 0 {
                     for sy in 0..scale {
                         for sx in 0..scale {
-                            put(
-                                rgba,
-                                w,
-                                h,
-                                cx + col * scale + sx,
-                                y + row * scale + sy,
-                                c,
-                            );
+                            put(rgba, w, h, cx + col * scale + sx, y + row * scale + sy, c);
                         }
                     }
                 }
@@ -485,10 +513,19 @@ mod tests {
         let mut av = AvConfig::default();
         let mut menu = Menu::new(true, true);
         menu.selected = 0;
-        assert_eq!(menu.handle(MenuInput::Confirm, &mut av), Some(MenuAction::Resume));
-        assert_eq!(menu.handle(MenuInput::Cancel, &mut av), Some(MenuAction::Resume));
+        assert_eq!(
+            menu.handle(MenuInput::Confirm, &mut av),
+            Some(MenuAction::Resume)
+        );
+        assert_eq!(
+            menu.handle(MenuInput::Cancel, &mut av),
+            Some(MenuAction::Resume)
+        );
         menu.selected = Row::ALL.len() - 1; // Quit
-        assert_eq!(menu.handle(MenuInput::Confirm, &mut av), Some(MenuAction::Quit));
+        assert_eq!(
+            menu.handle(MenuInput::Confirm, &mut av),
+            Some(MenuAction::Quit)
+        );
     }
 
     #[test]

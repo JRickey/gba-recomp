@@ -250,14 +250,28 @@ impl Default for InputConfig {
             gamepad_name: String::new(),
             // the historical play-command mapping
             keys: [
-                s("Z"), s("X"), s("RightShift"), s("Enter"),
-                s("Right"), s("Left"), s("Up"), s("Down"),
-                s("S"), s("A"),
+                s("Z"),
+                s("X"),
+                s("RightShift"),
+                s("Enter"),
+                s("Right"),
+                s("Left"),
+                s("Up"),
+                s("Down"),
+                s("S"),
+                s("A"),
             ],
             pads: [
-                s("East"), s("South"), s("Select"), s("Start"),
-                s("DPadRight"), s("DPadLeft"), s("DPadUp"), s("DPadDown"),
-                s("RightTrigger"), s("LeftTrigger"),
+                s("East"),
+                s("South"),
+                s("Select"),
+                s("Start"),
+                s("DPadRight"),
+                s("DPadLeft"),
+                s("DPadUp"),
+                s("DPadDown"),
+                s("RightTrigger"),
+                s("LeftTrigger"),
             ],
             // Default matches the historical hardcoded play behavior:
             // left stick AND the physical d-pad bindings both steer.
@@ -272,7 +286,9 @@ impl InputConfig {
         let mut cfg = Self::default();
         for line in text.lines() {
             let line = line.split('#').next().unwrap_or("").trim();
-            let Some((k, v)) = line.split_once('=') else { continue };
+            let Some((k, v)) = line.split_once('=') else {
+                continue;
+            };
             let (k, v) = (k.trim(), v.trim());
             match k {
                 "device" => {
@@ -420,7 +436,9 @@ impl AvConfig {
         let mut cfg = Self::default();
         for line in text.lines() {
             let line = line.split('#').next().unwrap_or("").trim();
-            let Some((k, v)) = line.split_once('=') else { continue };
+            let Some((k, v)) = line.split_once('=') else {
+                continue;
+            };
             let v = v.trim();
             match k.trim() {
                 "audio.enhanced" => cfg.audio_enhanced = v.eq_ignore_ascii_case("true"),
@@ -524,8 +542,7 @@ pub const BIOS_SIZE: usize = 0x4000;
 /// SHA-256 of the canonical BIOS dump. Other images (homebrew
 /// replacements, bad dumps) are warned about loudly but still tried —
 /// the user owns the choice.
-pub const BIOS_SHA256: &str =
-    "fd2547724b505f487e6dcb29ec2ecff3af35a841a77ab2e85fd87350abd36570";
+pub const BIOS_SHA256: &str = "fd2547724b505f487e6dcb29ec2ecff3af35a841a77ab2e85fd87350abd36570";
 
 /// Directory of the running executable — the "release directory" for
 /// portable installs. The exe path is canonicalized first so symlinked
@@ -624,7 +641,8 @@ mod tests {
 
     #[test]
     fn parse_tolerates_noise() {
-        let cfg = InputConfig::parse("garbage\nkey.a = Q # comment\nkey.zz = NO\ndevice = GAMEPAD\n");
+        let cfg =
+            InputConfig::parse("garbage\nkey.a = Q # comment\nkey.zz = NO\ndevice = GAMEPAD\n");
         assert_eq!(cfg.keys[Button::A.index()], "Q");
         assert_eq!(cfg.device, Device::Gamepad);
         assert_eq!(cfg.keys[Button::B.index()], "X"); // untouched default
@@ -636,7 +654,11 @@ mod tests {
         let s = InputConfig::default().serialize();
         assert!(s.contains("dpad_source = both\n"), "got:\n{s}");
         assert!(s.contains("stick_deadzone = 0.50\n"), "got:\n{s}");
-        let cfg = InputConfig { dpad_source: DpadSource::RightStick, stick_deadzone: 0.25, ..InputConfig::default() };
+        let cfg = InputConfig {
+            dpad_source: DpadSource::RightStick,
+            stick_deadzone: 0.25,
+            ..InputConfig::default()
+        };
         let s = cfg.serialize();
         assert!(s.contains("dpad_source = rightstick\n"), "got:\n{s}");
         assert!(s.contains("stick_deadzone = 0.25\n"), "got:\n{s}");
@@ -661,15 +683,27 @@ mod tests {
         );
 
         // deadzone clamps into the launcher's range; garbage keeps default.
-        assert_eq!(InputConfig::parse("stick_deadzone = 0.01\n").stick_deadzone, DEADZONE_MIN);
-        assert_eq!(InputConfig::parse("stick_deadzone = 9.0\n").stick_deadzone, DEADZONE_MAX);
-        assert_eq!(InputConfig::parse("stick_deadzone = abc\n").stick_deadzone, DEADZONE_DEFAULT);
+        assert_eq!(
+            InputConfig::parse("stick_deadzone = 0.01\n").stick_deadzone,
+            DEADZONE_MIN
+        );
+        assert_eq!(
+            InputConfig::parse("stick_deadzone = 9.0\n").stick_deadzone,
+            DEADZONE_MAX
+        );
+        assert_eq!(
+            InputConfig::parse("stick_deadzone = abc\n").stick_deadzone,
+            DEADZONE_DEFAULT
+        );
     }
 
     #[test]
     fn stick_tokens_classify_and_resolve() {
         // A stick token resolves to Stick; anything else is a button.
-        assert!(matches!(pad_binding("LeftStickUp"), PadBinding::Stick(StickToken::LeftStickUp)));
+        assert!(matches!(
+            pad_binding("LeftStickUp"),
+            PadBinding::Stick(StickToken::LeftStickUp)
+        ));
         assert!(matches!(pad_binding("South"), PadBinding::Button("South")));
         // axis geometry: horizontal flag + positive direction.
         assert_eq!(StickToken::LeftStickRight.axis(), (true, true));
@@ -681,7 +715,10 @@ mod tests {
     #[test]
     fn av_roundtrip_and_default_off() {
         assert!(!AvConfig::default().audio_enhanced);
-        let cfg = AvConfig { audio_enhanced: true, ..AvConfig::default() };
+        let cfg = AvConfig {
+            audio_enhanced: true,
+            ..AvConfig::default()
+        };
         assert_eq!(AvConfig::parse(&cfg.serialize()), cfg);
         assert_eq!(
             AvConfig::parse("junk\naudio.enhanced = TRUE # ok\n"),

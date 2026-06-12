@@ -136,8 +136,7 @@ impl Temporal {
             }
             ResponseMode::Smart => {
                 let have_window = self.filled >= RING;
-                let f: [&[u16]; RING] =
-                    [0, 1, 2, 3, 4, 5].map(|age| self.frame(age));
+                let f: [&[u16]; RING] = [0, 1, 2, 3, 4, 5].map(|age| self.frame(age));
                 for i in 0..self.pixels {
                     let cur = lut.table[(f[0][i] & 0x7FFF) as usize];
                     out[i] = if have_window && self.alternating(&f, i) {
@@ -224,8 +223,9 @@ mod tests {
     #[test]
     fn simple_halves_alternation() {
         let lut = raw_lut();
-        let frames: Vec<Vec<u16>> =
-            (0..6).map(|i| vec![if i % 2 == 0 { WHITE } else { BLACK }]).collect();
+        let frames: Vec<Vec<u16>> = (0..6)
+            .map(|i| vec![if i % 2 == 0 { WHITE } else { BLACK }])
+            .collect();
         let out = run(ResponseMode::Simple, &frames, &lut);
         assert_eq!(out[0][0], 128); // (255 + 0 + 1) >> 1
     }
@@ -237,25 +237,24 @@ mod tests {
         // pixel 2 cycles 3 values (irregular — must NOT blend).
         let third = [WHITE, BLACK, 0x03E0u16];
         let frames: Vec<Vec<u16>> = (0..6)
-            .map(|i| {
-                vec![
-                    if i % 2 == 0 { WHITE } else { BLACK },
-                    WHITE,
-                    third[i % 3],
-                ]
-            })
+            .map(|i| vec![if i % 2 == 0 { WHITE } else { BLACK }, WHITE, third[i % 3]])
             .collect();
         let out = run(ResponseMode::Smart, &frames, &lut);
         assert_eq!(out[0][0], 128, "alternating pixel blends");
         assert_eq!(out[1][0], 255, "static pixel untouched");
-        assert_eq!(out[2], lut.table[third[(6 - 1) % 3] as usize], "irregular pixel untouched");
+        assert_eq!(
+            out[2],
+            lut.table[third[(6 - 1) % 3] as usize],
+            "irregular pixel untouched"
+        );
     }
 
     #[test]
     fn smart_waits_for_full_window() {
         let lut = raw_lut();
-        let frames: Vec<Vec<u16>> =
-            (0..3).map(|i| vec![if i % 2 == 0 { WHITE } else { BLACK }]).collect();
+        let frames: Vec<Vec<u16>> = (0..3)
+            .map(|i| vec![if i % 2 == 0 { WHITE } else { BLACK }])
+            .collect();
         let out = run(ResponseMode::Smart, &frames, &lut);
         // Only 3 frames seen: passes through current frame unblended.
         assert_eq!(out[0][0], 255);
@@ -306,8 +305,9 @@ mod tests {
     #[test]
     fn off_is_pass_through() {
         let lut = raw_lut();
-        let frames: Vec<Vec<u16>> =
-            (0..6).map(|i| vec![if i % 2 == 0 { WHITE } else { BLACK }]).collect();
+        let frames: Vec<Vec<u16>> = (0..6)
+            .map(|i| vec![if i % 2 == 0 { WHITE } else { BLACK }])
+            .collect();
         let out = run(ResponseMode::Off, &frames, &lut);
         assert_eq!(out[0], lut.table[BLACK as usize]);
     }

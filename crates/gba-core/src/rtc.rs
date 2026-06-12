@@ -118,7 +118,9 @@ impl Rtc {
             // "set the time" prompt. 24-hour mode left for the game to set.
             control: 0,
             offset: 0,
-            fixed: std::env::var("RECOMP_RTC_EPOCH").ok().and_then(|s| s.trim().parse().ok()),
+            fixed: std::env::var("RECOMP_RTC_EPOCH")
+                .ok()
+                .and_then(|s| s.trim().parse().ok()),
             trace: std::env::var_os("RECOMP_TRACE_RTC").is_some(),
         }
     }
@@ -370,7 +372,12 @@ impl Rtc {
         if self.trace {
             eprintln!(
                 "rtc: clock set to {:04}-{:02}-{:02} {:02}:{:02}:{:02} (offset {}s)",
-                target.year, target.month, target.day, target.hour, target.min, target.sec,
+                target.year,
+                target.month,
+                target.day,
+                target.hour,
+                target.min,
+                target.sec,
                 self.offset
             );
         }

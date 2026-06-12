@@ -80,8 +80,7 @@ impl ColorLut {
             }
             screen => {
                 let model = screen.model(settings.darken_or_default()).unwrap();
-                let to_display: Mat3 =
-                    rgb_to_rgb(&model.primaries, settings.target.primaries());
+                let to_display: Mat3 = rgb_to_rgb(&model.primaries, settings.target.primaries());
                 for (px, entry) in table.iter_mut().enumerate() {
                     let c = unpack555(px as u16);
                     // Panel tone response (authored intent), pure power law.
@@ -94,8 +93,7 @@ impl ColorLut {
                     // black floor in linear light.
                     for v in &mut out {
                         let clipped = v.clamp(0.0, 1.0);
-                        let lifted =
-                            model.black_floor + (1.0 - model.black_floor) * clipped;
+                        let lifted = model.black_floor + (1.0 - model.black_floor) * clipped;
                         // Encode with the display transfer the surface is
                         // actually tagged/assumed as (piecewise sRGB — both
                         // sRGB and Display P3 use it).
@@ -144,7 +142,10 @@ mod tests {
     use super::*;
 
     fn settings(screen: ScreenKind) -> ColorSettings {
-        ColorSettings { screen, ..ColorSettings::default() }
+        ColorSettings {
+            screen,
+            ..ColorSettings::default()
+        }
     }
 
     #[test]
@@ -159,7 +160,11 @@ mod tests {
     #[test]
     fn channel_order_is_bgr555() {
         // Red lives in the LOW 5 bits of the framebuffer word.
-        for screen in [ScreenKind::Frontlit, ScreenKind::Backlit, ScreenKind::Classic] {
+        for screen in [
+            ScreenKind::Frontlit,
+            ScreenKind::Backlit,
+            ScreenKind::Classic,
+        ] {
             let lut = ColorLut::build(&settings(screen));
             let red = lut.table[0x001F];
             let blue = lut.table[0x7C00];
@@ -174,7 +179,10 @@ mod tests {
         // colorimetric model: the gamut transforms are white-preserving by
         // construction. Classic is exempt — that model's red row is
         // deliberately overdriven and its white is intentionally warm.
-        for screen in ScreenKind::ALL.into_iter().filter(|s| *s != ScreenKind::Classic) {
+        for screen in ScreenKind::ALL
+            .into_iter()
+            .filter(|s| *s != ScreenKind::Classic)
+        {
             let lut = ColorLut::build(&settings(screen));
             let [r, g, b, _] = lut.table[0x7FFF];
             assert!(
@@ -226,9 +234,7 @@ mod tests {
         assert_eq!(classic_entry(0x7FFF), [252, 238, 242, 255]);
         let darkish = classic_entry(0x0210); // r=16, g=16, b=0
         let lr: f64 = (16.0 / 31.0f64).powf(4.0);
-        let want_r = ((50.0 * lr + 255.0 * lr) / 255.0).powf(1.0 / 2.2)
-            * (255.0 / 280.0)
-            * 255.0;
+        let want_r = ((50.0 * lr + 255.0 * lr) / 255.0).powf(1.0 / 2.2) * (255.0 / 280.0) * 255.0;
         assert_eq!(darkish[0], (want_r + 0.5) as u8);
     }
 

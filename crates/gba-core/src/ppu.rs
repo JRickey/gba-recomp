@@ -29,7 +29,11 @@ struct ObjPixel {
     semi: bool,
 }
 
-const OBJ_EMPTY: ObjPixel = ObjPixel { color: TRANSPARENT, priority: 0xFF, semi: false };
+const OBJ_EMPTY: ObjPixel = ObjPixel {
+    color: TRANSPARENT,
+    priority: 0xFF,
+    semi: false,
+};
 
 fn io16(mem: &MemMap, off: usize) -> u16 {
     u16::from_le_bytes([mem.io[off], mem.io[off + 1]])
@@ -117,11 +121,25 @@ pub fn render_scanline(mem: &mut MemMap, line: usize) {
     mem.aff_ref[2] = mem.aff_ref[2].wrapping_add(io16(mem, 0x32) as i16 as i32);
     mem.aff_ref[3] = mem.aff_ref[3].wrapping_add(io16(mem, 0x36) as i16 as i32);
 
-    compose(mem, dispcnt, line, &bg_lines, &bg_used, &obj_line, &obj_window, line_has_semi);
+    compose(
+        mem,
+        dispcnt,
+        line,
+        &bg_lines,
+        &bg_used,
+        &obj_line,
+        &obj_window,
+        line_has_semi,
+    );
 }
 
 fn read_io32(mem: &MemMap, off: usize) -> u32 {
-    u32::from_le_bytes([mem.io[off], mem.io[off + 1], mem.io[off + 2], mem.io[off + 3]])
+    u32::from_le_bytes([
+        mem.io[off],
+        mem.io[off + 1],
+        mem.io[off + 2],
+        mem.io[off + 3],
+    ])
 }
 
 fn sign_extend28(v: u32) -> i32 {
@@ -177,9 +195,16 @@ fn render_text_bg(mem: &MemMap, bg: usize, line: usize, out: &mut Line) {
             for i in 0..span {
                 let fx = if hflip { 7 - (px + i) } else { px + i };
                 let addr = base + fx;
-                let color_idx = if addr >= 0x1_0000 { 0 } else { mem.vram[addr] as usize };
-                out[sx + i] =
-                    if color_idx == 0 { TRANSPARENT } else { pal16(mem, color_idx) };
+                let color_idx = if addr >= 0x1_0000 {
+                    0
+                } else {
+                    mem.vram[addr] as usize
+                };
+                out[sx + i] = if color_idx == 0 {
+                    TRANSPARENT
+                } else {
+                    pal16(mem, color_idx)
+                };
             }
         } else {
             let base = char_base + tile * 32 + fy * 4;
@@ -198,8 +223,11 @@ fn render_text_bg(mem: &MemMap, bg: usize, line: usize, out: &mut Line) {
                         pal_base + nib
                     }
                 };
-                out[sx + i] =
-                    if color_idx == 0 { TRANSPARENT } else { pal16(mem, color_idx) };
+                out[sx + i] = if color_idx == 0 {
+                    TRANSPARENT
+                } else {
+                    pal16(mem, color_idx)
+                };
             }
         }
         sx += span;
@@ -217,9 +245,17 @@ fn render_affine_bg(mem: &MemMap, bg: usize, out: &mut Line) {
     let size_px = (size_tiles * 8) as i32;
 
     let (pa, pc, ref_base) = if bg == 2 {
-        (io16(mem, 0x20) as i16 as i32, io16(mem, 0x24) as i16 as i32, 0)
+        (
+            io16(mem, 0x20) as i16 as i32,
+            io16(mem, 0x24) as i16 as i32,
+            0,
+        )
     } else {
-        (io16(mem, 0x30) as i16 as i32, io16(mem, 0x34) as i16 as i32, 2)
+        (
+            io16(mem, 0x30) as i16 as i32,
+            io16(mem, 0x34) as i16 as i32,
+            2,
+        )
     };
     let mut fx = mem.aff_ref[ref_base];
     let mut fy = mem.aff_ref[ref_base + 1];
@@ -242,8 +278,16 @@ fn render_affine_bg(mem: &MemMap, bg: usize, out: &mut Line) {
         let entry_off = screen_base + (ty / 8) * size_tiles + tx / 8;
         let tile = mem.vram[entry_off] as usize;
         let addr = char_base + tile * 64 + (ty % 8) * 8 + tx % 8;
-        let color_idx = if addr < 0x1_0000 { mem.vram[addr] as usize } else { 0 };
-        *out_px = if color_idx == 0 { TRANSPARENT } else { pal16(mem, color_idx) };
+        let color_idx = if addr < 0x1_0000 {
+            mem.vram[addr] as usize
+        } else {
+            0
+        };
+        *out_px = if color_idx == 0 {
+            TRANSPARENT
+        } else {
+            pal16(mem, color_idx)
+        };
     }
 }
 
@@ -262,7 +306,11 @@ fn render_bitmap_bg(mem: &MemMap, mode: u16, dispcnt: u16, line: usize, out: &mu
         4 => {
             for (x, out_px) in out.iter_mut().enumerate() {
                 let idx = mem.vram[page + line * VISIBLE_WIDTH + x] as usize;
-                *out_px = if idx == 0 { TRANSPARENT } else { pal16(mem, idx) };
+                *out_px = if idx == 0 {
+                    TRANSPARENT
+                } else {
+                    pal16(mem, idx)
+                };
             }
         }
         _ => {
@@ -283,9 +331,9 @@ fn render_bitmap_bg(mem: &MemMap, mode: u16, dispcnt: u16, line: usize, out: &mu
 // ---- sprites ----
 
 const OBJ_SIZES: [[(i32, i32); 4]; 3] = [
-    [(8, 8), (16, 16), (32, 32), (64, 64)],   // square
-    [(16, 8), (32, 8), (32, 16), (64, 32)],   // horizontal
-    [(8, 16), (8, 32), (16, 32), (32, 64)],   // vertical
+    [(8, 8), (16, 16), (32, 32), (64, 64)], // square
+    [(16, 8), (32, 8), (32, 16), (64, 32)], // horizontal
+    [(8, 16), (8, 32), (16, 32), (32, 64)], // vertical
 ];
 
 /// Returns true if any semi-transparent sprite pixel was written
@@ -423,7 +471,11 @@ fn render_sprites(
             if mode == 2 {
                 window[sx_usize] = true;
             } else if out[sx_usize].priority == 0xFF || priority < out[sx_usize].priority {
-                out[sx_usize] = ObjPixel { color, priority, semi: mode == 1 };
+                out[sx_usize] = ObjPixel {
+                    color,
+                    priority,
+                    semi: mode == 1,
+                };
                 any_semi |= mode == 1;
             }
         }
@@ -642,7 +694,11 @@ fn darken(c: u16, evy: u32) -> u16 {
 /// lane (5-bit value doubled; hardware ORs in PRAM bit 15 as the LSB,
 /// which we strip at fetch).
 fn split6(c: u16) -> (u32, u32, u32) {
-    ((c & 31) as u32, (((c >> 5) & 31) as u32) << 1, ((c >> 10) & 31) as u32)
+    (
+        (c & 31) as u32,
+        (((c >> 5) & 31) as u32) << 1,
+        ((c >> 10) & 31) as u32,
+    )
 }
 
 fn join6(r: u32, g: u32, b: u32) -> u16 {
@@ -668,7 +724,7 @@ mod tests {
     fn mode0_text_tile() {
         let mut mem = MemMap::new(vec![]);
         mem.write16(0x0400_0000, 0x0100); // mode 0, BG0 on
-        // BG0: char base 0, screen base block 31 (0xF800), 4bpp, 32x32.
+                                          // BG0: char base 0, screen base block 31 (0xF800), 4bpp, 32x32.
         mem.write16(0x0400_0008, 31 << 8);
         // Palette 1, color 3 = red-ish.
         mem.write16(0x0500_0000 + (16 + 3) * 2, 0x001F);
@@ -688,7 +744,7 @@ mod tests {
     fn sprite_over_backdrop() {
         let mut mem = MemMap::new(vec![]);
         mem.write16(0x0400_0000, 0x1000); // mode 0, OBJ on
-        // OBJ palette color 1 = green.
+                                          // OBJ palette color 1 = green.
         mem.write16(0x0500_0200 + 2, 0x03E0);
         // Tile 1 in OBJ charblock: all color 1 (4bpp).
         for row in 0..8 {

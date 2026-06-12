@@ -147,7 +147,8 @@ impl InputScreen {
                     .trailing_fill(true);
                     // Persist only when the value actually moves — the
                     // slider reports `changed` while dragging.
-                    if ui.add(slider).changed() && (dz - self.cfg.stick_deadzone).abs() > f32::EPSILON
+                    if ui.add(slider).changed()
+                        && (dz - self.cfg.stick_deadzone).abs() > f32::EPSILON
                     {
                         self.cfg.stick_deadzone = dz;
                         self.persist();
@@ -170,39 +171,47 @@ impl InputScreen {
             let pulse = ui.ctx().input(|i| i.time);
             let blink = (pulse * 2.5).sin() > 0.0;
 
-            egui::Grid::new("bindings").num_columns(4).spacing([18.0, 7.0]).show(ui, |ui| {
-                for pair in Button::ALL.chunks(2) {
-                    for &b in pair {
-                        // button label with orb
-                        ui.horizontal(|ui| {
-                            let (r, _) = ui.allocate_exact_size(Vec2::splat(12.0), Sense::hover());
-                            theme::orb(ui.painter(), r.center(), 5.0, theme::VIOLET);
-                            ui.label(
-                                egui::RichText::new(b.name().to_uppercase())
-                                    .size(13.0)
-                                    .strong()
-                                    .color(theme::SILVER_HI),
-                            );
-                        });
-                        // current binding / capture pill
-                        let capturing = self.capture == Some(b);
-                        let text = if capturing {
-                            if blink { "PRESS\u{2026}".to_string() } else { String::new() }
-                        } else if gamepad {
-                            self.cfg.pads[b.index()].clone()
-                        } else {
-                            self.cfg.keys[b.index()].clone()
-                        };
-                        if theme::glossy_button(ui, &text, capturing, Vec2::new(118.0, 26.0))
-                            .clicked()
-                        {
-                            self.capture = if capturing { None } else { Some(b) };
-                            self.status.clear();
+            egui::Grid::new("bindings")
+                .num_columns(4)
+                .spacing([18.0, 7.0])
+                .show(ui, |ui| {
+                    for pair in Button::ALL.chunks(2) {
+                        for &b in pair {
+                            // button label with orb
+                            ui.horizontal(|ui| {
+                                let (r, _) =
+                                    ui.allocate_exact_size(Vec2::splat(12.0), Sense::hover());
+                                theme::orb(ui.painter(), r.center(), 5.0, theme::VIOLET);
+                                ui.label(
+                                    egui::RichText::new(b.name().to_uppercase())
+                                        .size(13.0)
+                                        .strong()
+                                        .color(theme::SILVER_HI),
+                                );
+                            });
+                            // current binding / capture pill
+                            let capturing = self.capture == Some(b);
+                            let text = if capturing {
+                                if blink {
+                                    "PRESS\u{2026}".to_string()
+                                } else {
+                                    String::new()
+                                }
+                            } else if gamepad {
+                                self.cfg.pads[b.index()].clone()
+                            } else {
+                                self.cfg.keys[b.index()].clone()
+                            };
+                            if theme::glossy_button(ui, &text, capturing, Vec2::new(118.0, 26.0))
+                                .clicked()
+                            {
+                                self.capture = if capturing { None } else { Some(b) };
+                                self.status.clear();
+                            }
                         }
+                        ui.end_row();
                     }
-                    ui.end_row();
-                }
-            });
+                });
 
             // capture: next key / pad button (or stick push) becomes the binding
             if let Some(b) = self.capture {
@@ -217,7 +226,9 @@ impl InputScreen {
                 } else {
                     let pressed: Option<Key> = ui.ctx().input(|i| {
                         i.events.iter().find_map(|e| match e {
-                            Event::Key { key, pressed: true, .. } => Some(*key),
+                            Event::Key {
+                                key, pressed: true, ..
+                            } => Some(*key),
                             _ => None,
                         })
                     });
@@ -259,7 +270,11 @@ impl InputScreen {
                 } else {
                     &self.status
                 };
-                ui.label(egui::RichText::new(hint).size(11.0).color(theme::white(120)));
+                ui.label(
+                    egui::RichText::new(hint)
+                        .size(11.0)
+                        .color(theme::white(120)),
+                );
             });
             if let Some(p) = input_config::default_path() {
                 ui.label(
@@ -286,7 +301,9 @@ impl InputScreen {
             Button::ALL
                 .iter()
                 .map(|b| match &gp {
-                    Some(gp) => pad_active(gp, &self.cfg.pads[b.index()], self.cfg.dpad_source, dz, *b),
+                    Some(gp) => {
+                        pad_active(gp, &self.cfg.pads[b.index()], self.cfg.dpad_source, dz, *b)
+                    }
                     None => false,
                 })
                 .collect()
@@ -307,7 +324,11 @@ impl InputScreen {
                 ui.label(
                     egui::RichText::new(b.name().to_uppercase())
                         .size(10.0)
-                        .color(if on { theme::SILVER_HI } else { theme::white(70) }),
+                        .color(if on {
+                            theme::SILVER_HI
+                        } else {
+                            theme::white(70)
+                        }),
                 );
                 ui.add_space(4.0);
             }
@@ -336,10 +357,34 @@ fn stick_token_from_axis(axis: gilrs::Axis, value: f32) -> Option<StickToken> {
     }
     let pos = value > 0.0;
     Some(match axis {
-        LeftStickX => if pos { StickToken::LeftStickRight } else { StickToken::LeftStickLeft },
-        LeftStickY => if pos { StickToken::LeftStickUp } else { StickToken::LeftStickDown },
-        RightStickX => if pos { StickToken::RightStickRight } else { StickToken::RightStickLeft },
-        RightStickY => if pos { StickToken::RightStickUp } else { StickToken::RightStickDown },
+        LeftStickX => {
+            if pos {
+                StickToken::LeftStickRight
+            } else {
+                StickToken::LeftStickLeft
+            }
+        }
+        LeftStickY => {
+            if pos {
+                StickToken::LeftStickUp
+            } else {
+                StickToken::LeftStickDown
+            }
+        }
+        RightStickX => {
+            if pos {
+                StickToken::RightStickRight
+            } else {
+                StickToken::RightStickLeft
+            }
+        }
+        RightStickY => {
+            if pos {
+                StickToken::RightStickUp
+            } else {
+                StickToken::RightStickDown
+            }
+        }
         _ => return None,
     })
 }
@@ -373,7 +418,9 @@ fn pad_active(
 
 fn binding_active(gp: &gilrs::Gamepad, name: &str, deadzone: f32) -> bool {
     match input_config::pad_binding(name) {
-        input_config::PadBinding::Button(b) => gilrs_button(b).is_some_and(|btn| gp.is_pressed(btn)),
+        input_config::PadBinding::Button(b) => {
+            gilrs_button(b).is_some_and(|btn| gp.is_pressed(btn))
+        }
         input_config::PadBinding::Stick(t) => stick_active(gp, t, deadzone),
     }
 }
@@ -388,20 +435,35 @@ fn stick_active(gp: &gilrs::Gamepad, tok: StickToken, deadzone: f32) -> bool {
         (false, false) => RightStickY,
     };
     let v = gp.value(axis);
-    if positive { v > deadzone } else { v < -deadzone }
+    if positive {
+        v > deadzone
+    } else {
+        v < -deadzone
+    }
 }
 
 fn gilrs_button(name: &str) -> Option<gilrs::Button> {
     use gilrs::Button::*;
     Some(match name {
-        "South" => South, "East" => East, "North" => North, "West" => West,
-        "C" => C, "Z" => Z,
-        "LeftTrigger" => LeftTrigger, "LeftTrigger2" => LeftTrigger2,
-        "RightTrigger" => RightTrigger, "RightTrigger2" => RightTrigger2,
-        "Select" => Select, "Start" => Start, "Mode" => Mode,
-        "LeftThumb" => LeftThumb, "RightThumb" => RightThumb,
-        "DPadUp" => DPadUp, "DPadDown" => DPadDown,
-        "DPadLeft" => DPadLeft, "DPadRight" => DPadRight,
+        "South" => South,
+        "East" => East,
+        "North" => North,
+        "West" => West,
+        "C" => C,
+        "Z" => Z,
+        "LeftTrigger" => LeftTrigger,
+        "LeftTrigger2" => LeftTrigger2,
+        "RightTrigger" => RightTrigger,
+        "RightTrigger2" => RightTrigger2,
+        "Select" => Select,
+        "Start" => Start,
+        "Mode" => Mode,
+        "LeftThumb" => LeftThumb,
+        "RightThumb" => RightThumb,
+        "DPadUp" => DPadUp,
+        "DPadDown" => DPadDown,
+        "DPadLeft" => DPadLeft,
+        "DPadRight" => DPadRight,
         _ => return None,
     })
 }
@@ -410,14 +472,50 @@ fn gilrs_button(name: &str) -> Option<gilrs::Button> {
 fn key_name(key: Key) -> Option<&'static str> {
     use Key::*;
     Some(match key {
-        A => "A", B => "B", C => "C", D => "D", E => "E", F => "F", G => "G",
-        H => "H", I => "I", J => "J", K => "K", L => "L", M => "M", N => "N",
-        O => "O", P => "P", Q => "Q", R => "R", S => "S", T => "T", U => "U",
-        V => "V", W => "W", X => "X", Y => "Y", Z => "Z",
-        Num0 => "0", Num1 => "1", Num2 => "2", Num3 => "3", Num4 => "4",
-        Num5 => "5", Num6 => "6", Num7 => "7", Num8 => "8", Num9 => "9",
-        ArrowUp => "Up", ArrowDown => "Down", ArrowLeft => "Left", ArrowRight => "Right",
-        Enter => "Enter", Space => "Space", Tab => "Tab", Backspace => "Backspace",
+        A => "A",
+        B => "B",
+        C => "C",
+        D => "D",
+        E => "E",
+        F => "F",
+        G => "G",
+        H => "H",
+        I => "I",
+        J => "J",
+        K => "K",
+        L => "L",
+        M => "M",
+        N => "N",
+        O => "O",
+        P => "P",
+        Q => "Q",
+        R => "R",
+        S => "S",
+        T => "T",
+        U => "U",
+        V => "V",
+        W => "W",
+        X => "X",
+        Y => "Y",
+        Z => "Z",
+        Num0 => "0",
+        Num1 => "1",
+        Num2 => "2",
+        Num3 => "3",
+        Num4 => "4",
+        Num5 => "5",
+        Num6 => "6",
+        Num7 => "7",
+        Num8 => "8",
+        Num9 => "9",
+        ArrowUp => "Up",
+        ArrowDown => "Down",
+        ArrowLeft => "Left",
+        ArrowRight => "Right",
+        Enter => "Enter",
+        Space => "Space",
+        Tab => "Tab",
+        Backspace => "Backspace",
         _ => return None,
     })
 }

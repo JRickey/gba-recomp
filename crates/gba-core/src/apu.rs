@@ -263,7 +263,11 @@ impl Apu {
             while rem > 0 {
                 let take = per.saturating_sub(self.wave_acc).min(rem);
                 let byte = io[bank_base + self.wave_pos / 2];
-                let nib = if self.wave_pos & 1 == 0 { byte >> 4 } else { byte & 0xF } as i32;
+                let nib = if self.wave_pos & 1 == 0 {
+                    byte >> 4
+                } else {
+                    byte & 0xF
+                } as i32;
                 area += (nib - 8) * 16 * take as i32;
                 self.wave_acc += take;
                 rem -= take;
@@ -330,6 +334,9 @@ impl Apu {
             1 => 1,
             _ => 0,
         };
-        (((left << 4) >> vol_shift) as i16, ((right << 4) >> vol_shift) as i16)
+        (
+            ((left << 4) >> vol_shift) as i16,
+            ((right << 4) >> vol_shift) as i16,
+        )
     }
 }

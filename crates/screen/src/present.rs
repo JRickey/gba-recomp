@@ -83,31 +83,32 @@ impl Presenter {
         let surface = unsafe {
             let target = wgpu::SurfaceTargetUnsafe::from_window(window)
                 .map_err(|e| format!("window handle: {e}"))?;
-            instance.create_surface_unsafe(target).map_err(|e| format!("surface: {e}"))?
+            instance
+                .create_surface_unsafe(target)
+                .map_err(|e| format!("surface: {e}"))?
         };
-        let adapter = pollster::block_on(instance.request_adapter(
-            &wgpu::RequestAdapterOptions {
-                power_preference: wgpu::PowerPreference::LowPower,
-                compatible_surface: Some(&surface),
-                force_fallback_adapter: false,
-            },
-        ))
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::LowPower,
+            compatible_surface: Some(&surface),
+            force_fallback_adapter: false,
+        }))
         .map_err(|e| format!("no graphics adapter: {e}"))?;
-        let (device, queue) = pollster::block_on(adapter.request_device(
-            &wgpu::DeviceDescriptor {
-                label: Some("screen-presenter"),
-                ..Default::default()
-            },
-        ))
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("screen-presenter"),
+            ..Default::default()
+        }))
         .map_err(|e| format!("graphics device: {e}"))?;
 
         let caps = surface.get_capabilities(&adapter);
         // Display-encoded bytes in, display-encoded bytes out: a UNORM
         // (non-sRGB-view) format so nothing re-encodes behind our back.
-        let format = [wgpu::TextureFormat::Bgra8Unorm, wgpu::TextureFormat::Rgba8Unorm]
-            .into_iter()
-            .find(|f| caps.formats.contains(f))
-            .ok_or_else(|| format!("no 8-bit UNORM surface format in {:?}", caps.formats))?;
+        let format = [
+            wgpu::TextureFormat::Bgra8Unorm,
+            wgpu::TextureFormat::Rgba8Unorm,
+        ]
+        .into_iter()
+        .find(|f| caps.formats.contains(f))
+        .ok_or_else(|| format!("no 8-bit UNORM surface format in {:?}", caps.formats))?;
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format,
@@ -121,7 +122,11 @@ impl Presenter {
 
         let texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("screen-src"),
-            size: wgpu::Extent3d { width: src_w, height: src_h, depth_or_array_layers: 1 },
+            size: wgpu::Extent3d {
+                width: src_w,
+                height: src_h,
+                depth_or_array_layers: 1,
+            },
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
@@ -171,7 +176,10 @@ impl Presenter {
                         &texture.create_view(&wgpu::TextureViewDescriptor::default()),
                     ),
                 },
-                wgpu::BindGroupEntry { binding: 1, resource: uniforms.as_entire_binding() },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: uniforms.as_entire_binding(),
+                },
             ],
         });
 
@@ -271,7 +279,11 @@ impl Presenter {
                 bytes_per_row: Some(sw * 4),
                 rows_per_image: Some(sh),
             },
-            wgpu::Extent3d { width: sw, height: sh, depth_or_array_layers: 1 },
+            wgpu::Extent3d {
+                width: sw,
+                height: sh,
+                depth_or_array_layers: 1,
+            },
         );
 
         // Aspect-correct letterbox (source is 3:2), centered.
@@ -296,19 +308,25 @@ impl Presenter {
             0.0,
             0.0,
         ];
-        self.queue.write_buffer(&self.uniforms, 0, as_bytes(&params));
+        self.queue
+            .write_buffer(&self.uniforms, 0, as_bytes(&params));
 
         let frame = match self.surface.get_current_texture() {
             Ok(f) => f,
             Err(wgpu::SurfaceError::Outdated | wgpu::SurfaceError::Lost) => {
                 self.surface.configure(&self.device, &self.config);
-                self.surface.get_current_texture().map_err(|e| e.to_string())?
+                self.surface
+                    .get_current_texture()
+                    .map_err(|e| e.to_string())?
             }
             Err(e) => return Err(e.to_string()),
         };
-        let view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let mut encoder =
-            self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
+        let view = frame
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("screen-pass"),
@@ -397,9 +415,7 @@ mod macos {
 
     use crate::profile::DisplayTarget;
 
-    pub fn ns_view_ptr(
-        window: &impl raw_window_handle::HasWindowHandle,
-    ) -> *mut std::ffi::c_void {
+    pub fn ns_view_ptr(window: &impl raw_window_handle::HasWindowHandle) -> *mut std::ffi::c_void {
         match window.window_handle().map(|h| h.as_raw()) {
             Ok(raw_window_handle::RawWindowHandle::AppKit(h)) => h.ns_view.as_ptr(),
             _ => std::ptr::null_mut(),
@@ -425,9 +441,13 @@ mod macos {
             let view = ns_view as *mut AnyObject;
             let layer: Option<Retained<AnyObject>> = msg_send![&*view, layer];
             let Some(layer) = layer else { return };
-            let Ok(layer) = layer.downcast::<CAMetalLayer>() else { return };
+            let Ok(layer) = layer.downcast::<CAMetalLayer>() else {
+                return;
+            };
             let name = match target {
-                DisplayTarget::Auto | DisplayTarget::Srgb => CFString::from_static_str("kCGColorSpaceSRGB"),
+                DisplayTarget::Auto | DisplayTarget::Srgb => {
+                    CFString::from_static_str("kCGColorSpaceSRGB")
+                }
                 DisplayTarget::DisplayP3 => CFString::from_static_str("kCGColorSpaceDisplayP3"),
             };
             if let Some(cs) = CGColorSpace::with_name(Some(&name)) {

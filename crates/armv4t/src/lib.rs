@@ -32,27 +32,60 @@ pub const PC: Reg = 15;
 /// Condition codes, in encoding order. `Nv` (0b1111) is never valid on ARMv4.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Cond {
-    Eq, Ne, Cs, Cc, Mi, Pl, Vs, Vc, Hi, Ls, Ge, Lt, Gt, Le, Al, Nv,
+    Eq,
+    Ne,
+    Cs,
+    Cc,
+    Mi,
+    Pl,
+    Vs,
+    Vc,
+    Hi,
+    Ls,
+    Ge,
+    Lt,
+    Gt,
+    Le,
+    Al,
+    Nv,
 }
 
 impl Cond {
     pub fn from_bits(bits: u8) -> Cond {
         use Cond::*;
-        [Eq, Ne, Cs, Cc, Mi, Pl, Vs, Vc, Hi, Ls, Ge, Lt, Gt, Le, Al, Nv][bits as usize & 0xF]
+        [
+            Eq, Ne, Cs, Cc, Mi, Pl, Vs, Vc, Hi, Ls, Ge, Lt, Gt, Le, Al, Nv,
+        ][bits as usize & 0xF]
     }
 }
 
 /// Data-processing opcodes, in ARM encoding order (bits 24-21).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AluOp {
-    And, Eor, Sub, Rsb, Add, Adc, Sbc, Rsc, Tst, Teq, Cmp, Cmn, Orr, Mov, Bic, Mvn,
+    And,
+    Eor,
+    Sub,
+    Rsb,
+    Add,
+    Adc,
+    Sbc,
+    Rsc,
+    Tst,
+    Teq,
+    Cmp,
+    Cmn,
+    Orr,
+    Mov,
+    Bic,
+    Mvn,
 }
 
 impl AluOp {
     pub fn from_bits(bits: u8) -> AluOp {
         use AluOp::*;
-        [And, Eor, Sub, Rsb, Add, Adc, Sbc, Rsc, Tst, Teq, Cmp, Cmn, Orr, Mov, Bic, Mvn]
-            [bits as usize & 0xF]
+        [
+            And, Eor, Sub, Rsb, Add, Adc, Sbc, Rsc, Tst, Teq, Cmp, Cmn, Orr, Mov, Bic, Mvn,
+        ][bits as usize & 0xF]
     }
 
     /// Comparison/test ops write flags only; rd is unused.
@@ -68,12 +101,20 @@ impl AluOp {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShiftKind {
-    Lsl, Lsr, Asr, Ror,
+    Lsl,
+    Lsr,
+    Asr,
+    Ror,
 }
 
 impl ShiftKind {
     pub fn from_bits(bits: u8) -> ShiftKind {
-        [ShiftKind::Lsl, ShiftKind::Lsr, ShiftKind::Asr, ShiftKind::Ror][bits as usize & 3]
+        [
+            ShiftKind::Lsl,
+            ShiftKind::Lsr,
+            ShiftKind::Asr,
+            ShiftKind::Ror,
+        ][bits as usize & 3]
     }
 }
 
@@ -86,7 +127,10 @@ pub enum Shift {
 }
 
 impl Shift {
-    pub const NONE: Shift = Shift::Imm { kind: ShiftKind::Lsl, amount: 0 };
+    pub const NONE: Shift = Shift::Imm {
+        kind: ShiftKind::Lsl,
+        amount: 0,
+    };
 }
 
 /// Second operand of a data-processing instruction.
@@ -94,8 +138,14 @@ impl Shift {
 pub enum Operand2 {
     /// Immediate, already rotated. `ror` is the rotate amount (0, 2, .., 30);
     /// when `ror != 0` the shifter carry-out is bit 31 of `value`.
-    Imm { value: u32, ror: u8 },
-    Reg { rm: Reg, shift: Shift },
+    Imm {
+        value: u32,
+        ror: u8,
+    },
+    Reg {
+        rm: Reg,
+        shift: Shift,
+    },
 }
 
 impl Operand2 {
@@ -104,13 +154,18 @@ impl Operand2 {
     }
 
     pub fn reg(rm: Reg) -> Operand2 {
-        Operand2::Reg { rm, shift: Shift::NONE }
+        Operand2::Reg {
+            rm,
+            shift: Shift::NONE,
+        }
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MemWidth {
-    Byte, Half, Word,
+    Byte,
+    Half,
+    Word,
 }
 
 /// Offset of a single load/store.
@@ -125,13 +180,39 @@ pub enum MemOffset {
 pub enum Op {
     /// Data processing. For compare/test ops `rd` is 0 and meaningless; for
     /// unary ops `rn` is 0 and meaningless.
-    Alu { op: AluOp, s: bool, rd: Reg, rn: Reg, op2: Operand2 },
+    Alu {
+        op: AluOp,
+        s: bool,
+        rd: Reg,
+        rn: Reg,
+        op2: Operand2,
+    },
     /// MUL / MLA: rd = rm * rs (+ rn if `acc`).
-    Mul { acc: bool, s: bool, rd: Reg, rn: Reg, rs: Reg, rm: Reg },
+    Mul {
+        acc: bool,
+        s: bool,
+        rd: Reg,
+        rn: Reg,
+        rs: Reg,
+        rm: Reg,
+    },
     /// UMULL/UMLAL/SMULL/SMLAL: rd_hi:rd_lo = rm * rs (+ rd_hi:rd_lo if `acc`).
-    MulLong { signed: bool, acc: bool, s: bool, rd_hi: Reg, rd_lo: Reg, rs: Reg, rm: Reg },
+    MulLong {
+        signed: bool,
+        acc: bool,
+        s: bool,
+        rd_hi: Reg,
+        rd_lo: Reg,
+        rs: Reg,
+        rm: Reg,
+    },
     /// SWP/SWPB: rd = [rn]; [rn] = rm (atomic, with rotated read).
-    Swap { byte: bool, rd: Reg, rm: Reg, rn: Reg },
+    Swap {
+        byte: bool,
+        rd: Reg,
+        rm: Reg,
+        rn: Reg,
+    },
     /// BX rm: branch to rm & !1, switch to Thumb if rm bit 0 set.
     Bx { rm: Reg },
     /// B/BL with the target fully resolved (pipeline offset applied).
@@ -189,7 +270,11 @@ pub struct Instr {
 impl Instr {
     /// Size in bytes of the encoding (2 for Thumb, 4 for ARM).
     pub fn size(&self) -> u32 {
-        if self.thumb { 2 } else { 4 }
+        if self.thumb {
+            2
+        } else {
+            4
+        }
     }
 
     /// The value read when this instruction reads PC as an operand:
@@ -207,9 +292,20 @@ impl Instr {
     /// the text section, and frequently a code pointer.
     pub fn literal_addr(&self) -> Option<u32> {
         match self.op {
-            Op::Mem { load: true, rn: PC, offset: MemOffset::Imm(imm), pre: true, up, .. } => {
+            Op::Mem {
+                load: true,
+                rn: PC,
+                offset: MemOffset::Imm(imm),
+                pre: true,
+                up,
+                ..
+            } => {
                 // In Thumb, PC is additionally word-aligned for literal loads.
-                let base = if self.thumb { self.pc_value() & !3 } else { self.pc_value() };
+                let base = if self.thumb {
+                    self.pc_value() & !3
+                } else {
+                    self.pc_value()
+                };
                 Some(if up {
                     base.wrapping_add(imm as u32)
                 } else {

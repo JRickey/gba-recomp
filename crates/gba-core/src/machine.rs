@@ -183,9 +183,16 @@ impl Machine {
         // BIOS prologue: stmfd sp!, {r0-r3, r12, lr}
         let sp = cpu.regs[13].wrapping_sub(24);
         cpu.regs[13] = sp;
-        for (i, value) in [cpu.regs[0], cpu.regs[1], cpu.regs[2], cpu.regs[3], cpu.regs[12], return_lr]
-            .into_iter()
-            .enumerate()
+        for (i, value) in [
+            cpu.regs[0],
+            cpu.regs[1],
+            cpu.regs[2],
+            cpu.regs[3],
+            cpu.regs[12],
+            return_lr,
+        ]
+        .into_iter()
+        .enumerate()
         {
             self.bus.write32(sp.wrapping_add(4 * i as u32), value);
         }
@@ -231,10 +238,28 @@ impl Machine {
 /// ballpark (commercial waitstate config assumed).
 pub fn instr_cost(region: usize, instr: &Instr) -> u64 {
     let fetch: u64 = match region {
-        0x0 | 0x3 | 0x7 => 1,                            // BIOS, IWRAM, OAM: 32-bit
-        0x2 => if instr.thumb { 3 } else { 6 },          // EWRAM: 16-bit, 2 waits
-        0x5 | 0x6 => if instr.thumb { 1 } else { 2 },    // palette/VRAM
-        0x8..=0xD => if instr.thumb { 2 } else { 4 },    // ROM 3/1 + prefetch
+        0x0 | 0x3 | 0x7 => 1, // BIOS, IWRAM, OAM: 32-bit
+        0x2 => {
+            if instr.thumb {
+                3
+            } else {
+                6
+            }
+        } // EWRAM: 16-bit, 2 waits
+        0x5 | 0x6 => {
+            if instr.thumb {
+                1
+            } else {
+                2
+            }
+        } // palette/VRAM
+        0x8..=0xD => {
+            if instr.thumb {
+                2
+            } else {
+                4
+            }
+        } // ROM 3/1 + prefetch
         _ => 1,
     };
     let op_extra: u64 = match instr.op {
@@ -333,7 +358,7 @@ mod tests {
         };
         put(&mut bios, 0x00, 0xEA00_000E); // reset: b 0x40
         put(&mut bios, 0x08, 0xEA00_003C); // swi vector: b 0x100
-        // boot code: ldr r0, =0x08000000 ; bx r0
+                                           // boot code: ldr r0, =0x08000000 ; bx r0
         put(&mut bios, 0x40, 0xE59F_0000);
         put(&mut bios, 0x44, 0xE12F_FF10);
         put(&mut bios, 0x48, 0x0800_0000);

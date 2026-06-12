@@ -33,7 +33,15 @@ pub struct Civil {
 
 /// Fallback used if the platform call fails or the target has no clock API.
 /// 2000-01-01 was a Saturday (dow = 6).
-const FALLBACK: Civil = Civil { year: 2000, month: 1, day: 1, dow: 6, hour: 0, min: 0, sec: 0 };
+const FALLBACK: Civil = Civil {
+    year: 2000,
+    month: 1,
+    day: 1,
+    dow: 6,
+    hour: 0,
+    min: 0,
+    sec: 0,
+};
 
 #[cfg(unix)]
 pub fn now_local() -> Civil {
@@ -138,7 +146,15 @@ mod tests {
 
     #[test]
     fn linear_roundtrips() {
-        let c = Civil { year: 2026, month: 6, day: 11, dow: 4, hour: 13, min: 37, sec: 9 };
+        let c = Civil {
+            year: 2026,
+            month: 6,
+            day: 11,
+            dow: 4,
+            hour: 13,
+            min: 37,
+            sec: 9,
+        };
         assert_eq!(from_linear(to_linear(&c)), c);
     }
 
@@ -146,14 +162,30 @@ mod tests {
     fn weekday_is_correct() {
         // 2000-01-01 was a Saturday (6); 2026-06-11 is a Thursday (4).
         assert_eq!(from_linear(to_linear(&FALLBACK)).dow, 6);
-        let thu = Civil { year: 2026, month: 6, day: 11, dow: 0, hour: 0, min: 0, sec: 0 };
+        let thu = Civil {
+            year: 2026,
+            month: 6,
+            day: 11,
+            dow: 0,
+            hour: 0,
+            min: 0,
+            sec: 0,
+        };
         assert_eq!(from_linear(to_linear(&thu)).dow, 4);
     }
 
     #[test]
     fn add_a_day_crosses_month_and_weekday() {
         // 2024-02-28 + 2 days = 2024-03-01 (leap year).
-        let feb = Civil { year: 2024, month: 2, day: 28, dow: 0, hour: 23, min: 0, sec: 0 };
+        let feb = Civil {
+            year: 2024,
+            month: 2,
+            day: 28,
+            dow: 0,
+            hour: 23,
+            min: 0,
+            sec: 0,
+        };
         let later = from_linear(to_linear(&feb) + 2 * 86_400);
         assert_eq!((later.year, later.month, later.day), (2024, 3, 1));
     }

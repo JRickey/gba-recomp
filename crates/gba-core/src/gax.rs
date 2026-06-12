@@ -23,9 +23,8 @@ use crate::shadow::{Judgement, Verifier};
 /// whose control layer differs); its literal pool holds the global
 /// state pointer cell.
 const CALC_NOTE_SIG: [u8; 32] = [
-    0x30, 0xB5, 0x04, 0x1C, 0x09, 0x06, 0x0B, 0x0E, 0x19, 0x1C, 0x12, 0x06, 0x15, 0x0E,
-    0xA0, 0x7A, 0x00, 0x2D, 0x16, 0xD1, 0x83, 0x42, 0x11, 0xD0, 0x22, 0x89, 0x98, 0x42,
-    0x04, 0xD2, 0x01, 0x49,
+    0x30, 0xB5, 0x04, 0x1C, 0x09, 0x06, 0x0B, 0x0E, 0x19, 0x1C, 0x12, 0x06, 0x15, 0x0E, 0xA0, 0x7A,
+    0x00, 0x2D, 0x16, 0xD1, 0x83, 0x42, 0x11, 0xD0, 0x22, 0x89, 0x98, 0x42, 0x04, 0xD2, 0x01, 0x49,
 ];
 
 /// ARM prologues of the chunk-commit functions (stereo / mono) — used
@@ -34,22 +33,18 @@ const CALC_NOTE_SIG: [u8; 32] = [
 /// hook PC: it runs exactly once per 128-sample chunk, after every
 /// mix entry is final.
 const COMMIT_STEREO_SIG: [u8; 16] = [
-    0xF7, 0x43, 0x2D, 0xE9, 0x00, 0xE0, 0xA0, 0xE3, 0x20, 0x90, 0xA0, 0xE3, 0xF4, 0x40,
-    0xD0, 0xE0,
+    0xF7, 0x43, 0x2D, 0xE9, 0x00, 0xE0, 0xA0, 0xE3, 0x20, 0x90, 0xA0, 0xE3, 0xF4, 0x40, 0xD0, 0xE0,
 ];
 const COMMIT_MONO_SIG: [u8; 16] = [
-    0xF3, 0x43, 0x2D, 0xE9, 0x00, 0xE0, 0xA0, 0xE3, 0x20, 0x90, 0xA0, 0xE3, 0xF0, 0x40,
-    0xD0, 0xE1,
+    0xF3, 0x43, 0x2D, 0xE9, 0x00, 0xE0, 0xA0, 0xE3, 0x20, 0x90, 0xA0, 0xE3, 0xF0, 0x40, 0xD0, 0xE1,
 ];
 /// Shared ARM prologue of all four voice-mix variants (magic check).
 const MIX_SIG: [u8; 16] = [
-    0xFE, 0x5F, 0x2D, 0xE9, 0x04, 0x20, 0x90, 0xE5, 0x08, 0xA0, 0x90, 0xE5, 0xB6, 0xB1,
-    0xD0, 0xE1,
+    0xFE, 0x5F, 0x2D, 0xE9, 0x04, 0x20, 0x90, 0xE5, 0x08, 0xA0, 0x90, 0xE5, 0xB6, 0xB1, 0xD0, 0xE1,
 ];
 /// Shared ARM prologue of the echo-processor variants.
 const ECHO_SIG: [u8; 16] = [
-    0xFE, 0x5F, 0x2D, 0xE9, 0x00, 0x20, 0x90, 0xE5, 0x0C, 0x30, 0x90, 0xE5, 0x08, 0x40,
-    0x90, 0xE5,
+    0xFE, 0x5F, 0x2D, 0xE9, 0x00, 0x20, 0x90, 0xE5, 0x0C, 0x30, 0x90, 0xE5, 0x08, 0x40, 0x90, 0xE5,
 ];
 
 const MAX_VOICES: usize = 16;
@@ -212,7 +207,12 @@ struct V3Stream {
 
 impl Default for V3Stream {
     fn default() -> V3Stream {
-        V3Stream { rate: 15769.0, chk_hold: 0.0, chk_acc: 0.0, lpf: [0.0; 2] }
+        V3Stream {
+            rate: 15769.0,
+            chk_hold: 0.0,
+            chk_acc: 0.0,
+            lpf: [0.0; 2],
+        }
     }
 }
 
@@ -361,7 +361,9 @@ impl GaxHle {
         for (base, len) in regions {
             for off in (0..len - 0xf4).step_by(4) {
                 let ss = base + off;
-                let Some(p0) = mem.u32(ss + 0xd0) else { continue };
+                let Some(p0) = mem.u32(ss + 0xd0) else {
+                    continue;
+                };
                 if p0 & 3 != 0 || !matches!(p0 >> 24, 2 | 3 | 8) {
                     continue;
                 }
@@ -386,8 +388,12 @@ impl GaxHle {
             }
             mem.slice(addr, 16)
         };
-        let Some(mix_pro) = code_bytes(mix_a) else { return false };
-        let Some(commit_pro) = code_bytes(commit) else { return false };
+        let Some(mix_pro) = code_bytes(mix_a) else {
+            return false;
+        };
+        let Some(commit_pro) = code_bytes(commit) else {
+            return false;
+        };
         if mix_pro != MIX_SIG {
             return false;
         }
@@ -455,7 +461,9 @@ impl GaxHle {
         }
         let mut hooks = [0u32; 3];
         for (i, o) in [(0usize, 0x60u32), (1, 0x64), (2, 0x68)] {
-            let Some(p) = mem.u32(work + o) else { return false };
+            let Some(p) = mem.u32(work + o) else {
+                return false;
+            };
             if p & 3 != 0 || !matches!(p >> 24, 2 | 3) {
                 return false;
             }
@@ -463,10 +471,14 @@ impl GaxHle {
         }
         let rate_of = |hdr: u32| -> Option<f64> {
             let h = mem.u32(hdr)?;
-            let r = mem.slice(h + 2, 2).map(|b| u16::from_le_bytes([b[0], b[1]]))?;
+            let r = mem
+                .slice(h + 2, 2)
+                .map(|b| u16::from_le_bytes([b[0], b[1]]))?;
             ((4000..=48000).contains(&r)).then_some(r as f64)
         };
-        let Some(music_rate) = rate_of(work + 0x24) else { return false };
+        let Some(music_rate) = rate_of(work + 0x24) else {
+            return false;
+        };
         self.v3_music.rate = music_rate;
         self.v3_fx.rate = rate_of(work + 0x28).unwrap_or(music_rate);
         self.v3_work = work;
@@ -549,7 +561,8 @@ impl GaxHle {
         }
         let _ = (key, r0);
         self.hooks += 1;
-        let gap = audio_cursor.saturating_sub(self.last_hook_cursor) / crate::mem::AUDIO_SAMPLE_CYCLES;
+        let gap =
+            audio_cursor.saturating_sub(self.last_hook_cursor) / crate::mem::AUDIO_SAMPLE_CYCLES;
         self.last_hook_cursor = audio_cursor;
         let ss = self.ss;
         // Mix rate from hook cadence — but as a long-run MEAN, not an
@@ -619,11 +632,15 @@ impl GaxHle {
         let prev_snap = self.pending;
         let mut cur = [SnapV::default(); MAX_VOICES];
         for (i, c) in cur.iter_mut().enumerate().take(self.count) {
-            let Some(ep) = mem.u32(aux + 4 * i as u32) else { continue };
+            let Some(ep) = mem.u32(aux + 4 * i as u32) else {
+                continue;
+            };
             if ep == 0 || !matches!(ep >> 24, 2 | 3) {
                 continue;
             }
-            let Some(e) = mem.slice(ep, 0x1c) else { continue };
+            let Some(e) = mem.slice(ep, 0x1c) else {
+                continue;
+            };
             let u32at = |o: usize| u32::from_le_bytes([e[o], e[o + 1], e[o + 2], e[o + 3]]);
             let pos_ptr = u32at(0x04);
             let end_ptr = u32at(0x08);
@@ -639,8 +656,16 @@ impl GaxHle {
                 }
                 continue;
             }
-            let gl = if vol_l == 0 { 0.0 } else { (vol_l as f32 + 1.0) / 256.0 };
-            let gr = if vol_r == 0 { 0.0 } else { (vol_r as f32 + 1.0) / 256.0 };
+            let gl = if vol_l == 0 {
+                0.0
+            } else {
+                (vol_l as f32 + 1.0) / 256.0
+            };
+            let gr = if vol_r == 0 {
+                0.0
+            } else {
+                (vol_r as f32 + 1.0) / 256.0
+            };
             *c = SnapV {
                 on: true,
                 pos: pos_ptr as f64 + frac,
@@ -740,7 +765,10 @@ impl GaxHle {
                     c.gr,
                 );
             }
-            eprintln!("gaxflags hooks={} echo_on={}{}", self.hooks, self.echo_on, flags);
+            eprintln!(
+                "gaxflags hooks={} echo_on={}{}",
+                self.hooks, self.echo_on, flags
+            );
         }
         if self.trace && self.hooks % 256 == 0 && !self.trace_acc.is_empty() {
             let mut by_slot: [(f64, f64, u32); MAX_VOICES] = [(0.0, 0.0, 0); MAX_VOICES];
@@ -778,9 +806,17 @@ impl GaxHle {
                 mem.u32(es + 0x0c).unwrap_or(0),
                 mem.u32(es + 0x10).unwrap_or(0),
             );
-            let bias = |g: u16| if g == 0 { 0.0 } else { (g as f32 + 1.0) / 65536.0 };
+            let bias = |g: u16| {
+                if g == 0 {
+                    0.0
+                } else {
+                    (g as f32 + 1.0) / 65536.0
+                }
+            };
             let g16 = |a: u32| {
-                mem.slice(a, 2).map(|b| u16::from_le_bytes([b[0], b[1]])).unwrap_or(0)
+                mem.slice(a, 2)
+                    .map(|b| u16::from_le_bytes([b[0], b[1]]))
+                    .unwrap_or(0)
             };
             self.echo.g_fb = bias(g16(es + 0x14));
             self.echo.g_in = bias(g16(es + 0x16));
@@ -867,9 +903,7 @@ impl GaxHle {
         // the canon stream includes it, so ours and the check must.
         if self.v3_lpf_depth > 0.0 {
             let a = (self.v3_lpf_depth * (0x334 as f32 / 256.0)).min(1.0);
-            for (st, val) in
-                [(&mut self.v3_music, &mut music), (&mut self.v3_fx, &mut fx)]
-            {
+            for (st, val) in [(&mut self.v3_music, &mut music), (&mut self.v3_fx, &mut fx)] {
                 st.lpf[0] += (*val - st.lpf[0]) * a;
                 st.lpf[1] += (st.lpf[0] - st.lpf[1]) * a;
                 *val = st.lpf[1];
@@ -967,10 +1001,7 @@ impl GaxHle {
                 r = m;
             }
             // The guest commit clamps every sample to the s8 rails.
-            self.mix_hold = (
-                l.clamp(-1.0, 127.0 / 128.0),
-                r.clamp(-1.0, 127.0 / 128.0),
-            );
+            self.mix_hold = (l.clamp(-1.0, 127.0 / 128.0), r.clamp(-1.0, 127.0 / 128.0));
         }
 
         let (hl, hr) = self.mix_hold;
@@ -1094,7 +1125,11 @@ mod tests {
         for (i, b) in rom.iter_mut().enumerate() {
             *b = (i as u8) & 0x7f;
         }
-        let mem = MemView { rom: &rom, ewram: &ewram, iwram: &iwram };
+        let mem = MemView {
+            rom: &rom,
+            ewram: &ewram,
+            iwram: &iwram,
+        };
         let mut v = Voice {
             on: true,
             pos: 0x0800_0000u32 as f64,
@@ -1112,7 +1147,11 @@ mod tests {
         }
         assert!(!v.dead);
         // One-shot: dies at the end.
-        let mut v2 = Voice { loop_ptr: 0, loop_len: 0, ..v };
+        let mut v2 = Voice {
+            loop_ptr: 0,
+            loop_len: 0,
+            ..v
+        };
         v2.pos = 0x0800_000Eu32 as f64;
         v2.end = 0x0800_0010u32 as f64;
         for _ in 0..4 {

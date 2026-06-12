@@ -74,7 +74,9 @@ impl SelfCheck {
         // shadows the other): search the lag both ways.
         let n = CHECK_WINDOW - 2 * CHECK_MAX_LAG;
         let mean = |v: &[(f32, f32)], side: usize| -> f64 {
-            v.iter().map(|e| if side == 0 { e.0 as f64 } else { e.1 as f64 }).sum::<f64>()
+            v.iter()
+                .map(|e| if side == 0 { e.0 as f64 } else { e.1 as f64 })
+                .sum::<f64>()
                 / v.len() as f64
         };
         let canon_level = (mean(&self.ex, 0) + mean(&self.ex, 1)) / 2.0;
@@ -292,7 +294,9 @@ impl Verifier {
         if window_ok {
             Judgement::Pass
         } else {
-            Judgement::Fail { structure_at_sane_level: r < CHECK_MIN_R && level_ok }
+            Judgement::Fail {
+                structure_at_sane_level: r < CHECK_MIN_R && level_ok,
+            }
         }
     }
 }

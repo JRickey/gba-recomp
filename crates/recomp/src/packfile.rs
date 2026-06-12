@@ -58,8 +58,9 @@ pub fn load() -> Option<Result<Manifest, String>> {
 
 fn parse(path: &Path, dir: PathBuf) -> Result<Manifest, String> {
     let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    let doc: toml::Value =
-        text.parse().map_err(|e| format!("{}: {e}", path.display()))?;
+    let doc: toml::Value = text
+        .parse()
+        .map_err(|e| format!("{}: {e}", path.display()))?;
     let s = |keys: [&str; 2]| -> Result<String, String> {
         doc.get(keys[0])
             .and_then(|t| t.get(keys[1]))
@@ -101,7 +102,9 @@ pub fn find_rom(m: &Manifest) -> Result<PathBuf, String> {
         dirs.push(c.join("gba-recomp"));
     }
     for d in &dirs {
-        let Ok(entries) = std::fs::read_dir(d) else { continue };
+        let Ok(entries) = std::fs::read_dir(d) else {
+            continue;
+        };
         let mut names: Vec<PathBuf> = entries
             .flatten()
             .map(|e| e.path())
@@ -111,8 +114,10 @@ pub fn find_rom(m: &Manifest) -> Result<PathBuf, String> {
         for p in names {
             if let Ok(data) = std::fs::read(&p) {
                 use sha2::{Digest, Sha256};
-                let sha: String =
-                    Sha256::digest(&data).iter().map(|b| format!("{b:02x}")).collect();
+                let sha: String = Sha256::digest(&data)
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect();
                 if sha == m.rom_sha256 {
                     return Ok(p);
                 }

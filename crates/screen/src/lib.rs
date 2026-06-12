@@ -15,9 +15,9 @@
 pub mod blend;
 pub mod color;
 pub mod lut;
-pub mod profile;
 #[cfg(feature = "gpu")]
 pub mod present;
+pub mod profile;
 
 pub use blend::{ResponseMode, Temporal};
 pub use lut::{ColorLut, ColorSettings};

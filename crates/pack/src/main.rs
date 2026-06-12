@@ -31,7 +31,10 @@ close coverage gaps automatically).";
 
 fn sha256_file(path: &str) -> Result<String, String> {
     let data = std::fs::read(path).map_err(|e| format!("{path}: {e}"))?;
-    Ok(Sha256::digest(&data).iter().map(|b| format!("{b:02x}")).collect())
+    Ok(Sha256::digest(&data)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect())
 }
 
 /// Resolve the recomp binary: explicit flag, env, sibling, PATH.
@@ -81,8 +84,10 @@ fn recomp_run(
     // seeding mode), not just our phase banners.
     for line in stdout.lines() {
         let line = line.trim_end();
-        if line.starts_with("labels:") || line.starts_with("blocks:")
-            || line.starts_with("bios:") || line.starts_with("profiled ")
+        if line.starts_with("labels:")
+            || line.starts_with("blocks:")
+            || line.starts_with("bios:")
+            || line.starts_with("profiled ")
             || line.contains("fallback_steps")
         {
             println!("      | {line}");
@@ -119,8 +124,11 @@ fn cmd_build(args: &[String]) -> Result<(), String> {
             "--out" => out_dir = it.next().ok_or("--out needs a value")?.into(),
             "--recomp" => recomp_flag = Some(it.next().ok_or("--recomp needs a value")?.clone()),
             "--soak" => {
-                soak = it.next().ok_or("--soak needs a value")?
-                    .parse().map_err(|e| format!("bad soak: {e}"))?
+                soak = it
+                    .next()
+                    .ok_or("--soak needs a value")?
+                    .parse()
+                    .map_err(|e| format!("bad soak: {e}"))?
             }
             other if cfg_path.is_none() => cfg_path = Some(other.to_string()),
             other => return Err(format!("unexpected argument {other:?}\n{USAGE}")),
@@ -137,7 +145,10 @@ fn cmd_build(args: &[String]) -> Result<(), String> {
     ] {
         let got = sha256_file(p.to_str().ok_or("non-UTF8 path")?)?;
         if got != *want {
-            return Err(format!("{}: sha256 {got} does not match {what}", p.display()));
+            return Err(format!(
+                "{}: sha256 {got} does not match {what}",
+                p.display()
+            ));
         }
     }
     if let Some(f) = &cfg.labels.file {
@@ -161,7 +172,11 @@ fn cmd_build(args: &[String]) -> Result<(), String> {
     let recomp = find_recomp(recomp_flag.as_deref())?;
     let work = out_dir.join("work");
     std::fs::create_dir_all(&work).map_err(|e| format!("{}: {e}", work.display()))?;
-    let stem = rom.file_stem().and_then(|s| s.to_str()).ok_or("bad ROM name")?.to_string();
+    let stem = rom
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .ok_or("bad ROM name")?
+        .to_string();
     // The package is BIOS-coherent by construction: the runtime boots
     // the end user's real BIOS (pin-enforced), so the translation is
     // built and soaked against the same image — an HLE translation
@@ -216,7 +231,14 @@ recomp needs the function map's boundaries for exhaustive coverage"
 
     println!("[1/3] translating (recomp build --ram --bios; labels auto-load beside the image)...");
     if !build_envs.is_empty() {
-        println!("      build env: {}", build_envs.iter().map(|(k, _)| *k).collect::<Vec<_>>().join(" "));
+        println!(
+            "      build env: {}",
+            build_envs
+                .iter()
+                .map(|(k, _)| *k)
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
     }
     recomp_run(&recomp, &work, &build_args, keep_c)?;
     if !dylib.is_file() {
@@ -226,20 +248,36 @@ recomp needs the function map's boundaries for exhaustive coverage"
     println!("[2/3] soak: {soak} frames with fallback tracing...");
     let frames = soak.to_string();
     let soak_args = ["runc", rom_str, "--frames", &frames, "--bios", bios_str];
-    let mut steps =
-        fallback_steps(&recomp_run(&recomp, &work, &soak_args, &[("RECOMP_TRACE_FALLBACK", "1")])?)?;
+    let mut steps = fallback_steps(&recomp_run(
+        &recomp,
+        &work,
+        &soak_args,
+        &[("RECOMP_TRACE_FALLBACK", "1")],
+    )?)?;
     println!("      fallback_steps: {steps}");
     if !cfg.runtime.interpreter && steps > 0 {
         println!("      full recomp requires zero — recording the gaps and rebuilding once...");
         recomp_run(
-            &recomp, &work,
-            &["runc", rom_str, "--frames", &frames, "--bios", bios_str, "--record-labels"],
+            &recomp,
+            &work,
+            &[
+                "runc",
+                rom_str,
+                "--frames",
+                &frames,
+                "--bios",
+                bios_str,
+                "--record-labels",
+            ],
             &[],
         )?;
         recomp_run(&recomp, &work, &build_args, keep_c)?;
-        steps = fallback_steps(
-            &recomp_run(&recomp, &work, &soak_args, &[("RECOMP_TRACE_FALLBACK", "1")])?,
-        )?;
+        steps = fallback_steps(&recomp_run(
+            &recomp,
+            &work,
+            &soak_args,
+            &[("RECOMP_TRACE_FALLBACK", "1")],
+        )?)?;
         println!("      fallback_steps after rebuild: {steps}");
         if steps > 0 {
             return Err(format!(
@@ -256,7 +294,10 @@ or set [runtime] interpreter = true.",
     if cfg.package.icon.is_none() {
         println!("      icon: using the canonical default (no package.icon given)");
     } else {
-        println!("      icon: {}×{} master from package.icon", master.w, master.h);
+        println!(
+            "      icon: {}×{} master from package.icon",
+            master.w, master.h
+        );
     }
 
     let pkg = out_dir.join(&cfg.package.name);
@@ -293,8 +334,11 @@ or set [runtime] interpreter = true.",
             "# Generated by gba-pack — pins only, no image content.\n\
 [package]\nname = \"{}\"\n\n[image]\nrom-sha256 = \"{}\"\nbios-sha256 = \"{}\"\n\n\
 [runtime]\ninterpreter = {}\nmenu = {}\n\n[translation]\nfile = \"translation.dylib\"\n",
-            name, cfg.image.rom_sha256, cfg.image.bios_sha256,
-            cfg.runtime.interpreter, cfg.runtime.menu,
+            name,
+            cfg.image.rom_sha256,
+            cfg.image.bios_sha256,
+            cfg.runtime.interpreter,
+            cfg.runtime.menu,
         ),
     )
     .map_err(|e| e.to_string())?;
@@ -314,14 +358,18 @@ inside the bundle next to the executable, or in your config directory:\n\n\
   2. your BIOS image as gba_bios.bin, sha256 {bios}\n\n\
 Then open {name}.app. The bundle is ad-hoc signed; on first launch macOS may\n\
 ask you to confirm in System Settings > Privacy & Security.\n",
-            name = name, rom = cfg.image.rom_sha256, bios = cfg.image.bios_sha256,
+            name = name,
+            rom = cfg.image.rom_sha256,
+            bios = cfg.image.bios_sha256,
         ),
         _ => format!(
             "{name} — a statically recompiled game.\n\n\
 This package contains NO game or BIOS data. To play, place your own dumps\n\
 next to the executable:\n\n  1. your cartridge image (.gba), sha256 {rom}\n\
   2. your BIOS image as gba_bios.bin, sha256 {bios}\n\nThen run ./{name}\n",
-            name = name, rom = cfg.image.rom_sha256, bios = cfg.image.bios_sha256,
+            name = name,
+            rom = cfg.image.rom_sha256,
+            bios = cfg.image.bios_sha256,
         ),
     };
     std::fs::write(pkg.join("README.txt"), readme).map_err(|e| e.to_string())?;
@@ -329,10 +377,16 @@ next to the executable:\n\n  1. your cartridge image (.gba), sha256 {rom}\n\
     // The project's dual license travels with every package so the end
     // user receives the terms the runtime ships under. Embedded (not
     // read from the repo) so packaging works from any working directory.
-    std::fs::write(pkg.join("LICENSE-MIT"), include_str!("../../../LICENSE-MIT"))
-        .map_err(|e| e.to_string())?;
-    std::fs::write(pkg.join("LICENSE-APACHE"), include_str!("../../../LICENSE-APACHE"))
-        .map_err(|e| e.to_string())?;
+    std::fs::write(
+        pkg.join("LICENSE-MIT"),
+        include_str!("../../../LICENSE-MIT"),
+    )
+    .map_err(|e| e.to_string())?;
+    std::fs::write(
+        pkg.join("LICENSE-APACHE"),
+        include_str!("../../../LICENSE-APACHE"),
+    )
+    .map_err(|e| e.to_string())?;
 
     match host {
         Platform::Macos => {
@@ -370,8 +424,7 @@ next to the executable:\n\n  1. your cartridge image (.gba), sha256 {rom}\n\
         if let Ok(entries) = std::fs::read_dir(work.join("out")) {
             for e in entries.flatten() {
                 if e.path().extension().is_some_and(|x| x == "c") {
-                    std::fs::copy(e.path(), src.join(e.file_name()))
-                        .map_err(|e| e.to_string())?;
+                    std::fs::copy(e.path(), src.join(e.file_name())).map_err(|e| e.to_string())?;
                     n += 1;
                 }
             }
@@ -384,8 +437,11 @@ next to the executable:\n\n  1. your cartridge image (.gba), sha256 {rom}\n\
         "  {} + translation.dylib + recomp.pack.toml (interpreter = {})",
         name, cfg.runtime.interpreter
     );
-    println!("  end user supplies: ROM {}…, BIOS {}…",
-        &cfg.image.rom_sha256[..12], &cfg.image.bios_sha256[..12]);
+    println!(
+        "  end user supplies: ROM {}…, BIOS {}…",
+        &cfg.image.rom_sha256[..12],
+        &cfg.image.bios_sha256[..12]
+    );
     Ok(())
 }
 
@@ -397,7 +453,13 @@ fn info_plist(name: &str) -> String {
     // any vendor/title text and just namespace under the product.
     let ident_stem: String = name
         .chars()
-        .map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '-' })
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' {
+                c
+            } else {
+                '-'
+            }
+        })
         .collect();
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
@@ -471,7 +533,9 @@ fn run() -> Result<(), String> {
     if let Some(p) = &bios {
         let got = sha256_file(p)?;
         if got != cfg.image.bios_sha256 {
-            return Err(format!("{p}: sha256 {got} does not match image.bios-sha256"));
+            return Err(format!(
+                "{p}: sha256 {got} does not match image.bios-sha256"
+            ));
         }
         println!("bios     {p} (verified)");
     }
@@ -487,7 +551,10 @@ label set is strongly recommended for a packaged release"
 
     println!(
         "runtime  menu={} enhanced-audio={} screen-sim={} engine-hle={:?}",
-        cfg.runtime.menu, cfg.runtime.enhanced_audio, cfg.runtime.screen_sim, cfg.runtime.engine_hle
+        cfg.runtime.menu,
+        cfg.runtime.enhanced_audio,
+        cfg.runtime.screen_sim,
+        cfg.runtime.engine_hle
     );
     println!(
         "output   binary={} c-source={}",
@@ -497,7 +564,14 @@ label set is strongly recommended for a packaged release"
     println!("plan validated. build pipeline not wired yet — next steps:");
     println!("  1. translate (recomp build with the label set, full-coverage report)");
     println!("  2. emit runtime crate with pinned SHAs + selected modules");
-    println!("  3. per-platform link{}", if cfg.output.c_source { " + C source tree export" } else { "" });
+    println!(
+        "  3. per-platform link{}",
+        if cfg.output.c_source {
+            " + C source tree export"
+        } else {
+            ""
+        }
+    );
     Ok(())
 }
 

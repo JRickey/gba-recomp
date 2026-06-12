@@ -182,7 +182,13 @@ fn shift_exprs(rm: &str, kind: ShiftKind, amount: u8) -> (String, Option<String>
 fn inline_body(cx: &Ctx, instr: &Instr) -> Option<String> {
     let mut s = String::new();
     match instr.op {
-        Op::Alu { op, s: sflag, rd, rn, op2 } => {
+        Op::Alu {
+            op,
+            s: sflag,
+            rd,
+            rn,
+            op2,
+        } => {
             if rd == PC {
                 return None;
             }
@@ -195,8 +201,14 @@ fn inline_body(cx: &Ctx, instr: &Instr) -> Option<String> {
                 }
             };
             match op {
-                AluOp::And | AluOp::Eor | AluOp::Orr | AluOp::Bic | AluOp::Mov | AluOp::Mvn
-                | AluOp::Tst | AluOp::Teq => {
+                AluOp::And
+                | AluOp::Eor
+                | AluOp::Orr
+                | AluOp::Bic
+                | AluOp::Mov
+                | AluOp::Mvn
+                | AluOp::Tst
+                | AluOp::Teq => {
                     let expr = match op {
                         AluOp::And | AluOp::Tst => format!("({a} & {bexpr})"),
                         AluOp::Eor | AluOp::Teq => format!("({a} ^ {bexpr})"),
@@ -216,8 +228,14 @@ fn inline_body(cx: &Ctx, instr: &Instr) -> Option<String> {
                         s.push_str("        (void)r;\n");
                     }
                 }
-                AluOp::Add | AluOp::Adc | AluOp::Sub | AluOp::Sbc | AluOp::Rsb | AluOp::Rsc
-                | AluOp::Cmp | AluOp::Cmn => {
+                AluOp::Add
+                | AluOp::Adc
+                | AluOp::Sub
+                | AluOp::Sbc
+                | AluOp::Rsb
+                | AluOp::Rsc
+                | AluOp::Cmp
+                | AluOp::Cmn => {
                     let (x, y, ci) = match op {
                         AluOp::Add | AluOp::Cmn => (a.clone(), bexpr.clone(), "0u".to_string()),
                         AluOp::Adc => (a.clone(), bexpr.clone(), cin.to_string()),
@@ -239,7 +257,14 @@ fn inline_body(cx: &Ctx, instr: &Instr) -> Option<String> {
                 }
             }
         }
-        Op::Mul { acc, s: sflag, rd, rn, rs, rm } => {
+        Op::Mul {
+            acc,
+            s: sflag,
+            rd,
+            rn,
+            rs,
+            rm,
+        } => {
             if rd == PC {
                 return None;
             }
@@ -252,8 +277,20 @@ fn inline_body(cx: &Ctx, instr: &Instr) -> Option<String> {
                 s.push_str("        f_nz(c, r);\n");
             }
         }
-        Op::MulLong { signed, acc, s: sflag, rd_hi, rd_lo, rs, rm } => {
-            let cast = if signed { "(int64_t)(int32_t)" } else { "(uint64_t)" };
+        Op::MulLong {
+            signed,
+            acc,
+            s: sflag,
+            rd_hi,
+            rd_lo,
+            rs,
+            rm,
+        } => {
+            let cast = if signed {
+                "(int64_t)(int32_t)"
+            } else {
+                "(uint64_t)"
+            };
             let _ = writeln!(
                 s,
                 "        uint64_t r = (uint64_t)({cast}c[{rm}] * {cast}c[{rs}]);"
@@ -270,7 +307,17 @@ fn inline_body(cx: &Ctx, instr: &Instr) -> Option<String> {
                 s.push_str("        f_nz64(c, r);\n");
             }
         }
-        Op::Mem { load, width, signed, rd, rn, offset, pre, up, writeback } => {
+        Op::Mem {
+            load,
+            width,
+            signed,
+            rd,
+            rn,
+            offset,
+            pre,
+            up,
+            writeback,
+        } => {
             if rd == PC {
                 return None;
             }
@@ -296,7 +343,11 @@ fn inline_body(cx: &Ctx, instr: &Instr) -> Option<String> {
             let sign = if up { "+" } else { "-" };
             let _ = writeln!(s, "        uint32_t base = {base};");
             let _ = writeln!(s, "        uint32_t ob = base {sign} {off};");
-            let _ = writeln!(s, "        uint32_t addr = {};", if pre { "ob" } else { "base" });
+            let _ = writeln!(
+                s,
+                "        uint32_t addr = {};",
+                if pre { "ob" } else { "base" }
+            );
             let do_wb = !pre || writeback;
             if load {
                 let v = match (width, signed) {
@@ -336,7 +387,15 @@ fn inline_body(cx: &Ctx, instr: &Instr) -> Option<String> {
                 }
             }
         }
-        Op::BlockMem { load, rn, rlist, pre, up, s_bit, writeback } => {
+        Op::BlockMem {
+            load,
+            rn,
+            rlist,
+            pre,
+            up,
+            s_bit,
+            writeback,
+        } => {
             if s_bit || rlist == 0 || rn == PC || (load && rlist & (1 << PC) != 0) {
                 return None; // user-bank / empty list / pop{pc} handled elsewhere
             }
@@ -369,7 +428,11 @@ fn inline_body(cx: &Ctx, instr: &Instr) -> Option<String> {
                     let val = if *r == PC {
                         format!("0x{:08x}u", instr.pc_value().wrapping_add(4))
                     } else if *r == rn {
-                        if *r == lowest { "base".to_string() } else { wb_val.clone() }
+                        if *r == lowest {
+                            "base".to_string()
+                        } else {
+                            wb_val.clone()
+                        }
                     } else {
                         format!("c[{r}]")
                     };
@@ -393,7 +456,11 @@ struct ChainCtx<'a> {
 }
 
 fn label(key: u32) -> String {
-    format!("L_{:08x}_{}", key & !1, if key & 1 != 0 { "t" } else { "a" })
+    format!(
+        "L_{:08x}_{}",
+        key & !1,
+        if key & 1 != 0 { "t" } else { "a" }
+    )
 }
 
 /// Emit a static control transfer to `key` (caller has already set
@@ -421,7 +488,9 @@ fn transfer(out: &mut String, chain: Option<&ChainCtx>, src_addr: u32, key: u32,
 pub fn static_exit_keys(b: &Block) -> Vec<u32> {
     let tb = b.thumb as u32;
     let n = b.instrs.len();
-    let Some(last) = b.instrs.last() else { return Vec::new() };
+    let Some(last) = b.instrs.last() else {
+        return Vec::new();
+    };
     if n >= 2 {
         if let Some((target, _)) = armv4t::fuse_thumb_bl(&b.instrs[n - 2], last) {
             return vec![(target & !1) | 1];
@@ -438,7 +507,9 @@ pub fn static_exit_keys(b: &Block) -> Vec<u32> {
         Op::Bx { .. } | Op::Swi { .. } | Op::Undefined { .. } | Op::ThumbBlLow { .. } => Vec::new(),
         Op::Alu { rd, .. } if rd == PC => Vec::new(),
         Op::Mem { load: true, rd, .. } if rd == PC => Vec::new(),
-        Op::BlockMem { load: true, rlist, .. } if rlist & (1 << PC) != 0 => Vec::new(),
+        Op::BlockMem {
+            load: true, rlist, ..
+        } if rlist & (1 << PC) != 0 => Vec::new(),
         _ => vec![last.addr.wrapping_add(last.size()) | tb],
     }
 }
@@ -494,7 +565,11 @@ fn emit_block(out: &mut String, b: &Block, view: &crate::analyze::View, chain: O
     }
 
     let close: &str = if chain.is_some() { "\n" } else { "}\n\n" };
-    let mut cx = Ctx { out, thumb: b.thumb, cycles: 0 };
+    let mut cx = Ctx {
+        out,
+        thumb: b.thumb,
+        cycles: 0,
+    };
     let mut i = 0;
     while i < b.instrs.len() {
         let instr = &b.instrs[i];
@@ -506,9 +581,7 @@ fn emit_block(out: &mut String, b: &Block, view: &crate::analyze::View, chain: O
         // Fused Thumb BL pair (always unconditional).
         if let Op::ThumbBlHigh { .. } = instr.op {
             if i + 1 < b.instrs.len() {
-                if let Some((target, ret)) =
-                    armv4t::fuse_thumb_bl(instr, &b.instrs[i + 1])
-                {
+                if let Some((target, ret)) = armv4t::fuse_thumb_bl(instr, &b.instrs[i + 1]) {
                     cx.cycles += cost + gba_core::machine_instr_cost(region, &b.instrs[i + 1]);
                     cx.flush_ticks();
                     let _ = writeln!(cx.out, "    c[14] = 0x{ret:08x}u;");
@@ -576,16 +649,25 @@ fn emit_block(out: &mut String, b: &Block, view: &crate::analyze::View, chain: O
                 return;
             }
             // pop {.., pc} (no state switch on v4T).
-            Op::BlockMem { load: true, rn, rlist, pre: false, up: true, s_bit: false, writeback: true }
-                if instr.cond == Cond::Al && rlist & (1 << PC) != 0 && rn != PC && region != 0 =>
-            {
+            Op::BlockMem {
+                load: true,
+                rn,
+                rlist,
+                pre: false,
+                up: true,
+                s_bit: false,
+                writeback: true,
+            } if instr.cond == Cond::Al && rlist & (1 << PC) != 0 && rn != PC && region != 0 => {
                 cx.cycles += cost;
                 cx.flush_ticks();
                 let regs: Vec<u8> = (0..15).filter(|r| rlist & (1 << r) != 0).collect();
                 let total = (regs.len() as u32 + 1) * 4;
                 let _ = writeln!(cx.out, "    {{ uint32_t addr = c[{rn}];");
                 for r in &regs {
-                    let _ = writeln!(cx.out, "      c[{r}] = a->read32(m, addr & ~3u); addr += 4u;");
+                    let _ = writeln!(
+                        cx.out,
+                        "      c[{r}] = a->read32(m, addr & ~3u); addr += 4u;"
+                    );
                 }
                 let _ = writeln!(cx.out, "      c[{rn}] = c[{rn}] + {total}u;");
                 let mask = if b.thumb { "~1u" } else { "~3u" };
@@ -635,7 +717,7 @@ fn emit_block(out: &mut String, b: &Block, view: &crate::analyze::View, chain: O
     if let Some(last) = b.instrs.last() {
         let next = last.addr.wrapping_add(last.size());
         cx.flush_ticks();
-        let _ = writeln!(cx.out, "    c[15] = 0x{next:08x}u;", );
+        let _ = writeln!(cx.out, "    c[15] = 0x{next:08x}u;",);
         transfer(cx.out, chain, b.addr, next | thumb_bit, "    ");
     }
     out.push_str(close);
@@ -658,8 +740,11 @@ fn emit_block(out: &mut String, b: &Block, view: &crate::analyze::View, chain: O
 /// per-entry dispatch.
 fn chain_groups(blocks: &[Block]) -> Vec<Vec<usize>> {
     const GROUP_MAX_INSTRS: usize = 8192;
-    let key_idx: std::collections::HashMap<u32, usize> =
-        blocks.iter().enumerate().map(|(i, b)| (b.key(), i)).collect();
+    let key_idx: std::collections::HashMap<u32, usize> = blocks
+        .iter()
+        .enumerate()
+        .map(|(i, b)| (b.key(), i))
+        .collect();
     // Union-find.
     let mut parent: Vec<usize> = (0..blocks.len()).collect();
     fn find(parent: &mut Vec<usize>, mut i: usize) -> usize {
@@ -789,7 +874,11 @@ pub fn emit_c_chunked(
         );
     }
     out.push_str("};\n");
-    let _ = writeln!(out, "const uint64_t rcg_block_count = {};", analysis.blocks.len());
+    let _ = writeln!(
+        out,
+        "const uint64_t rcg_block_count = {};",
+        analysis.blocks.len()
+    );
     sink(&out, analysis.blocks.len())?;
     Ok(count + 1)
 }

@@ -234,8 +234,16 @@ impl MemMap {
             BackupKind::Flash128 => Some(Flash::new(true)),
             _ => None,
         };
-        let eeprom = if backup == BackupKind::Eeprom { Some(Eeprom::new()) } else { None };
-        let rtc = if crate::rtc::detect(&rom) { Some(crate::rtc::Rtc::new()) } else { None };
+        let eeprom = if backup == BackupKind::Eeprom {
+            Some(Eeprom::new())
+        } else {
+            None
+        };
+        let rtc = if crate::rtc::detect(&rom) {
+            Some(crate::rtc::Rtc::new())
+        } else {
+            None
+        };
         MemMap {
             bios: vec![0; 0x4000],
             ewram: vec![0; 0x4_0000],
@@ -270,7 +278,10 @@ impl MemMap {
             flash,
             eeprom,
             rtc,
-            fifo: [std::collections::VecDeque::new(), std::collections::VecDeque::new()],
+            fifo: [
+                std::collections::VecDeque::new(),
+                std::collections::VecDeque::new(),
+            ],
             fifo_sample: [0; 2],
             audio_buf: Vec::new(),
             tap_channels: false,
@@ -653,8 +664,7 @@ impl MemMap {
         // Direct Sound: timers 0/1 clock the FIFOs selected in SOUNDCNT_H.
         if i < 2 {
             let t = &self.timers[i];
-            let period =
-                (((0x1_0000 - t.reload as u64).max(1)) << t.prescaler_shift()) as u32;
+            let period = (((0x1_0000 - t.reload as u64).max(1)) << t.prescaler_shift()) as u32;
             let soundcnt_h = u16::from_le_bytes([self.io[0x82], self.io[0x83]]);
             for f in 0..2 {
                 let timer_sel = (soundcnt_h >> (10 + f * 4)) & 1;
@@ -822,7 +832,11 @@ impl MemMap {
         self.dma[i].cur_src = src;
         // Rough cycle cost: 2 cycles per unit transferred plus setup
         // (minus what the chunked accounting above already added).
-        let accounted = if sound_mode { 0 } else { (count as u64 / 16) * 32 };
+        let accounted = if sound_mode {
+            0
+        } else {
+            (count as u64 / 16) * 32
+        };
         self.clock += 2 * count as u64 + 4 - accounted;
 
         // An EEPROM request is exactly one DMA; the end of the transfer
@@ -888,9 +902,7 @@ impl MemMap {
         }
         match 0x0400_0000 + off {
             REG_IE => self.reg_ie = (self.reg_ie & 0xFF00) | value as u16,
-            x if x == REG_IE + 1 => {
-                self.reg_ie = (self.reg_ie & 0x00FF) | ((value as u16) << 8)
-            }
+            x if x == REG_IE + 1 => self.reg_ie = (self.reg_ie & 0x00FF) | ((value as u16) << 8),
             // IF: write-1-to-clear.
             REG_IF => self.reg_if &= !(value as u16),
             x if x == REG_IF + 1 => self.reg_if &= !((value as u16) << 8),
@@ -1146,10 +1158,7 @@ impl Bus for MemMap {
                 // wider writes decompose to these byte writes.
                 if self.is_gpio(addr) {
                     self.rtc.as_mut().unwrap().write(addr & 0x01FF_FFFF, value);
-                } else if addr >> 24 == 0x0D
-                    && self.is_eeprom_addr(addr)
-                    && addr & 1 == 0
-                {
+                } else if addr >> 24 == 0x0D && self.is_eeprom_addr(addr) && addr & 1 == 0 {
                     self.eeprom.as_mut().unwrap().write_bit(value as u16);
                 }
             }
@@ -1454,8 +1463,7 @@ impl Bus for MemMap {
             let ahead = if key & 1 != 0 { 4 } else { 8 };
             let off = ((pc.wrapping_add(ahead)) & !3) as usize;
             if off + 4 <= self.bios.len() {
-                self.bios_open =
-                    u32::from_le_bytes(self.bios[off..off + 4].try_into().unwrap());
+                self.bios_open = u32::from_le_bytes(self.bios[off..off + 4].try_into().unwrap());
             }
         }
     }
