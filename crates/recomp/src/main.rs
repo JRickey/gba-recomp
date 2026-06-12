@@ -1245,7 +1245,7 @@ fn status_line(s: &str) {
 /// guards, conditional-BL link fix; 3 = MidiKey2Freq HLE + sound
 /// FIFO/DMA timing fixes (profiled state shifts); 4 = SWI ends blocks
 /// (halt ordering vs following instructions — scanline-effect timing).
-const TRANSLATION_REV: u32 = 4;
+const TRANSLATION_REV: u32 = 5;
 
 /// Locate (or build) the cached native translation for this image.
 /// Cache key is the ROM's SHA-256 under the `TRANSLATION_REV` directory,

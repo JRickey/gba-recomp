@@ -33,6 +33,11 @@ pub struct RtApi {
     /// hash of `len` guest bytes at `addr` equals `expect`. One call per
     /// block entry; hashes the IWRAM slice directly on the fast path.
     pub guard: extern "C" fn(*mut core::ffi::c_void, u32, u32, u64) -> u32,
+    /// Chain gate: returns 1 when chained native code must return to
+    /// the dispatch loop — a frame completed, the CPU halted, or an
+    /// interrupt became deliverable. Checked on chained back-edges so
+    /// native loops cannot starve IRQ delivery or frame pacing.
+    pub chain_gate: extern "C" fn(*mut core::ffi::c_void) -> u32,
 }
 
 const _: () = {
@@ -45,6 +50,13 @@ macro_rules! mach {
     ($m:ident) => {
         unsafe { &mut *($m as *mut Machine) }
     };
+}
+
+extern "C" fn rt_chain_gate(m: *mut core::ffi::c_void) -> u32 {
+    let mach = mach!(m);
+    (mach.bus.frame_ready
+        || mach.bus.halted
+        || (mach.bus.irq_pending() && mach.cpu.cpsr & crate::cpu::FLAG_I == 0)) as u32
 }
 
 extern "C" fn rt_read8(m: *mut core::ffi::c_void, a: u32) -> u32 {
@@ -119,4 +131,5 @@ pub const RT_API: RtApi = RtApi {
     write32: rt_write32,
     tick: rt_tick,
     guard: rt_guard,
+    chain_gate: rt_chain_gate,
 };

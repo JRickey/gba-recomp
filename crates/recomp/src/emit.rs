@@ -33,6 +33,7 @@ typedef struct {
     void (*write32)(void*, uint32_t, uint32_t);
     void (*tick)(void*, uint32_t);
     uint32_t (*guard)(void*, uint32_t, uint32_t, uint64_t);
+    uint32_t (*chain_gate)(void*);
 } RtApi;
 typedef struct { uint32_t key; uint32_t (*fn)(const RtApi*, void*); } RcgBlock;
 
@@ -385,15 +386,78 @@ fn inline_body(cx: &Ctx, instr: &Instr) -> Option<String> {
 }
 
 /// Emit one block as a C function.
-fn emit_block(out: &mut String, b: &Block, view: &crate::analyze::View) {
+/// Chain-group context: the member key set of the group this block is
+/// emitted into. Static transfers to members become gotos.
+struct ChainCtx<'a> {
+    members: &'a std::collections::HashSet<u32>,
+}
+
+fn label(key: u32) -> String {
+    format!("L_{:08x}_{}", key & !1, if key & 1 != 0 { "t" } else { "a" })
+}
+
+/// Emit a static control transfer to `key` (caller has already set
+/// c[15] and any link register): a direct goto when the target belongs
+/// to the same chain group — gated on back-edges so native loops still
+/// return for IRQ delivery and frame pacing — else a dispatcher return.
+fn transfer(out: &mut String, chain: Option<&ChainCtx>, src_addr: u32, key: u32, ind: &str) {
+    if let Some(ch) = chain {
+        if ch.members.contains(&key) {
+            if key & !1 <= src_addr {
+                let _ = writeln!(out, "{ind}if (a->chain_gate(m)) return 0x{key:08x}u;");
+            }
+            let _ = writeln!(out, "{ind}goto {};", label(key));
+            return;
+        }
+    }
+    let _ = writeln!(out, "{ind}return 0x{key:08x}u;");
+}
+
+/// The dispatch keys this block can statically transfer to in its
+/// emitted form (unconditional/taken branch targets, fused Thumb BL
+/// targets, fall-through). May over-approximate (a fall-through that
+/// emission turns into a shell exit) — used only to group blocks; the
+/// emitter decides per-site whether a goto actually materializes.
+pub fn static_exit_keys(b: &Block) -> Vec<u32> {
+    let tb = b.thumb as u32;
+    let n = b.instrs.len();
+    let Some(last) = b.instrs.last() else { return Vec::new() };
+    if n >= 2 {
+        if let Some((target, _)) = armv4t::fuse_thumb_bl(&b.instrs[n - 2], last) {
+            return vec![(target & !1) | 1];
+        }
+    }
+    match last.op {
+        Op::Branch { target, .. } => {
+            let mut v = vec![target | tb];
+            if last.cond != Cond::Al {
+                v.push(last.addr.wrapping_add(last.size()) | tb);
+            }
+            v
+        }
+        Op::Bx { .. } | Op::Swi { .. } | Op::Undefined { .. } | Op::ThumbBlLow { .. } => Vec::new(),
+        Op::Alu { rd, .. } if rd == PC => Vec::new(),
+        Op::Mem { load: true, rd, .. } if rd == PC => Vec::new(),
+        Op::BlockMem { load: true, rlist, .. } if rlist & (1 << PC) != 0 => Vec::new(),
+        _ => vec![last.addr.wrapping_add(last.size()) | tb],
+    }
+}
+
+fn emit_block(out: &mut String, b: &Block, view: &crate::analyze::View, chain: Option<&ChainCtx>) {
     let thumb_bit = b.thumb as u32;
     let region = (b.addr >> 24) as usize & 0xF;
-    let _ = writeln!(
-        out,
-        "uint32_t b_{:08x}_{}(const RtApi* a, void* m) {{\n    uint32_t* c = (uint32_t*)m;\n    uint32_t pc; (void)pc;",
-        b.addr,
-        if b.thumb { "t" } else { "a" }
-    );
+    if chain.is_some() {
+        // Group member: a labelled body inside the group function,
+        // which owns the c/pc declarations.
+        let _ = writeln!(out, "{}:;", label(b.key()));
+    } else {
+        let _ = writeln!(
+            out,
+            "uint32_t b_{:08x}_{}(const RtApi* a, void* m) {{\n    uint32_t* c = (uint32_t*)m;\n    uint32_t pc; (void)pc;",
+            b.addr,
+            if b.thumb { "t" } else { "a" }
+        );
+    }
 
     // RAM-resident blocks were translated from a profiling snapshot;
     // guard the whole block's content (one FNV-1a hash call) so swapped
@@ -422,12 +486,13 @@ fn emit_block(out: &mut String, b: &Block, view: &crate::analyze::View) {
                     "    c[15] = 0x{:08x}u; return a->interp_one(m);",
                     b.addr
                 );
-                out.push_str("}\n\n");
+                out.push_str(if chain.is_some() { "\n" } else { "}\n\n" });
                 return;
             }
         }
     }
 
+    let close: &str = if chain.is_some() { "\n" } else { "}\n\n" };
     let mut cx = Ctx { out, thumb: b.thumb, cycles: 0 };
     let mut i = 0;
     while i < b.instrs.len() {
@@ -446,13 +511,9 @@ fn emit_block(out: &mut String, b: &Block, view: &crate::analyze::View) {
                     cx.cycles += cost + gba_core::machine_instr_cost(region, &b.instrs[i + 1]);
                     cx.flush_ticks();
                     let _ = writeln!(cx.out, "    c[14] = 0x{ret:08x}u;");
-                    let _ = writeln!(
-                        cx.out,
-                        "    c[15] = 0x{:08x}u; return 0x{:08x}u;",
-                        target & !1,
-                        (target & !1) | 1
-                    );
-                    cx.out.push_str("}\n\n");
+                    let _ = writeln!(cx.out, "    c[15] = 0x{:08x}u;", target & !1);
+                    transfer(cx.out, chain, b.addr, (target & !1) | 1, "    ");
+                    cx.out.push_str(close);
                     return;
                 }
             }
@@ -480,18 +541,21 @@ fn emit_block(out: &mut String, b: &Block, view: &crate::analyze::View) {
                     };
                     let _ = writeln!(
                         cx.out,
-                        "    {{ uint32_t s_ = c[16]; uint32_t cn = s_ >> 31, cz = (s_ >> 30) & 1u, cc = (s_ >> 29) & 1u, cv = (s_ >> 28) & 1u;\n      if {} {{ {lr}c[15] = 0x{:08x}u; return 0x{key:08x}u; }} }}",
+                        "    {{ uint32_t s_ = c[16]; uint32_t cn = s_ >> 31, cz = (s_ >> 30) & 1u, cc = (s_ >> 29) & 1u, cv = (s_ >> 28) & 1u;\n      if {} {{ {lr}c[15] = 0x{:08x}u;",
                         cond_expr(instr.cond),
                         target
                     );
+                    transfer(cx.out, chain, b.addr, key, "        ");
+                    cx.out.push_str("      } }\n");
                     i += 1;
                     continue;
                 }
                 if link {
                     let _ = writeln!(cx.out, "    c[14] = 0x{:08x}u;", instr.addr.wrapping_add(4));
                 }
-                let _ = writeln!(cx.out, "    c[15] = 0x{:08x}u; return 0x{key:08x}u;", target);
-                cx.out.push_str("}\n\n");
+                let _ = writeln!(cx.out, "    c[15] = 0x{:08x}u;", target);
+                transfer(cx.out, chain, b.addr, key, "    ");
+                cx.out.push_str(close);
                 return;
             }
             Op::Bx { rm } if instr.cond == Cond::Al => {
@@ -502,7 +566,7 @@ fn emit_block(out: &mut String, b: &Block, view: &crate::analyze::View) {
                     cx.out,
                     "    {{ uint32_t t = {t};\n      if (t & 1u) {{ c[16] |= 0x20u; c[15] = t & ~1u; return (t & ~1u) | 1u; }}\n      c[16] &= ~0x20u; c[15] = t & ~3u; return t & ~3u; }}"
                 );
-                cx.out.push_str("}\n\n");
+                cx.out.push_str(close);
                 return;
             }
             // pop {.., pc} (no state switch on v4T).
@@ -523,7 +587,7 @@ fn emit_block(out: &mut String, b: &Block, view: &crate::analyze::View) {
                     cx.out,
                     "      c[15] = a->read32(m, addr & ~3u) & {mask}; return c[15] | {thumb_bit}u; }}"
                 );
-                cx.out.push_str("}\n\n");
+                cx.out.push_str(close);
                 return;
             }
             _ => {}
@@ -553,7 +617,7 @@ fn emit_block(out: &mut String, b: &Block, view: &crate::analyze::View) {
             None => {
                 emit_shell(&mut cx, instr, expect, last);
                 if last {
-                    cx.out.push_str("}\n\n");
+                    cx.out.push_str(close);
                     return;
                 }
             }
@@ -565,13 +629,10 @@ fn emit_block(out: &mut String, b: &Block, view: &crate::analyze::View) {
     if let Some(last) = b.instrs.last() {
         let next = last.addr.wrapping_add(last.size());
         cx.flush_ticks();
-        let _ = writeln!(
-            cx.out,
-            "    c[15] = 0x{next:08x}u; return 0x{:08x}u;",
-            next | thumb_bit
-        );
+        let _ = writeln!(cx.out, "    c[15] = 0x{next:08x}u;", );
+        transfer(cx.out, chain, b.addr, next | thumb_bit, "    ");
     }
-    out.push_str("}\n\n");
+    out.push_str(close);
 }
 
 /// Emit translated C in translation units of at most ~`max_bytes` each,
@@ -583,6 +644,98 @@ fn emit_block(out: &mut String, b: &Block, view: &crate::analyze::View) {
 /// `sink` also receives the number of blocks emitted so far (out of
 /// `analysis.blocks.len()`), so callers can report build progress.
 /// Returns the number of units emitted.
+/// Group ROM blocks into chain groups: connected components over the
+/// static-transfer edges, split to a bounded size so no C function gets
+/// unwieldy. Within a group, static transfers become gotos (back-edges
+/// gated); everything else still returns to the dispatcher. RAM blocks
+/// stay solo: their entry guards and the audio-HLE hook keys depend on
+/// per-entry dispatch.
+fn chain_groups(blocks: &[Block]) -> Vec<Vec<usize>> {
+    const GROUP_MAX_INSTRS: usize = 8192;
+    let key_idx: std::collections::HashMap<u32, usize> =
+        blocks.iter().enumerate().map(|(i, b)| (b.key(), i)).collect();
+    // Union-find.
+    let mut parent: Vec<usize> = (0..blocks.len()).collect();
+    fn find(parent: &mut Vec<usize>, mut i: usize) -> usize {
+        while parent[i] != i {
+            parent[i] = parent[parent[i]];
+            i = parent[i];
+        }
+        i
+    }
+    for (i, b) in blocks.iter().enumerate() {
+        if b.addr >> 24 != 8 {
+            continue;
+        }
+        for key in static_exit_keys(b) {
+            if let Some(&j) = key_idx.get(&key) {
+                if blocks[j].addr >> 24 == 8 {
+                    let (ri, rj) = (find(&mut parent, i), find(&mut parent, j));
+                    if ri != rj {
+                        parent[ri] = rj;
+                    }
+                }
+            }
+        }
+    }
+    let mut by_root: std::collections::BTreeMap<usize, Vec<usize>> = Default::default();
+    for i in 0..blocks.len() {
+        let r = find(&mut parent, i);
+        by_root.entry(r).or_default().push(i);
+    }
+    // Split oversized components by address order: locality keeps the
+    // gotos that matter (loops are address-adjacent) inside one part.
+    let mut groups = Vec::new();
+    for (_, mut members) in by_root {
+        members.sort_by_key(|&i| blocks[i].key());
+        let mut cur = Vec::new();
+        let mut instrs = 0usize;
+        for i in members {
+            if instrs + blocks[i].instrs.len() > GROUP_MAX_INSTRS && !cur.is_empty() {
+                groups.push(std::mem::take(&mut cur));
+                instrs = 0;
+            }
+            instrs += blocks[i].instrs.len();
+            cur.push(i);
+        }
+        if !cur.is_empty() {
+            groups.push(cur);
+        }
+    }
+    groups
+}
+
+/// Emit one chain group: a static function holding every member body
+/// (entered through a small switch), plus the externally-linked
+/// per-member forwarders the block table points at.
+fn emit_group(out: &mut String, blocks: &[Block], members: &[usize], view: &crate::analyze::View) {
+    let keys: std::collections::HashSet<u32> = members.iter().map(|&i| blocks[i].key()).collect();
+    let gid = blocks[members[0]].key();
+    let _ = writeln!(
+        out,
+        "static uint32_t g_{gid:08x}(const RtApi* a, void* m, uint32_t entry) {{\n    uint32_t* c = (uint32_t*)m;\n    uint32_t pc; (void)pc;\n    switch (entry) {{"
+    );
+    for (n, &i) in members.iter().enumerate() {
+        let _ = writeln!(out, "    case {n}u: goto {};", label(blocks[i].key()));
+    }
+    out.push_str("    default: return 0u;\n    }\n");
+    let chain = ChainCtx { members: &keys };
+    for &i in members {
+        emit_block(out, &blocks[i], view, Some(&chain));
+    }
+    out.push_str("}\n\n");
+    for (n, &i) in members.iter().enumerate() {
+        let b = &blocks[i];
+        let _ = writeln!(
+            out,
+            "uint32_t b_{:08x}_{}(const RtApi* a, void* m) {{ return g_{gid:08x}(a, m, {n}u); }}",
+            b.addr,
+            if b.thumb { "t" } else { "a" }
+        );
+    }
+    out.push('\n');
+}
+
 pub fn emit_c_chunked(
     analysis: &Analysis,
     view: &crate::analyze::View,
@@ -594,10 +747,16 @@ pub fn emit_c_chunked(
     out.push_str(PREAMBLE);
     out.push('\n');
 
-    for (i, b) in analysis.blocks.iter().enumerate() {
-        emit_block(&mut out, b, view);
+    let mut done = 0usize;
+    for members in chain_groups(&analysis.blocks) {
+        if members.len() == 1 {
+            emit_block(&mut out, &analysis.blocks[members[0]], view, None);
+        } else {
+            emit_group(&mut out, &analysis.blocks, &members, view);
+        }
+        done += members.len();
         if out.len() >= max_bytes {
-            sink(&out, i + 1)?;
+            sink(&out, done)?;
             count += 1;
             out.clear();
             out.push_str(PREAMBLE);
