@@ -161,6 +161,20 @@ pub struct RdrvHle {
     /// window length (the last hook gap).
     win_pos: f64,
     win_len: f64,
+    /// Tick-cadence statistics: long-run MEAN of the hook gap (the tick
+    /// is frame-locked underneath; IRQ-latency jitter cancels in the
+    /// mean), with a 16-hook recent window that re-seeds it on a real
+    /// cadence change. Same scheme as the GAX audit's mix-rate fix —
+    /// an EMA's short memory turned hook jitter into per-tick pitch
+    /// wobble in the telemetry denominator.
+    cad_recent: [f64; 16],
+    cad_idx: u32,
+    cad_sum: f64,
+    cad_n: u32,
+    /// A mix hook has fired since (re-)engage: until then the
+    /// starvation watchdog must not run (a fresh engage has no cursor
+    /// baseline — disengaging on it flaps at probe cadence).
+    hook_seen: bool,
 }
 
 impl RdrvHle {
@@ -184,6 +198,11 @@ impl RdrvHle {
             steps_cursor: 0,
             win_pos: 0.0,
             win_len: f64::MAX,
+            cad_recent: [0.0; 16],
+            cad_idx: 0,
+            cad_sum: 0.0,
+            cad_n: 0,
+            hook_seen: false,
         }
     }
 
@@ -212,6 +231,10 @@ impl RdrvHle {
         if let Some(lay) = harvest(mem, blob) {
             self.lay = lay;
             self.engaged = true;
+            self.hook_seen = false;
+            if std::env::var_os("RECOMP_RDRV_TRACE").is_some() {
+                eprintln!("rdrv: re-engage hooks={}", self.hooks);
+            }
         }
     }
 
@@ -237,14 +260,38 @@ impl RdrvHle {
         }
         // Hook cadence is the tick rate; chunk count makes it the mix
         // rate (self-calibrating; the engine has a 4-row rate table).
+        // The cadence is kept as a long-run MEAN, not an EMA: the tick
+        // is frame-locked underneath, so hook-observation jitter
+        // (sequencer load ahead of the mix entry) cancels in the mean,
+        // while an EMA fed it straight into mix_step and the telemetry
+        // denominator as per-tick pitch wobble. A 16-hook recent
+        // window re-seeds the mean if the cadence genuinely moves.
         let chunk = self.lay.chunk_ptr_deref(mem).unwrap_or(224).clamp(64, 512) as f64;
         self.last_hook_cursor = audio_cursor;
+        self.hook_seen = true;
         if (256..=4096).contains(&gap) {
-            let step = gap as f64 / chunk;
-            self.mix_step = if self.hooks < 8 {
-                step
+            let g = gap as f64;
+            self.cad_recent[(self.cad_idx % 16) as usize] = g;
+            self.cad_idx += 1;
+            self.cad_sum += g;
+            self.cad_n += 1;
+            if self.cad_n > 4096 {
+                self.cad_sum *= 0.5;
+                self.cad_n /= 2;
+            }
+            if self.cad_idx >= 16 {
+                let recent = self.cad_recent.iter().sum::<f64>() / 16.0;
+                let mean = self.cad_sum / self.cad_n as f64;
+                if (recent / mean - 1.0).abs() > 0.05 {
+                    // Real cadence change: restart from the recent window.
+                    self.cad_sum = recent * 16.0;
+                    self.cad_n = 16;
+                }
+            }
+            self.mix_step = if self.cad_n >= 8 {
+                self.cad_sum / self.cad_n as f64 / chunk
             } else {
-                self.mix_step * 0.9 + step * 0.1
+                g / chunk
             };
         }
 
@@ -354,9 +401,22 @@ impl RdrvHle {
                         wraps += 1;
                     }
                     // Accept only a plausible forward advance (a
-                    // backward jump is a note restart).
+                    // backward jump is a note restart). The
+                    // denominator is the SMOOTHED tick length, not the
+                    // raw gap: the guest advanced dpos over a whole
+                    // number of frame-locked ticks, so the jitter in
+                    // when we observed the hooks must not leak into
+                    // the step (it was the per-tick pitch wobble).
+                    // round(gap / tick) keeps multi-tick spans
+                    // (missed hooks) honest.
                     if dpos > 0.0 && dpos < gap as f64 * 4.0 {
-                        v.grid_step = dpos / gap as f64;
+                        let denom = if self.cad_n >= 8 {
+                            let tick = self.cad_sum / self.cad_n as f64;
+                            (gap as f64 / tick).round().max(1.0) * tick
+                        } else {
+                            gap as f64
+                        };
+                        v.grid_step = dpos / denom;
                     }
                 }
             }
@@ -398,10 +458,27 @@ impl RdrvHle {
         }
 
         // Diagnostic (RECOMP_RDRV_TRACE): per-tick mixer snapshot.
-        if std::env::var_os("RECOMP_RDRV_TRACE").is_some() && self.hooks < 600 {
+        // Value "lo-hi" selects a hook range; any other value = first 600.
+        let trace_tick = match std::env::var("RECOMP_RDRV_TRACE") {
+            Ok(v) => {
+                if let Some((lo, hi)) = v.split_once('-') {
+                    let (lo, hi) = (
+                        lo.parse::<u64>().unwrap_or(0),
+                        hi.parse::<u64>().unwrap_or(u64::MAX),
+                    );
+                    (lo..=hi).contains(&self.hooks)
+                } else {
+                    self.hooks < 600
+                }
+            }
+            Err(_) => false,
+        };
+        if trace_tick {
             eprintln!(
-                "RDRV tick={} gap={gap} chunk={chunk} mix_step={:.4} gate_music={gate_music} fxvol={fxvol} tunevol={tunevol}",
-                self.hooks, self.mix_step
+                "RDRV tick={} cursor={} gap={gap} chunk={chunk} mix_step={:.4} gate_music={gate_music} fxvol={fxvol} tunevol={tunevol}",
+                self.hooks,
+                audio_cursor / crate::mem::AUDIO_SAMPLE_CYCLES,
+                self.mix_step
             );
             for v in self.pending[..n].iter() {
                 if !v.on {
@@ -410,14 +487,25 @@ impl RdrvHle {
                 let state = mem.u8(v.addr + V_STATE).unwrap_or(0);
                 let mode = mem.u8(v.addr + V_MODE).unwrap_or(0);
                 eprintln!(
-                    "  v@{:08x} st={state:02x} mode={mode} pos={:.1} end={:.1} loop={} gain={:.3} fx={}",
+                    "  v@{:08x} st={state:02x} mode={mode} pos={:.1} end={:.1} loop={} gain={:.3} fx={} cache_step={:.4} tel_step={:.5} instr={:08x}",
                     v.addr,
                     v.pos,
                     v.end,
                     v.loop_len,
                     v.gain,
-                    v.addr < self.lay.music_base
+                    v.addr < self.lay.music_base,
+                    v.step,
+                    v.grid_step,
+                    v.instr
                 );
+            }
+            for r in self.voices[..n].iter() {
+                if r.on {
+                    eprintln!(
+                        "  render v@{:08x} step={:.5} gain={:.3}->{:.3} pos={:.1}",
+                        r.addr, r.grid_step, r.gain, r.gain_target, r.pos
+                    );
+                }
             }
         }
     }
@@ -490,15 +578,41 @@ impl RdrvHle {
     /// scale (one full-scale FIFO DAC = 0.25). `canon` is the live FIFO
     /// DAC pair — this family feeds FIFO A only.
     pub fn render(&mut self, mem: &MemView, canon: [i8; 2], audio_cursor: u64) -> (f32, f32) {
-        // Starvation watchdog: ticks stopped (IWRAM rebuild, driver
-        // shutdown) — disengage and let the probe rescan.
-        if audio_cursor.saturating_sub(self.last_hook_cursor) / crate::mem::AUDIO_SAMPLE_CYCLES
-            > 3 * 1100
+        // Starvation watchdog: ticks stopped (song change, load
+        // screen, driver rebuild). "Layout valid" and "ticking" are
+        // separate states: stay ENGAGED so the stream stays contiguous
+        // (silence) — the old disengage flapped against the probe at
+        // sample cadence (re-engage had no cursor baseline, so the
+        // next render call disengaged again; every starvation became a
+        // long dropout with the tap dripping 1-of-16 samples). While
+        // starved, periodically re-locate the blob: a rebuild can move
+        // it, which moves the hook PCs; only a vanished blob (true
+        // shutdown) disengages back to the probe.
+        if self.hook_seen
+            && audio_cursor.saturating_sub(self.last_hook_cursor) / crate::mem::AUDIO_SAMPLE_CYCLES
+                > 3 * 1100
         {
-            self.engaged = false;
             self.count = 0;
             for v in self.voices.iter_mut() {
                 v.on = false;
+            }
+            self.engage_backoff = self.engage_backoff.wrapping_add(1);
+            if self.engage_backoff % 1024 == 0 {
+                match crate::engine::find(mem.iwram, &NOTE_ON_SIG, 0)
+                    .and_then(|off| harvest(mem, 0x0300_0000 + off as u32))
+                {
+                    Some(lay) => self.lay = lay,
+                    None => {
+                        if std::env::var_os("RECOMP_RDRV_TRACE").is_some() {
+                            eprintln!(
+                                "rdrv: blob gone at cursor={} hooks={} — disengage",
+                                audio_cursor / crate::mem::AUDIO_SAMPLE_CYCLES,
+                                self.hooks
+                            );
+                        }
+                        self.engaged = false;
+                    }
+                }
             }
             return (0.0, 0.0);
         }
@@ -519,14 +633,21 @@ impl RdrvHle {
         // Canon-domain check copy: the guest mixes on its own grid and
         // saturates the SUM to s8 — one stream-level ZOH at the guest
         // rate, clamped, against FIFO A (FIFO B stays silent on both
-        // sides of the comparison).
-        self.chk_acc -= 1.0;
-        if self.chk_acc <= 0.0 {
-            self.chk_hold = sum.clamp(-1.0, 127.0 / 128.0);
-            self.chk_acc += self.mix_step;
+        // sides of the comparison). Fed only while the render window
+        // is real (win_len finite): the tick right after an engage or
+        // a starvation resume renders silence with no snapshot behind
+        // it, and pairing that silence against live canon skews the
+        // level ratio (it mis-adopted auto-gain on a chain that is
+        // integer-exact).
+        if self.win_len != f64::MAX {
+            self.chk_acc -= 1.0;
+            if self.chk_acc <= 0.0 {
+                self.chk_hold = sum.clamp(-1.0, 127.0 / 128.0);
+                self.chk_acc += self.mix_step;
+            }
+            let canon_ab = (canon[0] as f32 / 128.0, canon[1] as f32 / 128.0);
+            let _ = self.vf.judge(canon_ab, (self.chk_hold, 0.0));
         }
-        let canon_ab = (canon[0] as f32 / 128.0, canon[1] as f32 / 128.0);
-        let _ = self.vf.judge(canon_ab, (self.chk_hold, 0.0));
         let m = sum * 0.25;
         (m, m)
     }

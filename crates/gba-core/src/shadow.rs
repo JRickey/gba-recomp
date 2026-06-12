@@ -173,6 +173,12 @@ pub struct Verifier {
     calibrated: bool,
     ratio_hist: [f32; 3],
     ratio_n: u32,
+    /// Some window already passed level IN-BAND at strong structure —
+    /// the stock scale is right, so an off-band stretch is content
+    /// (e.g. a canon-side source the shadow doesn't cover), NOT a
+    /// mixer-scale revision. A true scale revision is off-band in
+    /// every window; this flag locks auto-gain out for the rest.
+    saw_inband: bool,
     /// At least `prove_need` consecutive clean windows passed — the
     /// frontend substitutes only proven streams.
     pub proven: bool,
@@ -203,6 +209,7 @@ impl Verifier {
             calibrated: false,
             ratio_hist: [0.0; 3],
             ratio_n: 0,
+            saw_inband: false,
             proven: false,
             prove_need: 1,
             consec_pass: 0,
@@ -242,11 +249,19 @@ impl Verifier {
         };
         self.last_r = r;
         self.last_ratio = ratio;
+        if !self.calibrated && r >= 0.7 && (0.85..=1.15).contains(&ratio) {
+            self.saw_inband = true;
+        }
         // Probation auto-calibration: strong structure with a stable
         // off-band level means this driver revision scales its mixer
         // by a constant — measure it from the canon stream and adopt
-        // it instead of striking.
+        // it instead of striking. Never after an in-band window: a
+        // scale revision is off-band everywhere, so mixed in/off-band
+        // verdicts mean extra canon content, and adopting its level
+        // would play everything hot (it did, on a streamed backing
+        // layer the shadow doesn't cover).
         if !self.calibrated
+            && !self.saw_inband
             && r >= 0.7
             && !(0.85..=1.15).contains(&ratio)
             && (0.2..=5.0).contains(&ratio)
