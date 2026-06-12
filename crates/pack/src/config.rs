@@ -77,11 +77,26 @@ pub struct Runtime {
     /// Sound-engine HLE selection. `auto` = runtime discovery as in
     /// `play`; pinning skips discovery for a known title.
     pub engine_hle: EngineHle,
+    /// `false` = full recomp: the packaged binary ships with no
+    /// interpreter fallback — a dispatch miss halts loudly. The build
+    /// gates this on a zero-fallback soak.
+    #[serde(default = "default_true")]
+    pub interpreter: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl Default for Runtime {
     fn default() -> Self {
-        Runtime { menu: true, enhanced_audio: true, screen_sim: true, engine_hle: EngineHle::Auto }
+        Runtime {
+            menu: true,
+            enhanced_audio: true,
+            screen_sim: true,
+            engine_hle: EngineHle::Auto,
+            interpreter: true,
+        }
     }
 }
 

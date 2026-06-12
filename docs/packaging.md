@@ -49,6 +49,10 @@ menu = true                  # press-Escape in-game menu (see below)
 enhanced-audio = true        # per-channel sinc + soft-clip + engine-HLE shadow
 screen-sim = true            # panel simulation (crates/screen)
 engine-hle = "auto"          # auto | off | m4a | gax | rdrv  (pin = skip discovery)
+interpreter = true           # false = FULL RECOMP: no interpreter ships; a
+                             # dispatch miss halts loudly, and the build
+                             # refuses to package unless a soak run executed
+                             # zero interpreter-fallback steps
 
 [output]
 binary = true
@@ -97,10 +101,42 @@ ROM/BIOS flow is the packaged binary's equivalent.
   the image*; each recomp's own repository decides what it
   distributes — this repository never carries either.
 
+## Full recomp (`interpreter = false`)
+
+Interpreter fallback is bit-exact, so it is never a *correctness*
+risk — but a "full recomp" should mean what it says. With the flag
+off, three teeth engage:
+
+1. **Build gate**: `gba-pack build` soak-runs the translation
+   (default 3600 frames, `--soak` to change) and refuses to package
+   unless **zero** interpreter steps executed. If the first soak finds
+   gaps (typically computed jump-table targets, invisible to any
+   static map), it records them as labels, rebuilds once, and re-runs
+   the gate.
+2. **Runtime trap**: the packaged binary halts loudly on a dispatch
+   miss, printing the missing address as a label the packager can add
+   — never a silent fidelity downgrade.
+3. **No escape hatch**: `--interp` is rejected by full-recomp
+   packages.
+
+The honest caveat: a soak proves the *covered paths*, not all paths.
+A player reaching genuinely unvisited code (different route, save
+state) trips the trap. Packagers should soak with recorded input
+covering real play, and ship updates as labels grow. Exhaustive
+in-function seeding from a complete mapper boundary set (translate
+every address inside every mapped function) is the planned hard
+guarantee.
+
 ## Status
 
-`gba-pack` currently validates the whole description (config schema,
-SHA pins, input hashes, label presence) and prints the build plan.
-The build steps land in order: translate-with-labels (exists today as
-`recomp build` — needs a coverage report), runtime crate emission,
-menu module, per-platform link, C-source export with names.
+`gba-pack` validates (plan mode) and **builds** (`gba-pack build`):
+translate with labels → soak gate → assemble `<out>/<name>/` holding
+the runtime binary, `translation.dylib`, the `recomp.pack.toml`
+manifest (pins + runtime options, no image content), a README for the
+end user, and `src-c/` when `c-source = true`. The runtime binary is
+`recomp` itself: a manifest beside the executable switches it to
+packaged behavior (bare launch plays the pinned title; ROM resolved
+by content hash next to the exe, BIOS pin enforced, translation
+loaded from the package). Still to land: the menu module,
+cross-platform packaging (host-only today), engine-hle pin
+enforcement at runtime, label-named functions in the C export.

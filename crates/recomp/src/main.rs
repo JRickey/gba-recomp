@@ -10,6 +10,7 @@ use std::process::ExitCode;
 mod analyze;
 mod emit;
 mod labels;
+mod packfile;
 
 use armv4t::{decode_arm, decode_thumb, Op};
 use gba_core::{is_self_loop, Machine, StepEvent};
@@ -40,6 +41,9 @@ fn main() -> ExitCode {
         Some("runc") => cmd_runc(&args[1..]),
         Some("verify") => cmd_verify(&args[1..]),
         Some("labels") => cmd_labels(&args[1..]),
+        // A packaged binary (manifest beside the executable) plays its
+        // pinned title when launched bare — double-click behavior.
+        None if packfile::load().is_some() => cmd_play(&[]),
         _ => {
             print_help(None);
             return ExitCode::FAILURE;
@@ -57,11 +61,14 @@ fn main() -> ExitCode {
 /// `(name, synopsis, flag lines, description)` per command — the single
 /// source for both the overview listing and per-command help.
 const HELP: &[(&str, &str, &[&str], &str)] = &[
-    ("build", "recomp build <rom> [--ram] [--bios file]", &[
+    ("build", "recomp build <rom> [--ram] [--bios file] [--labels file]", &[
         "--ram    profile a short interpreter run first, translating the RAM-resident \
 code and computed-branch targets it discovers (recommended; play's cache builds use it)",
         "--bios FILE    experimental: recompile a real 16 KB BIOS image too (region 0) \
 and disable all BIOS HLE; output goes to out/<stem>-bios.dylib",
+        "--labels FILE    union an explicit label map (instead of relying on the \
+beside-the-image file); used by packaging so a symlinked or renamed image still finds \
+its map",
     ], "Translate a ROM image to a native shared library at out/<stem>.dylib. \
 Emits C11 in bounded chunks and compiles them with cc. Label files (<rom>.labels \
 or the recorder's accumulator) contribute extra entry-point seeds automatically."),
@@ -828,8 +835,36 @@ fn cmd_play(args: &[String]) -> Result<(), String> {
             other => return Err(format!("unexpected argument {other:?}")),
         }
     }
-    let rom_path = rom_path.ok_or("missing ROM path")?;
+    // Packaged mode: a manifest beside the executable pins this binary
+    // to one title. The ROM is resolved by content hash (the package
+    // ships none), the BIOS pin is enforced, and the translation loads
+    // from the package instead of the build cache.
+    let manifest = match packfile::load() {
+        Some(Ok(m)) => Some(m),
+        Some(Err(e)) => return Err(e),
+        None => None,
+    };
+    let rom_path = match (&rom_path, &manifest) {
+        (Some(p), _) => p.clone(),
+        (None, Some(m)) => {
+            let p = packfile::find_rom(m)?;
+            eprintln!("{}: playing {}", m.name, p.display());
+            p.to_string_lossy().into_owned()
+        }
+        (None, None) => return Err("missing ROM path".into()),
+    };
     let rom = std::fs::read(&rom_path).map_err(|e| format!("{rom_path}: {e}"))?;
+    if let Some(m) = &manifest {
+        let sha = rom_sha256(&rom);
+        if sha != m.rom_sha256 {
+            return Err(format!(
+                "this package plays exactly one cartridge image \
+(sha256 {}…); {rom_path} hashes to {}…",
+                &m.rom_sha256[..16],
+                &sha[..16]
+            ));
+        }
+    }
     let sav_path = format!("{}.sav", rom_path.trim_end_matches(".gba"));
 
     // Product boot path: real BIOS when an image is installed (explicit
@@ -862,18 +897,56 @@ fn cmd_play(args: &[String]) -> Result<(), String> {
     if let Some(b) = &bios {
         use sha2::{Digest, Sha256};
         let sha = Sha256::digest(b).iter().map(|x| format!("{x:02x}")).collect::<String>();
-        if sha != input_config::BIOS_SHA256 {
+        if let Some(m) = &manifest {
+            if sha != m.bios_sha256 {
+                return Err(format!(
+                    "this package requires the pinned BIOS (sha256 {}…); the installed \
+image hashes to {}…",
+                    &m.bios_sha256[..16],
+                    &sha[..16]
+                ));
+            }
+        } else if sha != input_config::BIOS_SHA256 {
             eprintln!("bios: image is not the canonical dump (sha256 {sha}) — trying it as-is");
         }
+    } else if let Some(m) = &manifest {
+        return Err(format!(
+            "this package requires a BIOS image (sha256 {}…) and none is installed.\n\
+Place your own dump as gba_bios.bin next to the executable:\n  {}",
+            &m.bios_sha256[..16],
+            m.dir.display()
+        ));
     }
 
-    // Native translation: load from the per-user cache, building it on
-    // first launch. The product bar is full speed at full accuracy — the
-    // interpreter fallback below is a defect surface, not a graceful
-    // mode: it exists so a translation failure stays loudly diagnosable
-    // instead of crashing, and the loop alarms if speed drops below
-    // realtime either way.
-    let native = if interp_only {
+    // Native translation. Packaged: the prebuilt library ships in the
+    // package — under interpreter=false (a *full recomp*) failing to
+    // load it is fatal, and so is any dispatch miss later. Developer
+    // path: per-user cache, built on first launch. The product bar is
+    // full speed at full accuracy — interpreter fallback is a defect
+    // surface, not a graceful mode: it exists so a translation failure
+    // stays loudly diagnosable instead of crashing, and the loop
+    // alarms if speed drops below realtime either way.
+    let native = if let Some(m) = &manifest {
+        if interp_only && !m.interpreter {
+            return Err("--interp is not available in a full-recomp package".into());
+        }
+        if !m.interpreter {
+            NO_INTERP.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        let lib_path = m.dir.join(&m.translation);
+        match load_native(&lib_path).map(|v| {
+            eprintln!("native translation: {} blocks (packaged)", v.1.len);
+            v
+        }) {
+            Ok(v) if !interp_only => Some(v),
+            Ok(_) => None,
+            Err(e) if !m.interpreter => return Err(e),
+            Err(e) => {
+                eprintln!("DEGRADED: packaged translation unavailable ({e}); interpreter only");
+                None
+            }
+        }
+    } else if interp_only {
         None
     } else {
         match ensure_native(&rom_path, &rom, status, bios.as_deref()) {
@@ -1405,7 +1478,7 @@ fn ensure_native(
         if status {
             status_line("building 0");
         }
-        build_dylib(rom_path, true, bios, lib_str, &mut |pct, msg| {
+        build_dylib(rom_path, true, bios, None, lib_str, &mut |pct, msg| {
             if status {
                 status_line(&format!("building {pct} {msg}"));
             } else {
@@ -1416,10 +1489,17 @@ fn ensure_native(
             eprintln!();
         }
     }
-    let lib = unsafe { libloading::Library::new(&lib_path) }
+    let v = load_native(&lib_path)?;
+    eprintln!("native translation: {} blocks", v.1.len);
+    Ok(v)
+}
+
+/// Load a translation library and its block table from an explicit
+/// path (the cache, an out/ artifact, or a package).
+fn load_native(lib_path: &Path) -> Result<(libloading::Library, BlockTable), String> {
+    let lib = unsafe { libloading::Library::new(lib_path) }
         .map_err(|e| format!("{}: {e}", lib_path.display()))?;
     let table = BlockTable::load(&lib)?;
-    eprintln!("native translation: {} blocks", table.len);
     Ok((lib, table))
 }
 
@@ -1864,11 +1944,15 @@ fn cmd_build(args: &[String]) -> Result<(), String> {
     let mut rom_path = None;
     let mut ram = false;
     let mut bios: Option<Vec<u8>> = None;
+    let mut explicit_labels: Option<String> = None;
     let mut it = args.iter();
     while let Some(arg) = it.next() {
         match arg.as_str() {
             "--ram" => ram = true,
             "--bios" => bios = Some(load_bios_file(it.next().ok_or("--bios needs a value")?)?),
+            "--labels" => {
+                explicit_labels = Some(it.next().ok_or("--labels needs a value")?.to_string())
+            }
             other if rom_path.is_none() => rom_path = Some(other.to_string()),
             other => return Err(format!("unexpected argument {other:?}")),
         }
@@ -1884,6 +1968,7 @@ fn cmd_build(args: &[String]) -> Result<(), String> {
         rom_path,
         ram,
         bios.as_deref(),
+        explicit_labels.as_deref(),
         &format!("out/{stem}{suffix}.dylib"),
         &mut term_progress,
     );
@@ -1901,6 +1986,7 @@ fn build_dylib(
     rom_path: &str,
     ram: bool,
     bios: Option<&[u8]>,
+    explicit_labels: Option<&str>,
     lib_path: &str,
     progress: &mut dyn FnMut(u8, &str),
 ) -> Result<(), String> {
@@ -2057,11 +2143,38 @@ fn build_dylib(
     let sha = rom_sha256(&rom);
     let mut seeds = seeds;
     let mut iwram = iwram;
-    let lbl = labels::load_all(rom_path, &sha, rom.len());
+    let lbl = labels::load_all_with(rom_path, &sha, rom.len(), explicit_labels);
     if !lbl.is_empty() {
         let mut set: std::collections::BTreeSet<u32> = seeds.iter().copied().collect();
         let before = set.len();
         set.extend(&lbl.rom);
+        // RECOMP_EXHAUSTIVE (full-recomp packaging): a soak proves the
+        // covered paths, not all paths — computed jump-table targets
+        // inside a function appear only when play reaches them. With
+        // complete boundaries (`end` records from a mapper-grade set),
+        // every decode point inside every mapped function becomes a
+        // seed, so any computed target the game can ever take has a
+        // native block. Pool words inside ranges translate to junk
+        // blocks nothing dispatches to — size, not correctness.
+        if std::env::var_os("RECOMP_EXHAUSTIVE").is_some() {
+            let mut dense = 0usize;
+            for (&key, &end) in &lbl.ends {
+                if !(0x08..=0x0D).contains(&(key >> 24)) {
+                    continue;
+                }
+                let step = if key & 1 != 0 { 2 } else { 4 };
+                let thumb = key & 1;
+                let mut a = key & !1;
+                while a + step <= end {
+                    set.insert(a | thumb);
+                    a += step;
+                }
+                dense += 1;
+            }
+            println!(
+                "labels: exhaustive in-function seeding over {dense} bounded functions"
+            );
+        }
         let rom_added = set.len() - before;
         let mut iw_added = 0usize;
         let mut iw_unbacked = 0usize;
@@ -2394,6 +2507,16 @@ fn run_frame_native(
                 fb_prev_end = u32::MAX;
             }
             None => {
+                if NO_INTERP.load(std::sync::atomic::Ordering::Relaxed) {
+                    eprintln!(
+                        "DEFECT: full recomp missing native code at {:08x} ({}) — this \
+code path is not covered by the package's translation. Report this address to the \
+packager (it becomes a label; the rebuilt package covers it).",
+                        key & !1,
+                        if key & 1 != 0 { "thumb" } else { "arm" },
+                    );
+                    std::process::exit(2);
+                }
                 // Diagnostic (RECOMP_TRACE_FALLBACK): census of fallback
                 // *entries* — the dispatch keys that would be labels.
                 // Straight-line continuation inside a fallback run is not
@@ -2476,6 +2599,13 @@ fn capture_iwram(iwram: &[u8], entry: u32) {
 /// Census collection runs under RECOMP_TRACE_FALLBACK (prints at exit)
 /// or --record-labels (persists entries as a label file).
 static FALLBACK_COLLECT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Full-recomp mode (packaged with `interpreter = false`): a dispatch
+/// miss halts loudly instead of interpreting. The package was gated on
+/// a zero-fallback soak at build time, so reaching this is a coverage
+/// defect the packager needs to hear about, never something to play
+/// through silently at degraded fidelity.
+static NO_INTERP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 fn trace_fallback() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();

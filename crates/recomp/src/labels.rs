@@ -428,11 +428,27 @@ pub fn config_toml_path(sha: &str) -> PathBuf {
 /// Load and union every label source for an image. Errors in one file
 /// (wrong sha, bad header) are reported and that file ignored.
 pub fn load_all(rom_path: &str, sha: &str, rom_len: usize) -> Labels {
+    load_all_with(rom_path, sha, rom_len, None)
+}
+
+/// Like [`load_all`], plus an explicit label file unioned first. The
+/// explicit path is how packaging passes a map deterministically —
+/// filename-adjacent discovery breaks when the image is a symlink or
+/// renamed, so a packaged build never relies on it.
+pub fn load_all_with(rom_path: &str, sha: &str, rom_len: usize, explicit: Option<&str>) -> Labels {
     let mut out = Labels::default();
     let stem = rom_path.trim_end_matches(".gba");
     let beside_toml = PathBuf::from(format!("{stem}.labels.toml"));
     let beside = PathBuf::from(format!("{stem}.labels"));
-    for p in [beside_toml, beside, config_path(sha), config_toml_path(sha)] {
+    let explicit = explicit.map(PathBuf::from);
+    let mut sources: Vec<PathBuf> = Vec::new();
+    if let Some(p) = explicit {
+        sources.push(p);
+    }
+    sources.extend([beside_toml, beside, config_path(sha), config_toml_path(sha)]);
+    // Same file reachable two ways (explicit == beside) loads once.
+    sources.dedup_by(|a, b| a.canonicalize().ok() == b.canonicalize().ok() && a.exists());
+    for p in sources {
         if !p.is_file() {
             continue;
         }
