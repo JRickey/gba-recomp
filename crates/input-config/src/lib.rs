@@ -415,6 +415,10 @@ pub struct AvConfig {
     pub grid: String,
     /// Output colorspace: auto | srgb | display-p3.
     pub display_gamut: String,
+    /// Presentation vsync. Off (default) presents immediately
+    /// (AutoNoVsync); on trades possible tearing for compositor pacing.
+    /// Emulation speed is owned by the audio clock either way.
+    pub video_vsync: bool,
 }
 
 impl Default for AvConfig {
@@ -427,6 +431,7 @@ impl Default for AvConfig {
             response_keep: "auto".into(),
             grid: "auto".into(),
             display_gamut: "auto".into(),
+            video_vsync: false,
         }
     }
 }
@@ -448,6 +453,7 @@ impl AvConfig {
                 "video.response_keep" => cfg.response_keep = v.to_ascii_lowercase(),
                 "video.grid" => cfg.grid = v.to_ascii_lowercase(),
                 "video.gamut" => cfg.display_gamut = v.to_ascii_lowercase(),
+                "video.vsync" => cfg.video_vsync = v.eq_ignore_ascii_case("true"),
                 _ => {}
             }
         }
@@ -463,7 +469,8 @@ impl AvConfig {
              video.response = {}\n\
              video.response_keep = {}\n\
              video.grid = {}\n\
-             video.gamut = {}\n",
+             video.gamut = {}\n\
+             video.vsync = {}\n",
             self.audio_enhanced,
             self.screen,
             self.screen_darken,
@@ -471,6 +478,7 @@ impl AvConfig {
             self.response_keep,
             self.grid,
             self.display_gamut,
+            self.video_vsync,
         )
     }
 

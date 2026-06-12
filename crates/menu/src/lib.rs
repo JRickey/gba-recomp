@@ -67,6 +67,8 @@ pub enum Changed {
     /// The output gamut — may need the GPU presenter recreated; the loop
     /// decides whether to apply now or on next launch.
     Gamut,
+    /// `video_vsync` flipped; the loop retunes the presenter in place.
+    Vsync,
 }
 
 /// The rows of the menu, in display order. Action rows (`Resume`,
@@ -81,11 +83,12 @@ enum Row {
     Response,
     Grid,
     Gamut,
+    Vsync,
     Quit,
 }
 
 impl Row {
-    const ALL: [Row; 8] = [
+    const ALL: [Row; 9] = [
         Row::Resume,
         Row::Audio,
         Row::Screen,
@@ -93,6 +96,7 @@ impl Row {
         Row::Response,
         Row::Grid,
         Row::Gamut,
+        Row::Vsync,
         Row::Quit,
     ];
 
@@ -105,6 +109,7 @@ impl Row {
             Row::Response => "Response",
             Row::Grid => "Grid",
             Row::Gamut => "Gamut",
+            Row::Vsync => "Vsync",
             Row::Quit => "Quit (saves)",
         }
     }
@@ -306,6 +311,7 @@ fn value_of(row: Row, av: &AvConfig) -> Option<String> {
         Row::Response => response_mode(av).name().to_uppercase(),
         Row::Grid => av.grid.to_uppercase(),
         Row::Gamut => display_target(av).name().to_uppercase(),
+        Row::Vsync => if av.video_vsync { "ON" } else { "OFF" }.to_string(),
     })
 }
 
@@ -343,6 +349,10 @@ fn cycle(row: Row, av: &mut AvConfig, forward: bool) -> Option<Changed> {
             let next = step_enum(&DisplayTarget::ALL, cur, forward);
             av.display_gamut = next.name().to_string();
             Some(Changed::Gamut)
+        }
+        Row::Vsync => {
+            av.video_vsync = !av.video_vsync;
+            Some(Changed::Vsync)
         }
     }
 }

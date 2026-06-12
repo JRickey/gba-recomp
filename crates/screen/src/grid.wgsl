@@ -26,7 +26,7 @@ struct Params {
     stripe_d: f32,       // stripe aperture half-width, subpixel units
     row_d: f32,          // row aperture half-width, pixel units
     bgr: f32,            // 1.0 = blue stripe leftmost (panel order)
-    _pad: f32,
+    srgb_surface: f32,   // 1.0 = surface view re-encodes sRGB; pre-decode output
 }
 
 @group(0) @binding(0) var src: texture_2d<f32>;
@@ -152,22 +152,38 @@ fn grid_sample(p: vec2f, du: vec2f) -> vec3f {
     return pow(max(acc * P.tint, vec3f(0.0)), vec3f(1.0 / P.gamma));
 }
 
+// Piecewise sRGB EOTF (decode): inverse of the encode an sRGB surface view
+// applies on write. Our pipeline's output is already display-encoded bytes;
+// when the only available surface format is *Srgb the hardware would encode
+// them AGAIN, so we pre-decode the final color and the re-encode lands the
+// intended bytes. Exact piecewise curve, not pow(2.2).
+fn srgb_eotf(c: vec3f) -> vec3f {
+    let lo = c / 12.92;
+    let hi = pow((c + vec3f(0.055)) / 1.055, vec3f(2.4));
+    return select(hi, lo, c <= vec3f(0.04045));
+}
+
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4f {
     let q = in.pos.xy - P.dst_origin;
-    if (q.x < 0.0 || q.y < 0.0 || q.x >= P.dst_size.x || q.y >= P.dst_size.y) {
-        return vec4f(0.0, 0.0, 0.0, 1.0);
-    }
-    let scale = P.dst_size / P.src_size;
-    let p = q / scale;          // source-space position, pixel units
-    let du = 1.0 / scale;       // source pixels per output pixel
+    var rgb = vec3f(0.0); // letterbox black (fixed point of the EOTF)
+    if (q.x >= 0.0 && q.y >= 0.0 && q.x < P.dst_size.x && q.y < P.dst_size.y) {
+        let scale = P.dst_size / P.src_size;
+        let p = q / scale;          // source-space position, pixel units
+        let du = 1.0 / scale;       // source pixels per output pixel
 
-    let flat = flat_sample(p, du);
-    // The grid needs headroom to resolve: below ~2x it is sub-Nyquist
-    // physically and we fade it out rather than render a wrong residue.
-    let strength = P.grid_strength * smoothstep(1.5, 2.5, min(scale.x, scale.y));
-    if (strength <= 0.0) {
-        return vec4f(flat, 1.0);
+        let flat = flat_sample(p, du);
+        // The grid needs headroom to resolve: below ~2x it is sub-Nyquist
+        // physically and we fade it out rather than render a wrong residue.
+        let strength = P.grid_strength * smoothstep(1.5, 2.5, min(scale.x, scale.y));
+        if (strength <= 0.0) {
+            rgb = flat;
+        } else {
+            rgb = mix(flat, grid_sample(p, du), strength);
+        }
     }
-    return vec4f(mix(flat, grid_sample(p, du), strength), 1.0);
+    if (P.srgb_surface > 0.5) {
+        rgb = srgb_eotf(clamp(rgb, vec3f(0.0), vec3f(1.0)));
+    }
+    return vec4f(rgb, 1.0);
 }

@@ -31,6 +31,10 @@ pub struct Manifest {
     pub menu: bool,
     /// Translation library file name, relative to the manifest.
     pub translation: String,
+    /// Engine-HLE pin from packaging: `None` = auto-detect, `"off"` =
+    /// never arm, or an engine name (`m4a`/`gax`/`rdrv`) the packager
+    /// verified — detection of other engines is skipped at runtime.
+    pub engine_hle: Option<String>,
     /// The directory the manifest was loaded from.
     pub dir: PathBuf,
 }
@@ -90,6 +94,12 @@ fn parse(path: &Path, dir: PathBuf) -> Result<Manifest, String> {
             .and_then(toml::Value::as_bool)
             .unwrap_or(true),
         translation: s(["translation", "file"])?,
+        engine_hle: doc
+            .get("runtime")
+            .and_then(|t| t.get("engine-hle"))
+            .and_then(toml::Value::as_str)
+            .filter(|v| !v.eq_ignore_ascii_case("auto"))
+            .map(str::to_lowercase),
         dir,
     })
 }

@@ -2,13 +2,21 @@
 //! implementing raw-window-handle 0.6) and draws the post-LUT frame through
 //! the band-limited grid/scaling pass.
 //!
-//! Pacing: PresentMode::AutoNoVsync — emulation speed is owned by the
-//! audio clock, never the display. A 60/120/144 Hz panel, ProMotion, or a
-//! throttling compositor must not change game speed; the presenter just
-//! shows the latest frame whenever it's asked to.
+//! Pacing: emulation speed is owned by the audio clock, never the display.
+//! A 60/120/144 Hz panel, ProMotion/G-Sync/FreeSync, or a throttling
+//! compositor must not change game speed; the presenter just shows the
+//! latest frame whenever it's asked to. Vsync is therefore a pure
+//! PRESENTATION choice (tear-free vs lowest latency): off =
+//! PresentMode::AutoNoVsync, on = PresentMode::AutoVsync, switchable live
+//! via [`Presenter::set_vsync`] — neither setting ever paces the emulator.
 //!
-//! Color: the surface is 8-bit UNORM and receives display-encoded bytes
-//! (the LUT already encoded for the chosen target). On macOS we tag the
+//! Color: the surface preferentially is 8-bit UNORM and receives
+//! display-encoded bytes (the LUT already encoded for the chosen target).
+//! Some GL/Vulkan/compositor combinations only expose *Srgb surface
+//! formats; on those the surface view re-encodes whatever we write, so the
+//! shader pre-applies the inverse (the exact piecewise sRGB EOTF) to its
+//! final color — the hardware re-encode then reproduces the intended
+//! bytes (flag in the params buffer, slot 13). On macOS we tag the
 //! underlying layer with the matching colorspace so the compositor
 //! color-matches our output to the actual panel — that is what makes the
 //! simulation hold on wide-gamut (P3) laptop screens without us measuring
@@ -60,6 +68,10 @@ pub struct Presenter {
     texture: wgpu::Texture,
     uniforms: wgpu::Buffer,
     config: wgpu::SurfaceConfiguration,
+    /// True when the surface format is an sRGB view (only *Srgb formats
+    /// were available): the shader must pre-decode its display-encoded
+    /// output so the hardware re-encode is an identity overall.
+    srgb_surface: bool,
     src_size: (u32, u32),
     /// macOS: the view's backing scale factor (physical px per logical px).
     scale_factor: f64,
@@ -70,6 +82,10 @@ pub struct Presenter {
 impl Presenter {
     /// Create a presenter on `window`'s surface.
     ///
+    /// `vsync` selects the present mode only (false = AutoNoVsync, true =
+    /// AutoVsync): presentation pacing, never emulation pacing — game
+    /// speed is owned by the audio clock (see module docs).
+    ///
     /// Safety contract (checked by scope, not the type system): `window`
     /// must outlive the returned Presenter — the caller keeps the window
     /// alive for the whole play session and drops the presenter first.
@@ -78,6 +94,7 @@ impl Presenter {
         src_w: u32,
         src_h: u32,
         target: DisplayTarget,
+        vsync: bool,
     ) -> Result<Presenter, String> {
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
         let surface = unsafe {
@@ -100,23 +117,43 @@ impl Presenter {
         .map_err(|e| format!("graphics device: {e}"))?;
 
         let caps = surface.get_capabilities(&adapter);
-        // Display-encoded bytes in, display-encoded bytes out: a UNORM
-        // (non-sRGB-view) format so nothing re-encodes behind our back.
+        // Display-encoded bytes in, display-encoded bytes out: prefer a
+        // UNORM (non-sRGB-view) format so nothing re-encodes behind our
+        // back. Some GL/Vulkan/compositor combos only expose *Srgb
+        // formats — accept those and have the shader pre-decode its final
+        // color (piecewise sRGB EOTF) so the hardware re-encode reproduces
+        // the intended bytes.
         let format = [
             wgpu::TextureFormat::Bgra8Unorm,
             wgpu::TextureFormat::Rgba8Unorm,
+            wgpu::TextureFormat::Bgra8UnormSrgb,
+            wgpu::TextureFormat::Rgba8UnormSrgb,
         ]
         .into_iter()
         .find(|f| caps.formats.contains(f))
-        .ok_or_else(|| format!("no 8-bit UNORM surface format in {:?}", caps.formats))?;
+        .ok_or_else(|| format!("no 8-bit surface format in {:?}", caps.formats))?;
+        let srgb_surface = format.is_srgb();
+        // Opaque when supported (we always write alpha 1 and want no
+        // compositor blending); otherwise whatever the platform prefers.
+        let alpha_mode = if caps.alpha_modes.contains(&wgpu::CompositeAlphaMode::Opaque) {
+            wgpu::CompositeAlphaMode::Opaque
+        } else {
+            caps.alpha_modes[0]
+        };
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format,
-            width: src_w * 3,
-            height: src_h * 3,
-            present_mode: wgpu::PresentMode::AutoNoVsync,
+            // Guard against a zero-sized (e.g. minimized) start; present()
+            // resizes to the real window size on the first frame.
+            width: (src_w * 3).max(1),
+            height: (src_h * 3).max(1),
+            present_mode: if vsync {
+                wgpu::PresentMode::AutoVsync
+            } else {
+                wgpu::PresentMode::AutoNoVsync
+            },
             desired_maximum_frame_latency: 1,
-            alpha_mode: caps.alpha_modes[0],
+            alpha_mode,
             view_formats: vec![],
         };
 
@@ -227,6 +264,7 @@ impl Presenter {
             texture,
             uniforms,
             config,
+            srgb_surface,
             src_size: (src_w, src_h),
             scale_factor: 1.0,
             #[cfg(target_os = "macos")]
@@ -240,6 +278,24 @@ impl Presenter {
         }
         let _ = target; // consumed on macOS; assumption elsewhere
         Ok(p)
+    }
+
+    /// Switch presentation mode live (false = AutoNoVsync, true =
+    /// AutoVsync). Pacing principle: emulation speed is owned by the audio
+    /// clock; vsync only affects presentation (tearing vs latency), never
+    /// game speed — see the module header.
+    pub fn set_vsync(&mut self, on: bool) {
+        let mode = if on {
+            wgpu::PresentMode::AutoVsync
+        } else {
+            wgpu::PresentMode::AutoNoVsync
+        };
+        if self.config.present_mode != mode {
+            self.config.present_mode = mode;
+            self.config.width = self.config.width.max(1);
+            self.config.height = self.config.height.max(1);
+            self.surface.configure(&self.device, &self.config);
+        }
     }
 
     /// Physical-pixel surface size for a window reporting `logical` size.
@@ -304,7 +360,7 @@ impl Presenter {
             grid.stripe_halfwidth,
             grid.row_halfwidth,
             if grid.bgr { 1.0 } else { 0.0 },
-            0.0,
+            if self.srgb_surface { 1.0 } else { 0.0 },
             0.0,
             0.0,
         ];
@@ -313,7 +369,16 @@ impl Presenter {
 
         let frame = match self.surface.get_current_texture() {
             Ok(f) => f,
-            Err(wgpu::SurfaceError::Outdated | wgpu::SurfaceError::Lost) => {
+            // Outdated/Lost: the surface needs reconfiguring (resize, mode
+            // change, GL context dance). OutOfMemory: some drivers report
+            // it transiently for swapchain churn — reconfigure ONCE and
+            // retry; if it fails again the Err propagates and the caller
+            // falls back to CPU blit loudly.
+            Err(
+                wgpu::SurfaceError::Outdated
+                | wgpu::SurfaceError::Lost
+                | wgpu::SurfaceError::OutOfMemory,
+            ) => {
                 self.surface.configure(&self.device, &self.config);
                 self.surface
                     .get_current_texture()
@@ -382,6 +447,8 @@ mod tests {
         // struct is 3 vec2f + 8 scalars = 14 floats / 56 bytes, and field
         // ORDER is what the Rust array encodes — this guards the count so a
         // drifted struct fails loudly instead of misreading params.
+        // Slot 13 (the 8th scalar, last field) is srgb_surface: the
+        // sRGB-format-surface compensation flag set by Presenter.
         let wgsl = include_str!("grid.wgsl");
         let fields = wgsl
             .split("struct Params {")
@@ -394,6 +461,21 @@ mod tests {
         let scalars = fields.matches("f32").count();
         assert_eq!(vec2s, 3, "Params vec2 count drifted");
         assert_eq!(vec2s * 2 + scalars, 14, "Params float count drifted");
+        // The flag must be the LAST declared field (Rust array slot 13).
+        let last_field = fields
+            .lines()
+            .filter_map(|l| {
+                let l = l.trim();
+                l.split_once(':')
+                    .filter(|(name, _)| !name.contains("//"))
+                    .map(|(name, _)| name.trim())
+            })
+            .last();
+        assert_eq!(
+            last_field,
+            Some("srgb_surface"),
+            "srgb_surface must occupy params slot 13"
+        );
     }
 }
 

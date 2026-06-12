@@ -82,7 +82,7 @@ compile time and rejected.
 
 | Command | Purpose |
 |---|---|
-| `recomp build <rom> [--ram] [--bios file]` | Translate to a native shared library in `out/`. `--ram` adds a short profiling run that discovers RAM-resident code and computed-branch targets, then bakes them in (recommended; this is what `play` uses). `--bios` also recompiles a real 16 KB BIOS image (region 0, no BIOS HLE) into `out/<stem>-bios.dylib`. |
+| `recomp build <rom> [--ram] [--bios file]` | Translate to a native shared library in `out/`. `--ram` adds a short profiling run that discovers RAM-resident code and computed-branch targets, then bakes them in (recommended; this is what `play` uses). `--bios` also recompiles a real 16 KB BIOS image (region 0, no BIOS HLE) into `out/<stem>-bios.<dylib|so|dll>`. |
 | `recomp play <rom> [--interp] [--stats] [--status] [--bios file] [--no-bios]` | Windowed play. Boots the real BIOS when an image is installed (see below), BIOS HLE otherwise. First launch auto-translates into the cache (one-time, progress printed); `--interp` forces the interpreter; `--stats` prints perf readouts; `--status` emits machine-readable lifecycle lines (used by the launcher). |
 | `recomp runc <rom> [--frames N] [--out img.ppm] [--bios file]` | Headless run of the recompiled output from `out/`. |
 | `recomp verify <rom> [--frames N] [--reuse] [--dump prefix] [--bios file]` | Differential check: interpreter vs recompiled frame hash; prints `MATCH`/`MISMATCH`. `--reuse` skips the rebuild, `--dump` writes both final frames, `--bios` verifies under a real recompiled BIOS on both sides. |
@@ -96,7 +96,7 @@ View dumped frames with any PPM-aware tool; on macOS:
 `sips -s format png out/x.ppm --out out/x.png`.
 
 **Translation cache.** `play` keeps per-title translations under
-`<cache_dir>/gba-recomp/t<REV>/<sha256>.dylib` (e.g.
+`<cache_dir>/gba-recomp/t<REV>/<sha256>.<dylib|so|dll>` (e.g.
 `~/Library/Caches/gba-recomp` on macOS, `~/.cache/gba-recomp` on Linux),
 keyed by the ROM's SHA-256. Bumping `TRANSLATION_REV` (any emitter or ABI
 change) invalidates and sweeps old revisions automatically; deleting the
@@ -195,9 +195,9 @@ sudo apt install build-essential pkg-config libasound2-dev \
   simulation falls back gracefully
 - File dialogs use the XDG desktop portal (no GTK dependency)
 
-Note: cached translations keep the `.dylib` file name on all platforms;
-on Linux they are ordinary ELF shared objects — the extension is
-cosmetic.
+Note: translations are named for the host platform — `.dylib` on
+macOS, `.so` on Linux, `.dll` on Windows — and are produced by the
+system `cc -shared` either way.
 
 ### Windows
 

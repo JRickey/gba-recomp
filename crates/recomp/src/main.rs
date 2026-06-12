@@ -17,8 +17,25 @@ use gba_core::{is_self_loop, Machine, StepEvent};
 
 const ROM_BASE: u32 = 0x0800_0000;
 
+/// Native shared-library extension on the host platform. The translation
+/// pipeline links with the system `cc -shared`, which produces a PE DLL
+/// on Windows, an ELF .so on Linux, and a Mach-O dylib on macOS — name
+/// the artifact accordingly so loaders and humans agree on what it is.
+const LIB_EXT: &str = if cfg!(windows) {
+    "dll"
+} else if cfg!(target_os = "macos") {
+    "dylib"
+} else {
+    "so"
+};
+
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // Version probe (the launcher uses this as a stale-binary handshake).
+    if args.first().map(String::as_str) == Some("--version") {
+        println!("recomp {}", env!("CARGO_PKG_VERSION"));
+        return ExitCode::SUCCESS;
+    }
     // `recomp help [cmd]`, `recomp <cmd> --help`, and bare `--help`/`-h`
     // all land in help; the first non-help token names the topic.
     if args.iter().any(|a| a == "--help" || a == "-h")
@@ -67,11 +84,11 @@ const HELP: &[(&str, &str, &[&str], &str)] = &[
         "--ram    profile a short interpreter run first, translating the RAM-resident \
 code and computed-branch targets it discovers (recommended; play's cache builds use it)",
         "--bios FILE    experimental: recompile a real 16 KB BIOS image too (region 0) \
-and disable all BIOS HLE; output goes to out/<stem>-bios.dylib",
+and disable all BIOS HLE; output goes to out/<stem>-bios.<dylib|so|dll>",
         "--labels FILE    union an explicit label map (instead of relying on the \
 beside-the-image file); used by packaging so a symlinked or renamed image still finds \
 its map",
-    ], "Translate a ROM image to a native shared library at out/<stem>.dylib. \
+    ], "Translate a ROM image to a native shared library at out/<stem>.<dylib|so|dll> (host platform). \
 Emits C11 in bounded chunks and compiles them with cc. Label files (<rom>.labels \
 or the recorder's accumulator) contribute extra entry-point seeds automatically."),
     ("play", "recomp play <rom> [--interp] [--stats] [--status] [--record-labels] [--bios file] [--no-bios]", &[
@@ -92,12 +109,12 @@ input.cfg/av.cfg from the shared config directory."),
         "--out PATH         write the final frame as a PPM",
         "--input FILE       replay a recorded input script (see play's RECOMP_RECORD_INPUT)",
         "--record-labels    record fallback entry points as labels (headless soak runs)",
-        "--bios FILE     run a real-BIOS build (loads out/<stem>-bios.dylib; no BIOS HLE)",
-    ], "Run the recompiled output from out/<stem>.dylib headless (build first); \
+        "--bios FILE     run a real-BIOS build (loads out/<stem>-bios.<dylib|so|dll>; no BIOS HLE)",
+    ], "Run the recompiled output from out/<stem>.<dylib|so|dll> headless (build first); \
 prints frame hash and native/fallback counts."),
     ("verify", "recomp verify <rom> [--frames N] [--reuse] [--dump prefix] [--input file] [--bios file]", &[
         "--frames N       frames to compare (default 600)",
-        "--reuse          skip the rebuild if out/<stem>.dylib exists",
+        "--reuse          skip the rebuild if the out/<stem> library exists",
         "--dump PREFIX    write both final frames as PREFIX.interp.ppm / PREFIX.recomp.ppm",
         "--input FILE     replay a recorded input script on both sides (instead of demo taps)",
         "--bios FILE      verify with a real recompiled BIOS on both sides (no BIOS HLE)",
@@ -232,6 +249,29 @@ fn make_machine(rom: Vec<u8>, bios: Option<&[u8]>) -> Machine {
         Some(b) => Machine::new_with_bios(rom, b),
         None => Machine::new(rom),
     }
+}
+
+/// Sanity-check a cartridge image before booting it, so a stray file
+/// fails with a clear message instead of a cryptic crash downstream.
+fn validate_rom(path: &str, rom: &[u8]) -> Result<(), String> {
+    if rom.len() < 0xC0 {
+        return Err(format!(
+            "{path}: not a GBA cartridge image ({} bytes is smaller than the cartridge header)",
+            rom.len()
+        ));
+    }
+    if rom.len() > 32 << 20 {
+        return Err(format!(
+            "{path}: not a GBA cartridge image ({} MB exceeds the 32 MB cartridge space)",
+            rom.len() >> 20
+        ));
+    }
+    // Every cartridge or multiboot image begins with an ARM branch to its
+    // entry point; an odd dump is worth a warning but not a refusal.
+    if rom[3] != 0xEA {
+        eprintln!("{path}: entry point is not an ARM branch — this may not be a GBA image");
+    }
+    Ok(())
 }
 
 fn parse_hex(s: &str) -> Result<u32, String> {
@@ -468,7 +508,7 @@ fn cmd_frames(args: &[String]) -> Result<(), String> {
     let mp2k_on = std::env::var_os("RECOMP_MP2K").is_some();
     if mp2k_on {
         m.bus.tap_channels = true;
-        eprintln!("hle: {}", arm_audio_hle(&mut m));
+        eprintln!("hle: {}", arm_audio_hle(&mut m, None));
     }
     // Diagnostic (RECOMP_COST_FROM=N): from frame N on, attribute charged
     // cycles to the PC that incurred them; dump the histogram at exit.
@@ -754,7 +794,49 @@ fn cmd_mp2k_scan(args: &[String]) -> Result<(), String> {
 
 /// Arm the appropriate engine HLE shadow for this image (enhanced
 /// path). Returns a description line for diagnostics.
-fn arm_audio_hle(m: &mut Machine) -> String {
+///
+/// `pin` is the packaged [runtime] engine-hle value: a packager that
+/// verified one engine pins it so runtime skips classifying the rest
+/// (and "off" never arms a shadow at all).
+fn arm_audio_hle(m: &mut Machine, pin: Option<&str>) -> String {
+    match pin {
+        Some("off") => return "engine HLE pinned off by package".into(),
+        Some("m4a") => {
+            let sigs = gba_core::mp2k::detect(&m.bus.rom);
+            if sigs.is_empty() {
+                return "DEGRADED: package pins engine-hle = m4a but no driver signature found \
+                        — per-channel enhancement active"
+                    .into();
+            }
+            m.bus.mp2k = Some(Box::new(gba_core::mp2k::Mp2kHle::new(&sigs)));
+            return "M4A/MP2K — HLE shadow armed (pinned by package)".into();
+        }
+        Some("gax") => {
+            // v1 detects statically; the banner-era shadow self-validates
+            // against the 'GAX3' work-block magic at runtime, so arming it
+            // blind under a pin is safe — it simply never engages on a
+            // mismatch.
+            if let Some(sig) = gba_core::gax::detect_v1(&m.bus.rom) {
+                m.bus.gax = Some(Box::new(gba_core::gax::GaxHle::new(sig)));
+            } else {
+                m.bus.gax = Some(Box::new(gba_core::gax::GaxHle::new_v3()));
+            }
+            return "GAX — HLE shadow armed (pinned by package)".into();
+        }
+        Some("rdrv") => {
+            if let Some(sig) = gba_core::rdrv::detect(&m.bus.rom) {
+                m.bus.rdrv = Some(Box::new(gba_core::rdrv::RdrvHle::new(sig)));
+                return "in-house (R) — HLE shadow armed (pinned by package)".into();
+            }
+            return "DEGRADED: package pins engine-hle = rdrv but no driver found — \
+                    per-channel enhancement active"
+                .into();
+        }
+        Some(other) => {
+            eprintln!("DEGRADED: unknown engine-hle pin {other:?} — auto-detecting");
+        }
+        None => {}
+    }
     match gba_core::engine::classify(&m.bus.rom) {
         gba_core::engine::Engine::M4a(sigs) => {
             let desc = format!(
@@ -902,6 +984,7 @@ fn cmd_play(args: &[String]) -> Result<(), String> {
         (None, None) => return Err("missing ROM path".into()),
     };
     let rom = std::fs::read(&rom_path).map_err(|e| format!("{rom_path}: {e}"))?;
+    validate_rom(&rom_path, &rom)?;
     if let Some(m) = &manifest {
         let sha = rom_sha256(&rom);
         if sha != m.rom_sha256 {
@@ -1052,6 +1135,9 @@ Place your own dump as gba_bios.bin next to the executable:\n  {}",
     // Pacing is audio-clock driven (below), not display driven: a 120 Hz
     // or throttled window must not change game speed.
     window.set_target_fps(0);
+    // The pointer is never a game control: hide it over the play surface.
+    // It reappears whenever the pause menu is up (below).
+    window.set_cursor_visibility(false);
     if status {
         status_line("playing");
     }
@@ -1072,11 +1158,14 @@ Place your own dump as gba_bios.bin next to the executable:\n  {}",
     // It engages on the first live driver tick and reverts loudly if its
     // output stops matching the canon FIFO stream; the shadow is
     // read-only, so arming it always is free of correctness risk.
-    let desc = arm_audio_hle(&mut m);
+    let desc = arm_audio_hle(
+        &mut m,
+        manifest.as_ref().and_then(|m| m.engine_hle.as_deref()),
+    );
     eprintln!("audio engine: {desc}");
     let streams = std::sync::Arc::new(std::sync::Mutex::new(AudioStreams::default()));
     streams.lock().unwrap().enhanced_on = av.audio_enhanced;
-    let _stream = start_audio(streams.clone());
+    let mut stream = start_audio(streams.clone());
 
     // Bindings come from the launcher-managed config (defaults match the
     // historical hardcoded map). Keyboard always works; a configured
@@ -1150,13 +1239,14 @@ Place your own dump as gba_bios.bin next to the executable:\n  {}",
     );
     // GPU presenter on this window; if unavailable, the minifb CPU blit
     // below still carries the full color + response simulation (no grid).
-    let mut presenter = match screen::present::Presenter::new(&window, 240, 160, display_target) {
-        Ok(p) => Some(p),
-        Err(e) => {
-            eprintln!("video: GPU presenter unavailable ({e}); basic scaling active");
-            None
-        }
-    };
+    let mut presenter =
+        match screen::present::Presenter::new(&window, 240, 160, display_target, av.video_vsync) {
+            Ok(p) => Some(p),
+            Err(e) => {
+                eprintln!("video: GPU presenter unavailable ({e}); basic scaling active");
+                None
+            }
+        };
 
     let mut buf = vec![0u32; 240 * 160];
     let mut rgba = vec![[0u8; 4]; 240 * 160];
@@ -1196,6 +1286,15 @@ Place your own dump as gba_bios.bin next to the executable:\n  {}",
     // held key yields one event per press): Escape, the four directions,
     // and confirm — plus the gamepad equivalents.
     let mut nav_prev = NavEdges::default();
+    // Device watchdog state: the callback bumps `consumed`; if it stops
+    // (device unplugged, default route died) or the error callback fired,
+    // the loop drops the stream, falls back to wall-clock pacing loudly,
+    // and retries the device every few seconds — production must never
+    // silently freeze against a full ring nobody is draining.
+    let mut audio_watch = std::time::Instant::now();
+    let mut audio_consumed_last = 0u64;
+    let mut audio_stalls = 0u8;
+    let mut audio_retry: Option<std::time::Instant> = None;
     while window.is_open() {
         // KEYINPUT is active-low.
         let mut keys = 0x3FFu16;
@@ -1303,6 +1402,7 @@ Place your own dump as gba_bios.bin next to the executable:\n  {}",
                 break;
             }
             paused = !paused;
+            window.set_cursor_visibility(paused);
             if paused {
                 menu.reset();
             }
@@ -1347,6 +1447,13 @@ Place your own dump as gba_bios.bin next to the executable:\n  {}",
                         menu::MenuAction::Resume => paused = false,
                         menu::MenuAction::Quit => quit = true,
                         menu::MenuAction::Changed(what) => {
+                            // Vsync is the presenter's own knob; everything
+                            // else routes through apply_av_change.
+                            if what == menu::Changed::Vsync {
+                                if let Some(p) = presenter.as_mut() {
+                                    p.set_vsync(av.video_vsync);
+                                }
+                            }
                             apply_av_change(
                                 what,
                                 &av,
@@ -1373,6 +1480,7 @@ Place your own dump as gba_bios.bin next to the executable:\n  {}",
                 // the pause tail doesn't bleed into the next report, and
                 // neutralize the buttons held to select Resume/back out
                 // (South=A, East=B) so they don't buffer into the game.
+                window.set_cursor_visibility(false);
                 reset_audio_counters(&streams);
                 suppress = !keys & 0x3FF;
                 continue;
@@ -1422,7 +1530,7 @@ Place your own dump as gba_bios.bin next to the executable:\n  {}",
         // audio device, wall-clock pace at the hardware frame rate.
         let mut ran = 0u32;
         while ran < 4 {
-            if _stream.is_some() {
+            if stream.is_some() {
                 // Both rings are live (the menu can crossfade between
                 // them), so pace on the emptier one — neither faithful
                 // nor enhanced may be allowed to starve.
@@ -1482,7 +1590,7 @@ Place your own dump as gba_bios.bin next to the executable:\n  {}",
                     native_run as f64 * 100.0 / total as f64
                 };
                 window.set_title(&format!(
-                    "recomp · {emu_ema_ms:.2} ms/frame ({:.1}x headroom) · native {share:.0}%",
+                    "{title} · {emu_ema_ms:.2} ms/frame ({:.1}x headroom) · native {share:.0}%",
                     16.7 / emu_ema_ms.max(0.01),
                 ));
                 native_run = 0;
@@ -1518,17 +1626,24 @@ Place your own dump as gba_bios.bin next to the executable:\n  {}",
             if frames_run % 300 == 0 {
                 if let Some(data) = m.bus.save_data() {
                     let h = fnv64(data);
-                    if sav_seen != Some(h) {
-                        if std::fs::write(&sav_path, data).is_ok() {
-                            sav_seen = Some(h);
-                        }
+                    if sav_seen != Some(h) && write_sav(&sav_path, data).is_ok() {
+                        sav_seen = Some(h);
                     }
                 }
             }
 
             // Hand this frame's audio to the consumer (caps ~250 ms each),
             // refresh the routing snapshot, and count anything dropped.
-            {
+            if stream.is_none() {
+                // No consumer: drop this frame's taps on the floor. Not a
+                // defect — that was reported when the device died — but the
+                // rings must not overflow into permanent DEGRADED spam.
+                m.bus.audio_buf.clear();
+                m.bus.psg_tap.clear();
+                m.bus.hle_tap.clear();
+                m.bus.fifo_tap[0].clear();
+                m.bus.fifo_tap[1].clear();
+            } else {
                 use gba_core::Bus as _;
                 let cnt_h = m.bus.read16(0x0400_0082);
                 let mut st = streams.lock().unwrap();
@@ -1623,7 +1738,7 @@ Place your own dump as gba_bios.bin next to the executable:\n  {}",
         // Once both rings first reach target, the buffer has primed:
         // discard the cold-start underruns so they don't report as a
         // defect (steady state is what the alarm is for).
-        if !primed && _stream.is_some() {
+        if !primed && stream.is_some() {
             let st = streams.lock().unwrap();
             if (st.mixed.len() / 2).min(st.psg.len() / 2) >= RING_TARGET {
                 drop(st);
@@ -1632,13 +1747,63 @@ Place your own dump as gba_bios.bin next to the executable:\n  {}",
             }
         }
 
+        // Audio-device watchdog (state above). Runs on the outer loop, not
+        // the production loop — a dead consumer leaves the ring full and
+        // the production loop never executes, which is exactly the case
+        // this must catch.
+        if stream.is_some() && audio_watch.elapsed().as_secs() >= 1 {
+            audio_watch = std::time::Instant::now();
+            let (consumed, dead) = {
+                let st = streams.lock().unwrap();
+                (st.consumed, st.dead)
+            };
+            if dead || consumed == audio_consumed_last {
+                audio_stalls += 1;
+            } else {
+                audio_stalls = 0;
+            }
+            audio_consumed_last = consumed;
+            if dead || audio_stalls >= 2 {
+                eprintln!(
+                    "DEGRADED: audio device {} — wall-clock pacing, retrying every 5 s",
+                    if dead { "errored" } else { "stopped consuming" }
+                );
+                stream = None;
+                {
+                    let mut st = streams.lock().unwrap();
+                    st.dead = false;
+                    st.mixed.clear();
+                    st.psg.clear();
+                    st.hle.clear();
+                    st.fifo[0].clear();
+                    st.fifo[1].clear();
+                }
+                audio_stalls = 0;
+                audio_retry = Some(std::time::Instant::now());
+                next_frame = std::time::Instant::now();
+            }
+        } else if stream.is_none() {
+            if let Some(t) = audio_retry {
+                if t.elapsed().as_secs() >= 5 {
+                    audio_retry = Some(std::time::Instant::now());
+                    if let Some(s) = start_audio(streams.clone()) {
+                        eprintln!("audio: output device restored");
+                        stream = Some(s);
+                        primed = false;
+                        audio_consumed_last = 0;
+                        audio_stalls = 0;
+                        reset_audio_counters(&streams);
+                    }
+                }
+            }
+        }
         if ran == 0 {
             // Ring is full: let the device drain a little, pump events.
             std::thread::sleep(std::time::Duration::from_millis(2));
             window.update();
             continue;
         }
-        if _stream.is_none() {
+        if stream.is_none() {
             next_frame += std::time::Duration::from_nanos(16_742_706); // 59.7275 Hz
             let now = std::time::Instant::now();
             if next_frame > now {
@@ -1674,7 +1839,7 @@ Place your own dump as gba_bios.bin next to the executable:\n  {}",
     }
 
     if let Some(data) = m.bus.save_data() {
-        std::fs::write(&sav_path, data).map_err(|e| format!("{sav_path}: {e}"))?;
+        write_sav(&sav_path, data).map_err(|e| format!("{sav_path}: {e}"))?;
         eprintln!("saved {sav_path}");
     }
     print_fallback_census();
@@ -1733,6 +1898,11 @@ fn apply_av_change(
             // Restart-required: persisted to av.cfg by the caller, applied
             // on the next launch. Live rebuild would tear down the GPU
             // presenter mid-session.
+        }
+        menu::Changed::Vsync => {
+            // Applied directly to the presenter by the caller (the
+            // presenter isn't threaded through here); persisted to av.cfg
+            // like everything else.
         }
         menu::Changed::Video => {
             *screen_kind =
@@ -1836,7 +2006,7 @@ fn ensure_native(
         let d = lbl.digest(blob.as_ref());
         format!("-l{:08x}", d as u32 ^ (d >> 32) as u32)
     };
-    let lib_path = dir.join(format!("{sha}{suffix}{lsuffix}.dylib"));
+    let lib_path = dir.join(format!("{sha}{suffix}{lsuffix}.{LIB_EXT}"));
     let lib_str = lib_path.to_str().ok_or("non-UTF8 cache path")?;
     if !lib_path.is_file() {
         // Superseded translations of this image (older label sets) can
@@ -1917,6 +2087,12 @@ struct AudioStreams {
     /// since the last report. Expected behavior on hot mixes, not a
     /// defect — surfaced as a stats line, never DEGRADED.
     clipped: u64,
+    /// Frames the device callback has consumed since stream start — the
+    /// play loop's liveness signal for the output device.
+    consumed: u64,
+    /// Set by the stream error callback; the play loop's watchdog turns
+    /// it into a loud wall-clock fallback plus periodic retry.
+    dead: bool,
 }
 
 /// The premium path's consumer state: one interpolator per Direct Sound
@@ -1935,13 +2111,86 @@ struct Enhanced {
     dc: [DcBlock; 2],
 }
 
-/// Build the cpal output stream over the shared streams. `enhanced`
-/// selects the premium output path; off reproduces the original
-/// zero-order-hold behavior exactly.
+/// Open the default output device and start the stream, loudly: every
+/// failure path says what broke and that the session falls back to
+/// silent, wall-clock-paced play (the loop also retries after a
+/// mid-session device death).
 fn start_audio(streams: std::sync::Arc<std::sync::Mutex<AudioStreams>>) -> Option<cpal::Stream> {
     use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-    let device = cpal::default_host().default_output_device()?;
-    let cfg = device.default_output_config().ok()?;
+    let Some(device) = cpal::default_host().default_output_device() else {
+        eprintln!("DEGRADED: no audio output device — silent session, wall-clock pacing");
+        return None;
+    };
+    // Negotiate a config: the device default when its sample format is
+    // renderable, else the first supported f32/i16/u16 layout (plenty of
+    // ALSA/WASAPI devices default to i16 — refusing them would mean
+    // silence on otherwise fine hardware).
+    let renderable = |f: cpal::SampleFormat| {
+        matches!(
+            f,
+            cpal::SampleFormat::F32 | cpal::SampleFormat::I16 | cpal::SampleFormat::U16
+        )
+    };
+    let cfg = match device.default_output_config() {
+        Ok(c) if renderable(c.sample_format()) => c,
+        first => {
+            let fallback = device.supported_output_configs().ok().and_then(|mut it| {
+                it.find(|c| renderable(c.sample_format()))
+                    .map(|c| c.with_max_sample_rate())
+            });
+            match (first, fallback) {
+                (_, Some(c)) => c,
+                (Ok(c), None) => {
+                    eprintln!(
+                        "DEGRADED: audio device offers no renderable sample format \
+                         ({:?}) — silent session, wall-clock pacing",
+                        c.sample_format()
+                    );
+                    return None;
+                }
+                (Err(e), None) => {
+                    eprintln!(
+                        "DEGRADED: audio device config unavailable ({e}) — silent \
+                         session, wall-clock pacing"
+                    );
+                    return None;
+                }
+            }
+        }
+    };
+    let fmt = cfg.sample_format();
+    let built = match fmt {
+        cpal::SampleFormat::I16 => build_stream::<i16>(&device, &cfg, streams),
+        cpal::SampleFormat::U16 => build_stream::<u16>(&device, &cfg, streams),
+        _ => build_stream::<f32>(&device, &cfg, streams),
+    };
+    match built {
+        Ok(stream) => {
+            let _ = stream.play();
+            eprintln!(
+                "audio: {} Hz, {} ch, {fmt:?}",
+                cfg.sample_rate().0,
+                cfg.channels()
+            );
+            Some(stream)
+        }
+        Err(e) => {
+            eprintln!("DEGRADED: audio stream failed ({e}) — silent session, wall-clock pacing");
+            None
+        }
+    }
+}
+
+/// Build the typed output stream over the shared rings. Generic over the
+/// device sample format — everything renders in f32 and converts on
+/// write, so i16/u16-only devices work identically. Both audio paths run
+/// every callback; the menu crossfades between them.
+fn build_stream<T: cpal::SizedSample + cpal::FromSample<f32>>(
+    device: &cpal::Device,
+    cfg: &cpal::SupportedStreamConfig,
+    streams: std::sync::Arc<std::sync::Mutex<AudioStreams>>,
+) -> Result<cpal::Stream, String> {
+    use cpal::traits::DeviceTrait;
     let rate = cfg.sample_rate().0 as f64;
     let channels = cfg.channels() as usize;
     let src = gba_core::mem::AUDIO_RATE_HZ as f64;
@@ -1971,11 +2220,14 @@ fn start_audio(streams: std::sync::Arc<std::sync::Mutex<AudioStreams>>) -> Optio
     // the speaker. Model it on the faithful path too, or PSG duty
     // offsets thump on every note edge.
     let mut faithful_dc = [DcBlock::new(rate), DcBlock::new(rate)];
-    let stream = device
+    let err_streams = streams.clone();
+    device
         .build_output_stream(
-            &cfg.into(),
-            move |out: &mut [f32], _| {
+            &cfg.config(),
+            move |out: &mut [T], _| {
                 let mut st = streams.lock().unwrap();
+                // Liveness signal for the play loop's device watchdog.
+                st.consumed += (out.len() / channels.max(1)) as u64;
                 for frame in out.chunks_mut(channels) {
                     // Enhanced output (always computed so the ring stays
                     // drained and the path is warm for a live switch).
@@ -2077,24 +2329,25 @@ fn start_audio(streams: std::sync::Arc<std::sync::Mutex<AudioStreams>>) -> Optio
                     let l = (l * OUT_GAIN).clamp(-1.0, 1.0);
                     let r = (r * OUT_GAIN).clamp(-1.0, 1.0);
                     match frame {
-                        [m] => *m = (l + r) * 0.5,
+                        [m] => *m = T::from_sample((l + r) * 0.5),
                         [fl, fr, rest @ ..] => {
-                            *fl = l;
-                            *fr = r;
+                            *fl = T::from_sample(l);
+                            *fr = T::from_sample(r);
                             for ch in rest {
-                                *ch = (l + r) * 0.5;
+                                *ch = T::from_sample((l + r) * 0.5);
                             }
                         }
                         [] => {}
                     }
                 }
             },
-            |e| eprintln!("audio error: {e}"),
+            move |e| {
+                eprintln!("audio error: {e}");
+                err_streams.lock().unwrap().dead = true;
+            },
             None,
         )
-        .ok()?;
-    let _ = stream.play();
-    Some(stream)
+        .map_err(|e| e.to_string())
 }
 
 const SINC_TAPS: usize = 24;
@@ -2483,7 +2736,7 @@ fn cmd_build(args: &[String]) -> Result<(), String> {
         ram,
         bios.as_deref(),
         explicit_labels.as_deref(),
-        &format!("out/{stem}{suffix}.dylib"),
+        &format!("out/{stem}{suffix}.{LIB_EXT}"),
         &mut term_progress,
     );
     eprintln!();
@@ -2777,7 +3030,8 @@ run play/runc --record-labels to capture one"
         ),
     );
 
-    let prefix = lib_path.strip_suffix(".dylib").unwrap_or(lib_path);
+    let dot_ext = format!(".{LIB_EXT}");
+    let prefix = lib_path.strip_suffix(dot_ext.as_str()).unwrap_or(lib_path);
 
     // Bounded translation units, compiled one at a time: full-image
     // translations can exceed the source image a hundredfold, and a single
@@ -3416,7 +3670,7 @@ fn cmd_runc(args: &[String]) -> Result<(), String> {
         .unwrap_or("game")
         .to_string();
     let suffix = if bios.is_some() { "-bios" } else { "" };
-    let lib_path = format!("out/{stem}{suffix}.dylib");
+    let lib_path = format!("out/{stem}{suffix}.{LIB_EXT}");
 
     let lib =
         unsafe { libloading::Library::new(&lib_path) }.map_err(|e| format!("{lib_path}: {e}"))?;
@@ -3428,7 +3682,7 @@ fn cmd_runc(args: &[String]) -> Result<(), String> {
     // hook-at-block-boundary path play uses, validated headless here.
     if std::env::var_os("RECOMP_MP2K").is_some() {
         m.bus.tap_channels = true;
-        eprintln!("hle: {}", arm_audio_hle(&mut m));
+        eprintln!("hle: {}", arm_audio_hle(&mut m, None));
     }
     let mptr = &mut m as *mut Machine as *mut std::ffi::c_void;
 
@@ -3603,7 +3857,7 @@ fn cmd_verify(args: &[String]) -> Result<(), String> {
                     .parse()
                     .map_err(|e| format!("bad frames: {e}"))?
             }
-            // Triage helpers: --reuse skips the rebuild when out/<stem>.dylib
+            // Triage helpers: --reuse skips the rebuild when the out/<stem> library
             // already exists; --dump <prefix> writes both final frames as
             // <prefix>.interp.ppm / <prefix>.recomp.ppm.
             "--reuse" => reuse = true,
@@ -3623,7 +3877,7 @@ fn cmd_verify(args: &[String]) -> Result<(), String> {
         .unwrap_or("game")
         .to_string();
     let suffix = if bios.is_some() { "-bios" } else { "" };
-    if !(reuse && Path::new(&format!("out/{stem}{suffix}.dylib")).is_file()) {
+    if !(reuse && Path::new(&format!("out/{stem}{suffix}.{LIB_EXT}")).is_file()) {
         let mut build_args = vec![rom_path.clone()];
         if let Some(p) = &bios_path {
             build_args.extend(["--bios".to_string(), p.clone()]);
@@ -3676,6 +3930,15 @@ fn demo_keys(frame: u64) -> u16 {
 }
 
 /// FNV-1a, used for cheap change detection on backup media.
+/// Write save data atomically (temp + rename): a crash mid-write can
+/// never leave a torn .sav. std::fs::rename replaces the destination on
+/// every supported platform.
+fn write_sav(path: &str, data: &[u8]) -> std::io::Result<()> {
+    let tmp = format!("{path}.tmp");
+    std::fs::write(&tmp, data)?;
+    std::fs::rename(&tmp, path)
+}
+
 fn fnv64(bytes: &[u8]) -> u64 {
     let mut h = 0xcbf2_9ce4_8422_2325u64;
     for &b in bytes {
@@ -3724,7 +3987,7 @@ fn run_hash(
         .unwrap_or("game")
         .to_string();
     let suffix = if bios.is_some() { "-bios" } else { "" };
-    let lib_path = format!("out/{stem}{suffix}.dylib");
+    let lib_path = format!("out/{stem}{suffix}.{LIB_EXT}");
     let lib =
         unsafe { libloading::Library::new(&lib_path) }.map_err(|e| format!("{lib_path}: {e}"))?;
     let table = BlockTable::load(&lib)?;
