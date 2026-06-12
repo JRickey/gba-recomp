@@ -33,6 +33,36 @@ pub fn config_dir() -> Option<PathBuf> {
     Some(dir)
 }
 
+/// Suppress the console window any child process would otherwise flash
+/// on Windows (CREATE_NO_WINDOW). No-op elsewhere.
+fn no_console(cmd: &mut std::process::Command) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
+    }
+    #[cfg(not(windows))]
+    let _ = cmd;
+}
+
+/// Probe `recomp --version` (prints "recomp <semver>"). `None` = unknown:
+/// binary missing, the flag predates this handshake, or odd output.
+pub fn recomp_version() -> Option<String> {
+    let bin = recomp_bin().ok()?;
+    let mut cmd = std::process::Command::new(&bin);
+    cmd.arg("--version")
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    no_console(&mut cmd);
+    let out = cmd.output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let ver = text.lines().next()?.trim().strip_prefix("recomp ")?.trim();
+    (!ver.is_empty()).then(|| ver.to_string())
+}
+
 /// Locate the `recomp` binary: $GBA_RECOMP_BIN, next to this executable,
 /// then $PATH.
 fn recomp_bin() -> Result<PathBuf, String> {
@@ -76,8 +106,9 @@ pub fn launch(rom: &Path, bios: Option<&Path>) -> Result<std::process::Child, St
     }
     cmd.arg(rom)
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
+        .stderr(std::process::Stdio::piped());
+    no_console(&mut cmd);
+    cmd.spawn()
         .map_err(|e| format!("failed to start {}: {e}", bin.display()))
 }
 

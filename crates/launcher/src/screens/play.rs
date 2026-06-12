@@ -26,6 +26,10 @@ pub struct PlayScreen {
     bios: Option<PathBuf>,
     /// Setup-panel diagnostic (bad pick, unwritable install location).
     bios_notice: Option<String>,
+    /// Stale-sibling guard: probed once at startup. Some = the recomp
+    /// binary's version differs from ours (or couldn't be read) — shown
+    /// persistently in the footer; play stays allowed.
+    version_warning: Option<String>,
 }
 
 /// What the child has told us via the `--status` protocol so far.
@@ -81,6 +85,7 @@ impl PlayScreen {
             notice: None,
             bios: input_config::find_bios(),
             bios_notice: None,
+            version_warning: version_warning(),
         }
     }
 
@@ -175,9 +180,17 @@ impl PlayScreen {
         self.sessions.retain_mut(|s| match s.child.try_wait() {
             Ok(Some(code)) if !code.success() => {
                 // Pick up any stderr that raced the exit, then report.
-                while let Ok(msg) = s.rx.try_recv() {
-                    if let SessionMsg::Stderr(line) = msg {
-                        s.last_line = Some(line);
+                // try_wait can observe the exit before the reader threads
+                // flush the child's last lines into the channel, so drain
+                // until both readers hang up (EOF follows death within
+                // ms) — bounded so the UI thread can never stall long.
+                let deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
+                loop {
+                    let left = deadline.saturating_duration_since(std::time::Instant::now());
+                    match s.rx.recv_timeout(left) {
+                        Ok(SessionMsg::Stderr(line)) => s.last_line = Some(line),
+                        Ok(_) => {}
+                        Err(_) => break, // disconnected or deadline
                     }
                 }
                 *notice = Some(format!(
@@ -246,7 +259,13 @@ impl PlayScreen {
 
             let mut play: Option<PathBuf> = None;
             let mut forget: Option<usize> = None;
-            let footer = 26.0 + 32.0 * self.sessions.len() as f32;
+            let footer = 26.0
+                + 32.0 * self.sessions.len() as f32
+                + if self.version_warning.is_some() {
+                    18.0
+                } else {
+                    0.0
+                };
             egui::ScrollArea::vertical()
                 .max_height(ui.available_height() - footer)
                 .show(ui, |ui| {
@@ -310,6 +329,10 @@ impl PlayScreen {
             if let Some(n) = &self.notice {
                 ui.add_space(2.0);
                 ui.label(egui::RichText::new(n).size(11.0).color(theme::AMBER));
+            }
+            if let Some(w) = &self.version_warning {
+                ui.add_space(2.0);
+                ui.label(egui::RichText::new(w).size(11.0).color(theme::AMBER));
             }
         });
     }
@@ -395,6 +418,24 @@ fn read_stderr(err: std::process::ChildStderr, tx: std::sync::mpsc::Sender<Sessi
             }
         }
     });
+}
+
+/// Compare the recomp binary's `--version` against our own build once at
+/// startup. `cargo run -p gba-launcher` does not rebuild recomp, so a
+/// stale sibling can silently lack flags we pass; surface that loudly.
+fn version_warning() -> Option<String> {
+    let ours = env!("CARGO_PKG_VERSION");
+    match crate::platform::recomp_version() {
+        Some(v) if v == ours => None,
+        Some(v) => Some(format!(
+            "\u{26A0} recomp binary v{v} \u{2260} launcher v{ours} \u{2014} \
+             rebuild (cargo build --release -p recomp)"
+        )),
+        None => Some(format!(
+            "\u{26A0} recomp binary version unknown (older than launcher v{ours}?) \
+             \u{2014} rebuild (cargo build --release -p recomp)"
+        )),
+    }
 }
 
 fn stem(path: &Path) -> String {

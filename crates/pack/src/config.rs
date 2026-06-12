@@ -118,6 +118,19 @@ pub enum EngineHle {
     Rdrv,
 }
 
+impl EngineHle {
+    /// The manifest spelling — must match the pack.toml kebab-case values.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            EngineHle::Auto => "auto",
+            EngineHle::Off => "off",
+            EngineHle::M4a => "m4a",
+            EngineHle::Gax => "gax",
+            EngineHle::Rdrv => "rdrv",
+        }
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 pub struct Output {

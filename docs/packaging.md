@@ -136,7 +136,7 @@ guarantee.
 
 `gba-pack` validates (plan mode) and **builds** (`gba-pack build`):
 translate with labels → soak gate → assemble `<out>/<name>/` holding
-the runtime binary, `translation.dylib`, the `recomp.pack.toml`
+the runtime binary, `translation.<dylib|so|dll>` (host platform), the `recomp.pack.toml`
 manifest (pins + runtime options, no image content), a README for the
 end user, and `src-c/` when `c-source = true`. The runtime binary is
 `recomp` itself: a manifest beside the executable switches it to
