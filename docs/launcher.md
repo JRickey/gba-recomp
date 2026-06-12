@@ -23,21 +23,31 @@ open-licensed default fonts.
   executable, then `$PATH`.
 - **INPUT** — device pills (keyboard plus every connected pad, live via
   gilrs hot-plug) and click-to-capture rebinding for the ten KEYINPUT
-  buttons. Saved on every change to the shared config (below); `recomp
-  play` reads the same file, so bindings apply without re-launching the
-  frontend. Modifier keys cannot be captured (egui reports them as
-  modifiers, not keys); the default Select=RightShift survives unless
-  rebound.
+  buttons. Capture takes a key, a pad button, or a stick push, so any GBA
+  button can map to a stick direction. On a gamepad an **Analog** section
+  selects which source drives the d-pad (left stick / right stick /
+  physical d-pad / both) and a deadzone slider; a live monitor lights the
+  GBA buttons the selected pad is currently pressing. Saved on every
+  change to the shared config (below); `recomp play` reads the same file,
+  so bindings apply without re-launching the frontend. Modifier keys
+  cannot be captured (egui reports them as modifiers, not keys); the
+  default Select=RightShift survives unless rebound.
 - **A/V** — placeholder (hazard stripes): scaling, filters, and audio mix
   land here.
 
 ## Input config
 
 `<config dir>/gba-recomp/input.cfg` — plain `key = value` lines:
-`device`, `gamepad_name`, `key.<button>`, `pad.<button>` (see the
-`input-config` crate). Key names are a canonical set mapped to egui keys
-on the launcher side and minifb keys on the play side; pad names are
-gilrs button names. Unknown values fall back to defaults per-button.
+`device`, `gamepad_name`, `dpad_source`, `stick_deadzone`, `key.<button>`,
+`pad.<button>` (see the `input-config` crate). Key names are a canonical
+set mapped to egui keys on the launcher side and minifb keys on the play
+side; pad names are gilrs button names or stick-direction tokens
+(`LeftStickUp`, `RightStickRight`, ...). `dpad_source` is
+`leftstick|rightstick|dpad|both` (default `both`); `stick_deadzone` is a
+float clamped to `[0.05, 0.95]` (default `0.50`). Unknown values fall
+back to defaults per-key. A vendored community controller-mapping
+database (`assets/gamecontrollerdb.txt`, embedded into both binaries) is
+layered over gilrs's built-in mappings for the widest pad compatibility.
 
 ## Platform integration
 

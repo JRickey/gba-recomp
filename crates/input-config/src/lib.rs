@@ -76,18 +76,170 @@ pub enum Device {
     Gamepad,
 }
 
+/// Which analog/digital source drives the GBA d-pad. `Both` (the
+/// historical behavior) lets the left stick AND the physical d-pad both
+/// move the player; `Dpad` ignores the sticks entirely.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DpadSource {
+    LeftStick,
+    RightStick,
+    Dpad,
+    Both,
+}
+
+impl DpadSource {
+    /// Does this source read the left analog stick?
+    pub fn uses_left_stick(self) -> bool {
+        matches!(self, DpadSource::LeftStick | DpadSource::Both)
+    }
+
+    /// Does this source read the right analog stick?
+    pub fn uses_right_stick(self) -> bool {
+        matches!(self, DpadSource::RightStick)
+    }
+
+    fn token(self) -> &'static str {
+        match self {
+            DpadSource::LeftStick => "leftstick",
+            DpadSource::RightStick => "rightstick",
+            DpadSource::Dpad => "dpad",
+            DpadSource::Both => "both",
+        }
+    }
+
+    fn from_token(s: &str) -> Option<Self> {
+        Some(match s {
+            "leftstick" => DpadSource::LeftStick,
+            "rightstick" => DpadSource::RightStick,
+            "dpad" => DpadSource::Dpad,
+            "both" => DpadSource::Both,
+            _ => return None,
+        })
+    }
+}
+
+/// Default deadzone for stick-driven directions, and the range the
+/// launcher clamps the user's choice into. Below ~0.05 stick drift leaks
+/// through; above ~0.95 the stick is effectively unusable.
+pub const DEADZONE_DEFAULT: f32 = 0.5;
+pub const DEADZONE_MIN: f32 = 0.05;
+pub const DEADZONE_MAX: f32 = 0.95;
+
+/// A stick direction usable as a binding source for any of the ten pad
+/// inputs (e.g. binding R to "RightStickUp"). The play runtime resolves
+/// these against the live axis values past the configured deadzone; the
+/// launcher recognizes an axis push as a bindable source during capture.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum StickToken {
+    LeftStickUp,
+    LeftStickDown,
+    LeftStickLeft,
+    LeftStickRight,
+    RightStickUp,
+    RightStickDown,
+    RightStickLeft,
+    RightStickRight,
+}
+
+impl StickToken {
+    pub const ALL: [StickToken; 8] = [
+        StickToken::LeftStickUp,
+        StickToken::LeftStickDown,
+        StickToken::LeftStickLeft,
+        StickToken::LeftStickRight,
+        StickToken::RightStickUp,
+        StickToken::RightStickDown,
+        StickToken::RightStickLeft,
+        StickToken::RightStickRight,
+    ];
+
+    /// The canonical token stored in the config and shown in the UI.
+    pub fn name(self) -> &'static str {
+        match self {
+            StickToken::LeftStickUp => "LeftStickUp",
+            StickToken::LeftStickDown => "LeftStickDown",
+            StickToken::LeftStickLeft => "LeftStickLeft",
+            StickToken::LeftStickRight => "LeftStickRight",
+            StickToken::RightStickUp => "RightStickUp",
+            StickToken::RightStickDown => "RightStickDown",
+            StickToken::RightStickLeft => "RightStickLeft",
+            StickToken::RightStickRight => "RightStickRight",
+        }
+    }
+
+    /// Parse a stored token back into a stick direction.
+    pub fn by_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|t| t.name() == name)
+    }
+
+    /// `true` for the left stick, `false` for the right.
+    pub fn left(self) -> bool {
+        matches!(
+            self,
+            StickToken::LeftStickUp
+                | StickToken::LeftStickDown
+                | StickToken::LeftStickLeft
+                | StickToken::LeftStickRight
+        )
+    }
+
+    /// The axis component this token reads (`(horizontal, positive)`):
+    /// horizontal = X axis, else Y axis; positive = push toward +value.
+    /// Y is reported stick-up-positive by gilrs, matching this mapping.
+    pub fn axis(self) -> (bool, bool) {
+        match self {
+            StickToken::LeftStickRight | StickToken::RightStickRight => (true, true),
+            StickToken::LeftStickLeft | StickToken::RightStickLeft => (true, false),
+            StickToken::LeftStickUp | StickToken::RightStickUp => (false, true),
+            StickToken::LeftStickDown | StickToken::RightStickDown => (false, false),
+        }
+    }
+
+    /// The stick token that a `DpadSource` maps onto a given direction
+    /// (`(horizontal, positive)` axis geometry), or `None` when the source
+    /// reads no stick (`Dpad`). Lets both frontends derive which stick
+    /// direction lights a d-pad button from one place.
+    pub fn dir(source: DpadSource, horizontal: bool, positive: bool) -> Option<StickToken> {
+        let left = match source {
+            DpadSource::LeftStick | DpadSource::Both => true,
+            DpadSource::RightStick => false,
+            DpadSource::Dpad => return None,
+        };
+        Some(match (left, horizontal, positive) {
+            (true, true, true) => StickToken::LeftStickRight,
+            (true, true, false) => StickToken::LeftStickLeft,
+            (true, false, true) => StickToken::LeftStickUp,
+            (true, false, false) => StickToken::LeftStickDown,
+            (false, true, true) => StickToken::RightStickRight,
+            (false, true, false) => StickToken::RightStickLeft,
+            (false, false, true) => StickToken::RightStickUp,
+            (false, false, false) => StickToken::RightStickDown,
+        })
+    }
+}
+
 /// Key names are a canonical set understood by both frontends (egui on the
 /// launcher side, minifb on the play side): letters `A`..`Z`, digits
 /// `0`..`9`, `Up` `Down` `Left` `Right`, `Enter`, `Space`, `Tab`,
 /// `Backspace`, `LeftShift`, `RightShift`. Pad names are gilrs button
 /// names (`South`, `East`, `DPadUp`, `LeftTrigger`, ...).
-#[derive(Clone, PartialEq, Eq, Debug)]
+///
+/// Not `Eq` — `stick_deadzone` is an `f32`. Equality is `PartialEq`,
+/// which is all the tests and config diffing need.
+#[derive(Clone, PartialEq, Debug)]
 pub struct InputConfig {
     pub device: Device,
     /// Preferred pad by name; empty = first connected.
     pub gamepad_name: String,
     pub keys: [String; 10],
+    /// Pad bindings: a gilrs button name (`South`, `DPadUp`, ...) or a
+    /// stick-direction token (`LeftStickUp`, ...). The play runtime
+    /// resolves stick tokens against the live axes past `stick_deadzone`.
     pub pads: [String; 10],
+    /// Which source(s) move the GBA d-pad on a gamepad.
+    pub dpad_source: DpadSource,
+    /// Threshold a stick axis must pass to register as a direction.
+    pub stick_deadzone: f32,
 }
 
 impl Default for InputConfig {
@@ -107,6 +259,10 @@ impl Default for InputConfig {
                 s("DPadRight"), s("DPadLeft"), s("DPadUp"), s("DPadDown"),
                 s("RightTrigger"), s("LeftTrigger"),
             ],
+            // Default matches the historical hardcoded play behavior:
+            // left stick AND the physical d-pad bindings both steer.
+            dpad_source: DpadSource::Both,
+            stick_deadzone: DEADZONE_DEFAULT,
         }
     }
 }
@@ -127,6 +283,18 @@ impl InputConfig {
                     }
                 }
                 "gamepad_name" => cfg.gamepad_name = v.to_string(),
+                "dpad_source" => {
+                    if let Some(d) = DpadSource::from_token(&v.to_ascii_lowercase()) {
+                        cfg.dpad_source = d;
+                    }
+                }
+                "stick_deadzone" => {
+                    if let Ok(z) = v.parse::<f32>() {
+                        if z.is_finite() {
+                            cfg.stick_deadzone = z.clamp(DEADZONE_MIN, DEADZONE_MAX);
+                        }
+                    }
+                }
                 _ => {
                     if let Some(name) = k.strip_prefix("key.") {
                         if let Some(b) = button_by_name(name) {
@@ -153,6 +321,8 @@ impl InputConfig {
             }
         ));
         out.push_str(&format!("gamepad_name = {}\n", self.gamepad_name));
+        out.push_str(&format!("dpad_source = {}\n", self.dpad_source.token()));
+        out.push_str(&format!("stick_deadzone = {:.2}\n", self.stick_deadzone));
         for b in Button::ALL {
             out.push_str(&format!("key.{} = {}\n", b.name(), self.keys[b.index()]));
         }
@@ -182,6 +352,25 @@ impl InputConfig {
 
 pub fn button_by_name(name: &str) -> Option<Button> {
     Button::ALL.into_iter().find(|b| b.name() == name)
+}
+
+/// A resolved pad binding: either a physical button (by gilrs name) or a
+/// stick direction. The play runtime maps the button name through gilrs
+/// and the stick token through the live axes; keeping the split here lets
+/// the dependency-free model own the token vocabulary.
+pub enum PadBinding<'a> {
+    Button(&'a str),
+    Stick(StickToken),
+}
+
+/// Classify a stored pad binding. A recognized stick token resolves to
+/// `Stick`; everything else is handed back as a button name for gilrs to
+/// interpret (unknown names there simply never fire).
+pub fn pad_binding(name: &str) -> PadBinding<'_> {
+    match StickToken::by_name(name) {
+        Some(t) => PadBinding::Stick(t),
+        None => PadBinding::Button(name),
+    }
 }
 
 /// Audio/video settings, launcher-edited, honored by the play runtime.
@@ -426,6 +615,10 @@ mod tests {
         cfg.gamepad_name = "Pro Pad 2".into();
         cfg.keys[Button::A.index()] = "Space".into();
         cfg.pads[Button::L.index()] = "LeftTrigger2".into();
+        // stick-as-button binding survives the round-trip too
+        cfg.pads[Button::R.index()] = "RightStickUp".into();
+        cfg.dpad_source = DpadSource::RightStick;
+        cfg.stick_deadzone = 0.30;
         assert_eq!(InputConfig::parse(&cfg.serialize()), cfg);
     }
 
@@ -435,6 +628,54 @@ mod tests {
         assert_eq!(cfg.keys[Button::A.index()], "Q");
         assert_eq!(cfg.device, Device::Gamepad);
         assert_eq!(cfg.keys[Button::B.index()], "X"); // untouched default
+    }
+
+    #[test]
+    fn serialize_spells_analog_keys_as_specified() {
+        // Lock the on-disk format so launcher and play never disagree.
+        let s = InputConfig::default().serialize();
+        assert!(s.contains("dpad_source = both\n"), "got:\n{s}");
+        assert!(s.contains("stick_deadzone = 0.50\n"), "got:\n{s}");
+        let cfg = InputConfig { dpad_source: DpadSource::RightStick, stick_deadzone: 0.25, ..InputConfig::default() };
+        let s = cfg.serialize();
+        assert!(s.contains("dpad_source = rightstick\n"), "got:\n{s}");
+        assert!(s.contains("stick_deadzone = 0.25\n"), "got:\n{s}");
+    }
+
+    #[test]
+    fn new_fields_default_and_clamp() {
+        // Old config files (no analog keys) load with the defaults that
+        // reproduce the historical behavior.
+        let old = InputConfig::parse("device = gamepad\npad.a = South\n");
+        assert_eq!(old.dpad_source, DpadSource::Both);
+        assert_eq!(old.stick_deadzone, DEADZONE_DEFAULT);
+
+        // dpad_source parses case-insensitively; bad values keep default.
+        assert_eq!(
+            InputConfig::parse("dpad_source = LEFTSTICK\n").dpad_source,
+            DpadSource::LeftStick
+        );
+        assert_eq!(
+            InputConfig::parse("dpad_source = nonsense\n").dpad_source,
+            DpadSource::Both
+        );
+
+        // deadzone clamps into the launcher's range; garbage keeps default.
+        assert_eq!(InputConfig::parse("stick_deadzone = 0.01\n").stick_deadzone, DEADZONE_MIN);
+        assert_eq!(InputConfig::parse("stick_deadzone = 9.0\n").stick_deadzone, DEADZONE_MAX);
+        assert_eq!(InputConfig::parse("stick_deadzone = abc\n").stick_deadzone, DEADZONE_DEFAULT);
+    }
+
+    #[test]
+    fn stick_tokens_classify_and_resolve() {
+        // A stick token resolves to Stick; anything else is a button.
+        assert!(matches!(pad_binding("LeftStickUp"), PadBinding::Stick(StickToken::LeftStickUp)));
+        assert!(matches!(pad_binding("South"), PadBinding::Button("South")));
+        // axis geometry: horizontal flag + positive direction.
+        assert_eq!(StickToken::LeftStickRight.axis(), (true, true));
+        assert_eq!(StickToken::RightStickDown.axis(), (false, false));
+        assert!(StickToken::LeftStickUp.left());
+        assert!(!StickToken::RightStickUp.left());
     }
 
     #[test]

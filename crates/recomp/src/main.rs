@@ -1037,7 +1037,7 @@ Place your own dump as gba_bios.bin next to the executable:\n  {}",
         })
         .collect();
     let mut pad = match icfg.device {
-        input_config::Device::Gamepad => gilrs::Gilrs::new().ok(),
+        input_config::Device::Gamepad => build_gilrs(),
         input_config::Device::Keyboard => None,
     };
 
@@ -1111,20 +1111,29 @@ Place your own dump as gba_bios.bin next to the executable:\n  {}",
                 .find(|(_, gp)| gp.name() == icfg.gamepad_name)
                 .or_else(|| g.gamepads().next());
             if let Some((_, gp)) = chosen {
+                let dz = icfg.stick_deadzone;
                 for b in input_config::Button::ALL {
-                    if pad_pressed(&gp, &icfg.pads[b.index()]) {
+                    if pad_pressed(&gp, &icfg.pads[b.index()], dz) {
                         keys &= !b.bit();
                     }
                 }
-                // left stick doubles as the D-pad
-                let (x, y) = (
-                    gp.value(gilrs::Axis::LeftStickX),
-                    gp.value(gilrs::Axis::LeftStickY),
-                );
-                if x > 0.5 { keys &= !(1 << 4); }
-                if x < -0.5 { keys &= !(1 << 5); }
-                if y > 0.5 { keys &= !(1 << 6); }
-                if y < -0.5 { keys &= !(1 << 7); }
+                // A configured stick drives the GBA d-pad per dpad_source
+                // (the physical d-pad still works through the bindings
+                // above). Y is up-positive in gilrs. `Dpad`/`Both` are
+                // covered for the stick part here; `Dpad` reads no stick.
+                let src = icfg.dpad_source;
+                if src.uses_left_stick() || src.uses_right_stick() {
+                    let (ax, ay) = if src.uses_right_stick() {
+                        (gilrs::Axis::RightStickX, gilrs::Axis::RightStickY)
+                    } else {
+                        (gilrs::Axis::LeftStickX, gilrs::Axis::LeftStickY)
+                    };
+                    let (x, y) = (gp.value(ax), gp.value(ay));
+                    if x > dz { keys &= !(1 << 4); } // Right
+                    if x < -dz { keys &= !(1 << 5); } // Left
+                    if y > dz { keys &= !(1 << 6); } // Up
+                    if y < -dz { keys &= !(1 << 7); } // Down
+                }
             }
         }
         m.bus.keys = keys;
@@ -1921,10 +1930,30 @@ fn minifb_key(name: &str) -> Option<minifb::Key> {
     })
 }
 
-/// Gilrs button name (the launcher stores `{:?}` of the button) to state.
-fn pad_pressed(gp: &gilrs::Gamepad, name: &str) -> bool {
+/// Vendored community controller mapping DB (zlib; see THIRD-PARTY.md).
+/// gilrs bundles its own snapshot, but it lags newer controllers — this
+/// fresher copy is fed on top so the packaged play binary recognizes the
+/// broadest possible set of pads with no external file dependency.
+const CONTROLLER_DB: &str = include_str!("../../../assets/gamecontrollerdb.txt");
+
+/// Build a gilrs context with the vendored DB layered over the built-in
+/// mappings. Falls back to a plain context if the builder rejects (the
+/// dummy backend on headless hosts), so the play loop never hard-fails
+/// over input init.
+fn build_gilrs() -> Option<gilrs::Gilrs> {
+    gilrs::GilrsBuilder::new()
+        .add_mappings(CONTROLLER_DB)
+        .build()
+        .ok()
+        .or_else(|| gilrs::Gilrs::new().ok())
+}
+
+/// Gilrs button name (the launcher stores `{:?}` of the button) to a
+/// gilrs `Button`. Stick-direction tokens are handled elsewhere (they
+/// read axes, not buttons) and return `None` here.
+fn gilrs_button(name: &str) -> Option<gilrs::Button> {
     use gilrs::Button::*;
-    let btn = match name {
+    Some(match name {
         "South" => South, "East" => East, "North" => North, "West" => West,
         "C" => C, "Z" => Z,
         "LeftTrigger" => LeftTrigger, "LeftTrigger2" => LeftTrigger2,
@@ -1933,9 +1962,32 @@ fn pad_pressed(gp: &gilrs::Gamepad, name: &str) -> bool {
         "LeftThumb" => LeftThumb, "RightThumb" => RightThumb,
         "DPadUp" => DPadUp, "DPadDown" => DPadDown,
         "DPadLeft" => DPadLeft, "DPadRight" => DPadRight,
-        _ => return false,
+        _ => return None,
+    })
+}
+
+/// Is a stick token pushed past the deadzone right now? `(horizontal,
+/// positive)` from the token; gilrs reports both sticks' Y as up-positive,
+/// matching the token directions.
+fn stick_token_active(gp: &gilrs::Gamepad, tok: input_config::StickToken, deadzone: f32) -> bool {
+    use gilrs::Axis::*;
+    let (horizontal, positive) = tok.axis();
+    let axis = match (tok.left(), horizontal) {
+        (true, true) => LeftStickX,
+        (true, false) => LeftStickY,
+        (false, true) => RightStickX,
+        (false, false) => RightStickY,
     };
-    gp.is_pressed(btn)
+    let v = gp.value(axis);
+    if positive { v > deadzone } else { v < -deadzone }
+}
+
+/// Is the configured pad binding (button name or stick token) active?
+fn pad_pressed(gp: &gilrs::Gamepad, name: &str, deadzone: f32) -> bool {
+    match input_config::pad_binding(name) {
+        input_config::PadBinding::Button(b) => gilrs_button(b).is_some_and(|btn| gp.is_pressed(btn)),
+        input_config::PadBinding::Stick(t) => stick_token_active(gp, t, deadzone),
+    }
 }
 
 /// Statically recompile a ROM: analyze, emit C, compile to a shared

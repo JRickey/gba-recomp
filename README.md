@@ -147,6 +147,11 @@ files carry no per-file disclaimers.
 **Frontend assets** are generated procedurally by our own code; no third-party
 artwork is bundled. The GUI toolkit ships its own open-licensed default fonts.
 
+**Vendored data.** One third-party data file is checked in: a community
+game-controller mapping database (zlib-licensed), bundled so the launcher and
+play runtime recognize the broadest set of controllers. It is recorded, with
+source, version, and license, in [THIRD-PARTY.md](THIRD-PARTY.md).
+
 **Dependencies** are all permissively licensed (MIT / Apache-2.0 / ISC) —
 egui/eframe, winit, wgpu, raw-window-handle, rfd, gilrs, minifb, cpal,
 libloading, dirs, sha2, and (on Apple targets) the objc2 family. There are no
