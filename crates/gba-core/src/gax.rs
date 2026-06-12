@@ -121,8 +121,8 @@ struct Voice {
     dir: f64,
     loop_ptr: u32,
     loop_len: u32,
-    /// Source samples per host GRID sample (telemetry / chunk span).
-    grid_step: f64,
+    /// Source samples per GUEST output sample (position telemetry).
+    step: f64,
     gl0: f32,
     gl1: f32,
     /// Right gains; negated when the surround flag is set.
@@ -130,9 +130,6 @@ struct Voice {
     gr1: f32,
     echo_send: bool,
     dead: bool,
-    /// Canon-domain check copy: guest-rate ZOH.
-    chk_hold: f32,
-    chk_acc: f64,
 }
 
 impl Default for Voice {
@@ -144,15 +141,13 @@ impl Default for Voice {
             dir: 1.0,
             loop_ptr: 0,
             loop_len: 0,
-            grid_step: 0.0,
+            step: 0.0,
             gl0: 0.0,
             gl1: 0.0,
             gr0: 0.0,
             gr1: 0.0,
             echo_send: false,
             dead: false,
-            chk_hold: 0.0,
-            chk_acc: 0.0,
         }
     }
 }
@@ -170,8 +165,6 @@ struct Echo {
     g_fb: f32,
     g_in: f32,
     g_wet: f32,
-    wet_hold: (f32, f32),
-    acc: f64,
 }
 
 impl Echo {
@@ -183,8 +176,6 @@ impl Echo {
             g_fb: 0.0,
             g_in: 0.0,
             g_wet: 0.0,
-            wet_hold: (0.0, 0.0),
-            acc: 0.0,
         }
     }
 }
@@ -262,6 +253,9 @@ pub struct GaxHle {
     /// Render-window progress in grid samples (gain lerp phase).
     win_pos: f64,
     win_len: f64,
+    /// Guest-tick accumulator and the held mix pair (ZOH to the grid).
+    gtick: f64,
+    mix_hold: (f32, f32),
     trace: bool,
     trace_acc: Vec<(usize, f64, f64)>,
     // --- v3 state ---
@@ -304,6 +298,8 @@ impl GaxHle {
             pending: [SnapV::default(); MAX_VOICES],
             win_pos: 0.0,
             win_len: f64::MAX,
+            gtick: 0.0,
+            mix_hold: (0.0, 0.0),
             trace: std::env::var_os("RECOMP_GAX_TRACE").is_some(),
             trace_acc: Vec::new(),
             v3_work: 0,
@@ -691,8 +687,8 @@ impl GaxHle {
             // Per-voice advance from guest telemetry where available:
             // dpos across the chunk, forward-loop unwrapped. A failed
             // unwrap (ping-pong reflection, restart) falls back to the
-            // decoded 4.12 step on the exact timer grid.
-            let mut grid_step = src.step * 128.0 / chunk_grid;
+            // decoded 4.12 step.
+            let mut step = src.step;
             if same {
                 let mut d = c.pos - p.pos;
                 let mut wraps = 0;
@@ -702,13 +698,13 @@ impl GaxHle {
                 }
                 let exp = p.step * 128.0;
                 if d > 0.0 && d < exp * 4.0 + 4.0 {
-                    grid_step = d / chunk_grid;
+                    step = d / 128.0;
                     if self.trace && exp > 0.0 {
                         self.trace_acc.push((i, d / exp, p.step));
                     }
                 }
             }
-            if !(grid_step > 0.0) {
+            if !(step > 0.0) {
                 continue;
             }
             v.pos = start;
@@ -716,7 +712,7 @@ impl GaxHle {
             v.dir = if src.end as f64 >= start { 1.0 } else { -1.0 };
             v.loop_ptr = src.loop_ptr;
             v.loop_len = src.loop_len;
-            v.grid_step = grid_step;
+            v.step = step;
             v.gl0 = gl0;
             v.gr0 = gr0;
             v.gl1 = if c.on { c.gl } else { 0.0 };
@@ -904,54 +900,50 @@ impl GaxHle {
         if self.mode == Mode::V3 {
             return self.render_v3(mem, canon, audio_cursor);
         }
-        let gain = self.vf.gain();
-        let (mut l, mut r) = (0.0f32, 0.0f32);
-        let (mut chk_l, mut chk_r) = (0.0f32, 0.0f32);
-        let (mut echo_in_l, mut echo_in_r) = (0.0f32, 0.0f32);
-        let mut echo_in_chk = 0.0f32;
-        // Gain lerp phase across the chunk window (held at 1 if the
-        // next hook is late — voices keep sampling smoothly).
-        let t = if self.win_len > 0.0 {
-            (self.win_pos / self.win_len).min(1.0) as f32
-        } else {
-            1.0
-        };
+        // The mix advances at GUEST ticks and HOLDS across the host
+        // grid. The hold is deliberate, not a shortcut: at a ~8 kHz
+        // mix rate most of the audible treble is ZOH image energy, and
+        // the guest commit's s8 rail clamp is part of the authored
+        // sound — a smooth full-rate render audibly dulls the title
+        // (crossfading from canon to it sounded like a pitch drop).
+        // What the enhanced stream still buys over canon: float mixing
+        // and echo (no s8 truncation), exact jitter-free timing, and
+        // telemetry-true pitch. The output IS the canon-domain check.
         self.win_pos += 1.0;
-
-        for v in self.voices.iter_mut() {
-            if !v.on || v.dead {
-                continue;
-            }
-            let s = sample_voice(v, mem);
-            v.chk_acc -= 1.0;
-            if v.chk_acc <= 0.0 {
-                v.chk_hold = s;
-                v.chk_acc += self.mix_step;
-            }
-            let gl = v.gl0 + (v.gl1 - v.gl0) * t;
-            let gr = v.gr0 + (v.gr1 - v.gr0) * t;
-            if v.echo_send {
-                // Echo-send voices feed the delay line INSTEAD of the
-                // main mix, at their panned (signed) gains.
-                echo_in_l += s * gl * gain;
-                echo_in_r += s * gr * gain;
-                echo_in_chk += v.chk_hold * (gl + gr) * 0.5 * gain;
+        self.gtick -= 1.0;
+        if self.gtick <= 0.0 {
+            self.gtick += self.mix_step;
+            let gain = self.vf.gain();
+            // Gain lerp phase across the chunk window (held at 1 if
+            // the next hook is late — voices keep sampling smoothly).
+            let t = if self.win_len > 0.0 {
+                (self.win_pos / self.win_len).min(1.0) as f32
             } else {
-                l += s * gl * gain;
-                r += s * gr * gain;
-                chk_l += v.chk_hold * gl * gain;
-                chk_r += v.chk_hold * gr * gain;
+                1.0
+            };
+            let (mut l, mut r) = (0.0f32, 0.0f32);
+            let (mut echo_in_l, mut echo_in_r) = (0.0f32, 0.0f32);
+            for v in self.voices.iter_mut() {
+                if !v.on || v.dead {
+                    continue;
+                }
+                let s = sample_voice(v, mem);
+                let gl = v.gl0 + (v.gl1 - v.gl0) * t;
+                let gr = v.gr0 + (v.gr1 - v.gr0) * t;
+                if v.echo_send {
+                    // Echo-send voices feed the delay line INSTEAD of
+                    // the main mix, at their panned (signed) gains.
+                    echo_in_l += s * gl * gain;
+                    echo_in_r += s * gr * gain;
+                } else {
+                    l += s * gl * gain;
+                    r += s * gr * gain;
+                }
             }
-        }
-
-        // Echo at the guest sample cadence (delay time is in guest
-        // samples); per-channel independent delays in stereo mode (the
-        // guest's interleaved buffer never mixes the channels); the wet
-        // pair holds between ticks. Mono mode collapses to one line.
-        if self.echo_on && !self.echo.ring.is_empty() {
-            self.echo.acc -= 1.0;
-            if self.echo.acc <= 0.0 {
-                self.echo.acc += self.mix_step;
+            // Echo shares the tick; per-channel independent delays in
+            // stereo mode (the guest's interleaved buffer never mixes
+            // the channels), one line duplicated in mono mode.
+            if self.echo_on && !self.echo.ring.is_empty() {
                 let e = &mut self.echo;
                 let n = e.ring.len();
                 let (in_l, in_r) = if self.stereo {
@@ -966,32 +958,28 @@ impl GaxHle {
                 e.ring[e.wr] = (in_l + e.g_fb * wl, in_r + e.g_fb * wr_);
                 e.rd = (e.rd + 1) % n;
                 e.wr = (e.wr + 1) % n;
-                e.wet_hold = wet;
+                l += wet.0;
+                r += wet.1;
             }
-            l += self.echo.wet_hold.0;
-            r += self.echo.wet_hold.1;
-            chk_l += self.echo.wet_hold.0;
-            chk_r += self.echo.wet_hold.1;
+            if !self.stereo {
+                let m = (l + r) * 0.5;
+                l = m;
+                r = m;
+            }
+            // The guest commit clamps every sample to the s8 rails.
+            self.mix_hold = (
+                l.clamp(-1.0, 127.0 / 128.0),
+                r.clamp(-1.0, 127.0 / 128.0),
+            );
         }
-        let _ = echo_in_chk;
 
-        // Canon-domain check copy: commit clamps to s8.
-        let sat = (
-            chk_l.clamp(-1.0, 127.0 / 128.0),
-            chk_r.clamp(-1.0, 127.0 / 128.0),
-        );
+        let (hl, hr) = self.mix_hold;
         // v1 FIFO A carries LEFT.
         let canon_lr = (canon[0] as f32 / 128.0, canon[1] as f32 / 128.0);
-        match self.vf.judge(canon_lr, sat) {
+        match self.vf.judge(canon_lr, (hl, hr)) {
             Judgement::None | Judgement::Pass | Judgement::Fail { .. } => {}
         }
-
-        if self.stereo {
-            (l * 0.25, r * 0.25)
-        } else {
-            let m = (l + r) * 0.5;
-            (m * 0.25, m * 0.25)
-        }
+        (hl * 0.25, hr * 0.25)
     }
 }
 
@@ -1049,7 +1037,7 @@ fn sample_voice(v: &mut Voice, mem: &MemView) -> f32 {
             return 0.0;
         }
     };
-    v.pos += v.dir * v.grid_step;
+    v.pos += v.dir * v.step;
     s
 }
 
@@ -1114,7 +1102,7 @@ mod tests {
             dir: 1.0,
             loop_ptr: 0x0800_0008,
             loop_len: 8,
-            grid_step: 3.0,
+            step: 3.0,
             ..Voice::default()
         };
         // Looping: samples stay inside [8, 16) after wrap, voice alive.
