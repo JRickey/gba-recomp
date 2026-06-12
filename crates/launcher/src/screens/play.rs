@@ -25,14 +25,14 @@ pub struct PlayScreen {
 enum SessionState {
     /// Spawned; no status line yet.
     Starting,
-    /// One-time translation in progress (0..=1).
-    Building(f32),
+    /// One-time translation in progress (0..=1) with a phase label.
+    Building(f32, String),
     /// The game window is up.
     Playing,
 }
 
 enum SessionMsg {
-    Building(f32),
+    Building(f32, String),
     Playing,
     Stderr(String),
 }
@@ -76,7 +76,7 @@ impl PlayScreen {
         for s in &mut self.sessions {
             while let Ok(msg) = s.rx.try_recv() {
                 match msg {
-                    SessionMsg::Building(f) => s.state = SessionState::Building(f),
+                    SessionMsg::Building(f, label) => s.state = SessionState::Building(f, label),
                     SessionMsg::Playing => s.state = SessionState::Playing,
                     SessionMsg::Stderr(line) => {
                         if line.starts_with("DEGRADED") {
@@ -188,14 +188,16 @@ impl PlayScreen {
                                 .color(theme::white(150)),
                         );
                     }
-                    SessionState::Building(f) => {
+                    SessionState::Building(f, ref label) => {
+                        let phase = if label.is_empty() {
+                            "one-time translation\u{2026}"
+                        } else {
+                            label.as_str()
+                        };
                         ui.label(
-                            egui::RichText::new(format!(
-                                "building {} \u{2014} one-time translation\u{2026}",
-                                s.name
-                            ))
-                            .size(11.0)
-                            .color(theme::CYAN),
+                            egui::RichText::new(format!("building {} \u{2014} {phase}", s.name))
+                                .size(11.0)
+                                .color(theme::CYAN),
                         );
                         ui.add(
                             egui::ProgressBar::new(f)
@@ -269,8 +271,15 @@ fn read_status(out: std::process::ChildStdout, tx: std::sync::mpsc::Sender<Sessi
             };
             let msg = if rest == "playing" {
                 Some(SessionMsg::Playing)
-            } else if let Some(pct) = rest.strip_prefix("building ") {
-                pct.trim().parse::<f32>().ok().map(|p| SessionMsg::Building(p / 100.0))
+            } else if let Some(rest) = rest.strip_prefix("building ") {
+                let rest = rest.trim();
+                let (pct, label) = match rest.split_once(' ') {
+                    Some((p, l)) => (p, l.trim()),
+                    None => (rest, ""),
+                };
+                pct.parse::<f32>()
+                    .ok()
+                    .map(|p| SessionMsg::Building(p / 100.0, label.to_string()))
             } else {
                 None
             };

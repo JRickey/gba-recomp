@@ -1312,11 +1312,16 @@ fn ensure_native(
         if status {
             status_line("building 0");
         }
-        build_dylib(rom_path, true, lib_str, &mut |pct| {
+        build_dylib(rom_path, true, lib_str, &mut |pct, msg| {
             if status {
-                status_line(&format!("building {pct}"));
+                status_line(&format!("building {pct} {msg}"));
+            } else {
+                term_progress(pct, msg);
             }
         })?;
+        if !status {
+            eprintln!();
+        }
     }
     let lib = unsafe { libloading::Library::new(&lib_path) }
         .map_err(|e| format!("{}: {e}", lib_path.display()))?;
@@ -1776,7 +1781,9 @@ fn cmd_build(args: &[String]) -> Result<(), String> {
     std::fs::create_dir_all("out").map_err(|e| e.to_string())?;
     let stem = Path::new(rom_path)
         .file_stem().and_then(|s| s.to_str()).unwrap_or("game").to_string();
-    build_dylib(rom_path, ram, &format!("out/{stem}.dylib"), &mut |_| {})
+    let r = build_dylib(rom_path, ram, &format!("out/{stem}.dylib"), &mut term_progress);
+    eprintln!();
+    r
 }
 
 /// The build pipeline behind `cmd_build`, parameterized on the output
@@ -1789,9 +1796,16 @@ fn build_dylib(
     rom_path: &str,
     ram: bool,
     lib_path: &str,
-    progress: &mut dyn FnMut(u8),
+    progress: &mut dyn FnMut(u8, &str),
 ) -> Result<(), String> {
     let rom = std::fs::read(rom_path).map_err(|e| format!("{rom_path}: {e}"))?;
+
+    // Phase budget, weighted by image size: bigger images spend nearly
+    // all their build inside the C compiler, so the profiling slice of
+    // the bar shrinks as the image grows (the bar should track wall
+    // time, not phase count).
+    let rom_mb = ((rom.len() >> 20) as u64).max(1);
+    let prof_end = (64 / rom_mb).clamp(4, 20) as u8;
 
     // Profile-guided RAM discovery: run the interpreter briefly, recording
     // control-transfer targets in EWRAM/IWRAM, then translate the observed
@@ -1847,19 +1861,25 @@ fn build_dylib(
                     }
                     m.bus.audio_buf.clear();
                 }
-                // Profiling occupies the first 20% of the reported
-                // build; the endpoint moves until audio engages, so
-                // estimate it (the report only ever advances).
+                // The profiling slice of the bar; the endpoint moves
+                // until audio engages, so estimate it (the report only
+                // ever advances). The label says what we're waiting on.
                 let est_end = match audio_from {
                     None => PROFILE_MAX_FRAMES,
                     Some(f0) => {
                         PROFILE_MAX_FRAMES.min((f0 + PROFILE_AUDIO_MARGIN).max(PROFILE_MIN_FRAMES))
                     }
                 };
-                let pct = (m.bus.frames * 20 / est_end.max(1)).min(20) as u8;
+                let pct =
+                    (m.bus.frames * prof_end as u64 / est_end.max(1)).min(prof_end as u64) as u8;
                 if pct > last_pct {
                     last_pct = pct;
-                    progress(pct);
+                    let msg = match (audio_from, m.bus.frames) {
+                        (None, f) if f < 90 => "powering on the cartridge\u{2026}",
+                        (None, _) => "running the intro, listening for the soundtrack\u{2026}",
+                        (Some(_), _) => "soundtrack heard \u{2014} studying how it plays\u{2026}",
+                    };
+                    progress(pct, msg);
                 }
             }
             // Seed observed control-transfer targets in IWRAM and ROM.
@@ -1889,6 +1909,10 @@ fn build_dylib(
             }
         }
         println!("profiled {} RAM entry points over {} frames", seeds.len(), m.bus.frames);
+        progress(
+            prof_end,
+            &format!("test drive done \u{2014} {} live code paths spotted", seeds.len()),
+        );
         (seeds.into_iter().collect::<Vec<u32>>(), m.bus.ewram.clone(), m.bus.iwram.clone())
     };
 
@@ -1944,10 +1968,14 @@ run play/runc --record-labels to capture one"
         ewram: if ram && ewram_xlat { Some(&ewram) } else { None },
         iwram: if !iwram.is_empty() { Some(&iwram) } else { None },
     };
+    progress(prof_end + 1, "charting every reachable code path\u{2026}");
     let analysis = analyze::analyze(&view, &seeds);
     let n_instrs: usize = analysis.blocks.iter().map(|b| b.instrs.len()).sum();
     println!("blocks: {} instructions: {n_instrs}", analysis.blocks.len());
-    progress(22);
+    progress(
+        prof_end + 2,
+        &format!("map drawn: {} code blocks to translate", analysis.blocks.len()),
+    );
 
     let prefix = lib_path.strip_suffix(".dylib").unwrap_or(lib_path);
 
@@ -1957,16 +1985,52 @@ run play/runc --record-labels to capture one"
     // the machine). 16 MB of C keeps each cc invocation modest.
     const MAX_UNIT: usize = 16 << 20;
     let total_blocks = analysis.blocks.len().max(1);
+    // Unit-count estimate up front (measured ~150 bytes of C per
+    // instruction), so the compile labels can say "part 2 of ~9".
+    let est_units = (n_instrs as u64 * 150 / MAX_UNIT as u64 + 1).max(1);
+    let span_start = prof_end + 2;
+    let span = 96 - span_start as u64;
     let mut objs: Vec<String> = Vec::new();
+    let mut prev_done = 0usize;
     let chunks = emit::emit_c_chunked(&analysis, &view, MAX_UNIT, |c, blocks_done| {
         let i = objs.len();
+        let p0 = span_start + (prev_done as u64 * span / total_blocks as u64) as u8;
+        let p1 = span_start + (blocks_done as u64 * span / total_blocks as u64) as u8;
+        prev_done = blocks_done;
         let c_path = format!("{prefix}.{i}.c");
         let o_path = format!("{prefix}.{i}.o");
         std::fs::write(&c_path, c).map_err(|e| e.to_string())?;
-        let status = std::process::Command::new("cc")
+        // Compiling dominates the build, so the bar keeps moving while
+        // cc works: poll the child and ease through this unit's span
+        // against a size-based time estimate (measured ~0.7 MB of C
+        // per second), never claiming the unit done early.
+        let mut child = std::process::Command::new("cc")
             .args(["-O1", "-c", "-o", &o_path, &c_path])
-            .status()
+            .spawn()
             .map_err(|e| format!("cc: {e}"))?;
+        let est_secs = (c.len() as f64 / 700_000.0).max(1.0);
+        let t0 = std::time::Instant::now();
+        let mut spin = 0usize;
+        let status = loop {
+            match child.try_wait().map_err(|e| format!("cc: {e}"))? {
+                Some(st) => break st,
+                None => {
+                    let frac = (t0.elapsed().as_secs_f64() / est_secs).min(0.95);
+                    let pct = p0 + ((p1.saturating_sub(p0)) as f64 * frac) as u8;
+                    let dots = ["\u{2026}", "\u{2026}\u{2026}", "\u{2026}\u{2026}\u{2026}"][spin % 3];
+                    spin += 1;
+                    progress(
+                        pct,
+                        &format!(
+                            "forging native code \u{2014} part {} of ~{}{dots}",
+                            i + 1,
+                            est_units.max(i as u64 + 1)
+                        ),
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(250));
+                }
+            }
+        };
         // Triage: keep the emitted C around for inspection.
         if std::env::var_os("RECOMP_KEEP_C").is_none() {
             let _ = std::fs::remove_file(&c_path);
@@ -1975,11 +2039,11 @@ run play/runc --record-labels to capture one"
             return Err(format!("cc failed on {c_path}"));
         }
         objs.push(o_path);
-        // Compiling dominates the build: it spans 22..=96 of the report.
-        progress(22 + (blocks_done * 74 / total_blocks) as u8);
+        progress(p1, &format!("{blocks_done} of {total_blocks} blocks translated"));
         Ok(())
     })?;
 
+    progress(97, "linking it all together\u{2026}");
     let status = std::process::Command::new("cc")
         .arg("-shared")
         .arg("-o")
@@ -1993,7 +2057,7 @@ run play/runc --record-labels to capture one"
     if !status.success() {
         return Err("link failed".into());
     }
-    progress(100);
+    progress(100, "ready to play");
     println!("wrote {lib_path} ({chunks} units)");
     Ok(())
 }
@@ -2389,6 +2453,18 @@ the local iwram snapshot is never exported)",
         }
         other => Err(format!("unknown labels subcommand {other:?}; {USAGE}")),
     }
+}
+
+/// Single-line terminal build progress: bar, percent, phase label.
+fn term_progress(pct: u8, msg: &str) {
+    use std::io::Write;
+    let filled = pct as usize * 28 / 100;
+    eprint!(
+        "\r\x1b[K  [{}{}] {pct:>3}%  {msg}",
+        "\u{25a0}".repeat(filled),
+        "\u{00b7}".repeat(28 - filled)
+    );
+    let _ = std::io::stderr().flush();
 }
 
 /// SHA-256 of the image, hex — the cross-tool image identity.
