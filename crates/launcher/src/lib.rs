@@ -5,7 +5,7 @@
 //! `android-native-activity` feature).
 
 mod app;
-mod assets;
+pub mod assets;
 mod platform;
 mod screens;
 mod theme;

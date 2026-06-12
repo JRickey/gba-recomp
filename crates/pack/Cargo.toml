@@ -13,3 +13,7 @@ path = "src/main.rs"
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 sha2 = "0.11.0"
+# Icon embedding: decode a packager-supplied PNG master and re-encode
+# per-size PNGs for the platform icon containers (.icns / .ico / .png).
+# Pure-Rust backend (miniz_oxide); MIT OR Apache-2.0.
+flate2 = "1"

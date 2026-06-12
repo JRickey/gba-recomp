@@ -9,6 +9,14 @@ description = "Frontend launcher: cartridge selection, input setup, A/V settings
 name = "gba_launcher"
 crate-type = ["lib", "cdylib"]
 
+# Committed dev tool: renders the canonical app-icon master PNG procedurally
+# (assets/icon/app-icon.png). Run `cargo run -p gba-launcher --bin gba-icon`
+# to regenerate it. Keeps the launcher's "zero bundled image assets" ethos:
+# the one committed PNG is a build artifact of code that lives in the repo.
+[[bin]]
+name = "gba-icon"
+path = "src/bin/gba-icon.rs"
+
 [features]
 # Android build (cdylib through the NativeActivity glue):
 #   cargo build --target aarch64-linux-android --features android-native-activity
@@ -17,6 +25,7 @@ android-native-activity = ["eframe/android-native-activity"]
 [dependencies]
 dirs = "6.0.0"
 eframe = "0.34.3"
+flate2 = "1"  # PNG IDAT compression for the gba-icon master generator
 gilrs = "0.11.2"
 input-config = { version = "0.2.0", path = "../input-config" }
 screen = { version = "0.2.0", path = "../screen", default-features = false }

@@ -1440,6 +1440,7 @@ version = "0.2.0"
 dependencies = [
  "dirs",
  "eframe",
+ "flate2",
  "gilrs",
  "input-config",
  "rfd",
@@ -1452,6 +1453,7 @@ dependencies = [
 name = "gba-pack"
 version = "0.2.0"
 dependencies = [
+ "flate2",
  "serde",
  "sha2",
  "toml",

@@ -31,6 +31,13 @@ pub struct Package {
     /// Target platforms; the trio is the default and the promise.
     #[serde(default = "default_platforms")]
     pub platforms: Vec<Platform>,
+    /// Optional executable icon: a square PNG master, ideally 1024×1024
+    /// (no smaller than 256×256 — every platform format is derived from
+    /// it). Relative paths resolve against this config file's directory,
+    /// like `labels.file`. When absent the canonical launcher icon is
+    /// used so the package still reads as part of the product family.
+    #[serde(default)]
+    pub icon: Option<PathBuf>,
 }
 
 #[derive(Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
@@ -172,6 +179,24 @@ impl PackConfig {
                 *f = dir.join(&f);
             }
         }
+        if let Some(icon) = cfg.package.icon.as_mut() {
+            if let (true, Some(dir)) = (icon.is_relative(), path.parent()) {
+                *icon = dir.join(&icon);
+            }
+            if !icon.is_file() {
+                return Err(format!("package.icon not found: {}", icon.display()));
+            }
+            // Validate it's actually a PNG by magic — a mislabeled JPEG or
+            // a .ico would silently break the per-platform conversion later.
+            let head = std::fs::read(&*icon)
+                .map_err(|e| format!("{}: {e}", icon.display()))?;
+            if !head.starts_with(&[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]) {
+                return Err(format!(
+                    "package.icon must be a PNG: {}",
+                    icon.display()
+                ));
+            }
+        }
         Ok(cfg)
     }
 }
@@ -186,6 +211,16 @@ mod tests {
         let p = dir.join(name);
         std::fs::write(&p, body).unwrap();
         p
+    }
+
+    /// Drop a tiny valid-headed PNG next to the configs and return its name.
+    fn write_png(name: &str) -> String {
+        let dir = std::env::temp_dir().join("gba-pack-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        // 8-byte PNG signature is all the loader checks; the rest is
+        // exercised at build time by the real encoder/decoder.
+        std::fs::write(dir.join(name), [0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]).unwrap();
+        name.to_string()
     }
 
     #[test]
@@ -204,6 +239,50 @@ mod tests {
         assert!(c.runtime.menu && c.runtime.enhanced_audio && c.runtime.screen_sim);
         assert_eq!(c.runtime.engine_hle, EngineHle::Auto);
         assert!(c.output.binary && !c.output.c_source);
+        assert!(c.package.icon.is_none());
+    }
+
+    #[test]
+    fn icon_field_resolves_and_validates() {
+        let png = write_png("game-icon.png");
+        let ok = write(
+            "icon-ok.toml",
+            &format!(
+                "[package]\nname = \"demo\"\nicon = \"{png}\"\n\
+[image]\nrom-sha256 = \"{0}\"\nbios-sha256 = \"{0}\"\n",
+                "a".repeat(64),
+            ),
+        );
+        let c = PackConfig::load(&ok).unwrap();
+        let icon = c.package.icon.unwrap();
+        assert!(icon.is_absolute(), "relative icon should resolve against config dir");
+        assert!(icon.is_file());
+
+        // Missing file is rejected.
+        let missing = write(
+            "icon-missing.toml",
+            &format!(
+                "[package]\nname = \"demo\"\nicon = \"nope.png\"\n\
+[image]\nrom-sha256 = \"{0}\"\nbios-sha256 = \"{0}\"\n",
+                "a".repeat(64),
+            ),
+        );
+        assert!(PackConfig::load(&missing).is_err());
+
+        // Present but not a PNG is rejected.
+        let _notpng = {
+            let dir = std::env::temp_dir().join("gba-pack-test");
+            std::fs::write(dir.join("notpng.png"), b"GIF89a not really").unwrap();
+        };
+        let bad = write(
+            "icon-notpng.toml",
+            &format!(
+                "[package]\nname = \"demo\"\nicon = \"notpng.png\"\n\
+[image]\nrom-sha256 = \"{0}\"\nbios-sha256 = \"{0}\"\n",
+                "a".repeat(64),
+            ),
+        );
+        assert!(PackConfig::load(&bad).is_err());
     }
 
     #[test]
