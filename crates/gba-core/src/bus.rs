@@ -57,4 +57,11 @@ pub trait Bus {
     /// Called after an HLE'd SWI completes — steps the BIOS
     /// read-protection value on buses that model it.
     fn note_swi_returned(&mut self) {}
+
+    /// Called with the fetch address before every instruction fetch.
+    /// Buses executing a real BIOS image use it to track whether the
+    /// CPU is inside the BIOS (region-0 reads return real bytes only
+    /// then) and to keep the read-protection value at the last-fetched
+    /// BIOS opcode, exactly like hardware.
+    fn note_fetch(&mut self, _pc: u32) {}
 }

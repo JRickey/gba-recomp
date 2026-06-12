@@ -464,7 +464,8 @@ fn emit_block(out: &mut String, b: &Block, view: &crate::analyze::View, chain: O
     // or overwritten code falls back to the interpreter instead of
     // running stale natives. First/last-word checks proved insufficient:
     // overlays routinely share prologue/epilogue words.
-    if region != 8 {
+    // ROM and BIOS (region 0) are fixed images: no guard.
+    if region != 8 && region != 0 {
         let last = b.instrs.last().unwrap();
         let len = last.addr.wrapping_add(last.size()).wrapping_sub(b.addr);
         match view.bytes(b.addr, len as usize) {
@@ -558,7 +559,12 @@ fn emit_block(out: &mut String, b: &Block, view: &crate::analyze::View, chain: O
                 cx.out.push_str(close);
                 return;
             }
-            Op::Bx { rm } if instr.cond == Cond::Al => {
+            // BIOS (region 0) blocks shell their indirect exits instead:
+            // the protection value (`bios_open`) must equal the last
+            // fetched BIOS opcode when control leaves the BIOS, and the
+            // interp shell's fetch hook maintains it exactly. Branches
+            // stay native (they are intra-BIOS).
+            Op::Bx { rm } if instr.cond == Cond::Al && region != 0 => {
                 cx.cycles += cost;
                 cx.flush_ticks();
                 let t = cx.reg(rm, instr);
@@ -571,7 +577,7 @@ fn emit_block(out: &mut String, b: &Block, view: &crate::analyze::View, chain: O
             }
             // pop {.., pc} (no state switch on v4T).
             Op::BlockMem { load: true, rn, rlist, pre: false, up: true, s_bit: false, writeback: true }
-                if instr.cond == Cond::Al && rlist & (1 << PC) != 0 && rn != PC =>
+                if instr.cond == Cond::Al && rlist & (1 << PC) != 0 && rn != PC && region != 0 =>
             {
                 cx.cycles += cost;
                 cx.flush_ticks();

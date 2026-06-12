@@ -16,6 +16,16 @@ pub fn pick_rom() -> Option<PathBuf> {
         .pick_file()
 }
 
+/// Open the system file picker for a BIOS image (first-launch setup).
+#[cfg(not(target_os = "android"))]
+pub fn pick_bios() -> Option<PathBuf> {
+    rfd::FileDialog::new()
+        .set_title("Select BIOS image (16 KB)")
+        .add_filter("BIOS image", &["bin", "rom"])
+        .add_filter("All files", &["*"])
+        .pick_file()
+}
+
 /// Per-user config/state directory (created on first use).
 pub fn config_dir() -> Option<PathBuf> {
     let dir = dirs::config_dir()?.join("gba-recomp");
@@ -50,12 +60,17 @@ fn recomp_bin() -> Result<PathBuf, String> {
 /// and stderr the runtime's diagnostics; both are piped so the launcher
 /// can reflect the session's real state instead of guessing.
 #[cfg(not(target_os = "android"))]
-pub fn launch(rom: &Path) -> Result<std::process::Child, String> {
+pub fn launch(rom: &Path, bios: Option<&Path>) -> Result<std::process::Child, String> {
     let bin = recomp_bin()?;
-    std::process::Command::new(&bin)
-        .arg("play")
-        .arg("--status")
-        .arg(rom)
+    let mut cmd = std::process::Command::new(&bin);
+    cmd.arg("play").arg("--status");
+    // Pass the resolved BIOS explicitly: play would find it again via the
+    // same shared lookup, but the launcher validated *this* file — the
+    // session must boot what the user was told it would boot.
+    if let Some(b) = bios {
+        cmd.arg("--bios").arg(b);
+    }
+    cmd.arg(rom)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
@@ -74,8 +89,13 @@ pub fn pick_rom() -> Option<PathBuf> {
     None
 }
 
+#[cfg(target_os = "android")]
+pub fn pick_bios() -> Option<PathBuf> {
+    None
+}
+
 /// Android: no play runtime is built for this target yet.
 #[cfg(target_os = "android")]
-pub fn launch(_rom: &Path) -> Result<std::process::Child, String> {
+pub fn launch(_rom: &Path, _bios: Option<&Path>) -> Result<std::process::Child, String> {
     Err("the play runtime is not available on this platform yet".into())
 }

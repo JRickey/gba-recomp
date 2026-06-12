@@ -298,6 +298,12 @@ pub fn av_path() -> Option<PathBuf> {
 /// `<config dir>/gba-recomp/input.cfg`, resolved per-platform without
 /// pulling in a dependency.
 pub fn default_path() -> Option<PathBuf> {
+    Some(config_root()?.join("input.cfg"))
+}
+
+/// `<config dir>/gba-recomp`, the per-user config/state directory,
+/// resolved per-platform without pulling in a dependency.
+pub fn config_root() -> Option<PathBuf> {
     let base = if cfg!(target_os = "macos") {
         PathBuf::from(std::env::var_os("HOME")?).join("Library/Application Support")
     } else if cfg!(windows) {
@@ -308,7 +314,105 @@ pub fn default_path() -> Option<PathBuf> {
             _ => PathBuf::from(std::env::var_os("HOME")?).join(".config"),
         }
     };
-    Some(base.join("gba-recomp").join("input.cfg"))
+    Some(base.join("gba-recomp"))
+}
+
+// ── BIOS image (real-BIOS boot) ─────────────────────────────────────
+//
+// The product boots the real BIOS: the launcher collects the user's
+// dump once (first-launch setup), installs it where the whole release
+// can find it, and the play runtime recompiles it alongside each
+// cartridge. No image installed = the runtime falls back to BIOS HLE.
+
+/// Canonical on-disk name for the installed BIOS image. Lowercase and
+/// used verbatim everywhere — Linux filesystems are case-sensitive, so
+/// resolution and install must never disagree on case.
+pub const BIOS_FILE_NAME: &str = "gba_bios.bin";
+
+/// Expected image size: the BIOS mask ROM is exactly 16 KB.
+pub const BIOS_SIZE: usize = 0x4000;
+
+/// SHA-256 of the canonical BIOS dump. Other images (homebrew
+/// replacements, bad dumps) are warned about loudly but still tried —
+/// the user owns the choice.
+pub const BIOS_SHA256: &str =
+    "fd2547724b505f487e6dcb29ec2ecff3af35a841a77ab2e85fd87350abd36570";
+
+/// Directory of the running executable — the "release directory" for
+/// portable installs. The exe path is canonicalized first so symlinked
+/// launches (Linux desktop entries, dev shims) resolve to the real
+/// install directory rather than the symlink's.
+pub fn exe_dir() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let exe = std::fs::canonicalize(&exe).unwrap_or(exe);
+    exe.parent().map(|d| d.to_path_buf())
+}
+
+/// Locate the installed BIOS image. Resolution order:
+/// 1. `$GBA_RECOMP_BIOS` (explicit override, dev/CI),
+/// 2. next to the executable (portable release directory),
+/// 3. the per-user config directory (fallback installs — read-only
+///    release dirs like /Applications or Program Files).
+pub fn find_bios() -> Option<PathBuf> {
+    if let Some(v) = std::env::var_os("GBA_RECOMP_BIOS") {
+        if !v.is_empty() {
+            let p = PathBuf::from(v);
+            if p.is_file() {
+                return Some(p);
+            }
+        }
+    }
+    if let Some(dir) = exe_dir() {
+        let p = dir.join(BIOS_FILE_NAME);
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    let p = config_root()?.join(BIOS_FILE_NAME);
+    p.is_file().then_some(p)
+}
+
+/// Install a user-selected BIOS image where `find_bios` will see it.
+/// Prefers the release directory (portable layout: the whole product
+/// travels as one folder); falls back to the per-user config directory
+/// when the release directory isn't writable — macOS app translocation
+/// and /Applications, Windows Program Files, system-wide Linux installs.
+/// The copy is staged to a temp file and renamed so a crash mid-write
+/// can never leave a torn image at the resolved name.
+pub fn install_bios(src: &std::path::Path) -> Result<PathBuf, String> {
+    let bytes = std::fs::read(src).map_err(|e| format!("{}: {e}", src.display()))?;
+    if bytes.len() != BIOS_SIZE {
+        return Err(format!(
+            "{}: expected a {BIOS_SIZE}-byte BIOS image, got {} bytes",
+            src.display(),
+            bytes.len()
+        ));
+    }
+    let mut targets = Vec::new();
+    if let Some(dir) = exe_dir() {
+        targets.push(dir.join(BIOS_FILE_NAME));
+    }
+    if let Some(dir) = config_root() {
+        targets.push(dir.join(BIOS_FILE_NAME));
+    }
+    let mut last_err = "no writable install location".to_string();
+    for dest in targets {
+        if let Some(dir) = dest.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        // Same-directory temp + rename: atomic on POSIX, and never
+        // crosses a volume boundary (fs::rename can't).
+        let tmp = dest.with_extension("bin.tmp");
+        let write = std::fs::write(&tmp, &bytes).and_then(|_| std::fs::rename(&tmp, &dest));
+        match write {
+            Ok(()) => return Ok(dest),
+            Err(e) => {
+                let _ = std::fs::remove_file(&tmp);
+                last_err = format!("{}: {e}", dest.display());
+            }
+        }
+    }
+    Err(format!("could not install BIOS image ({last_err})"))
 }
 
 #[cfg(test)]
@@ -343,6 +447,16 @@ mod tests {
             cfg,
             "unknown keys keep defaults"
         );
+    }
+
+    #[test]
+    fn install_bios_rejects_wrong_size() {
+        let dir = std::env::temp_dir();
+        let src = dir.join("gba-recomp-test-not-a-bios.bin");
+        std::fs::write(&src, vec![0u8; 123]).unwrap();
+        let err = install_bios(&src).unwrap_err();
+        assert!(err.contains("16384-byte"), "got: {err}");
+        let _ = std::fs::remove_file(&src);
     }
 
     #[test]

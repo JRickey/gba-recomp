@@ -1444,6 +1444,7 @@ dependencies = [
  "input-config",
  "rfd",
  "screen",
+ "sha2",
  "winit",
 ]
 

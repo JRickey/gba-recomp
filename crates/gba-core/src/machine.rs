@@ -48,6 +48,16 @@ impl Machine {
         }
     }
 
+    /// A machine that executes a real BIOS image instead of the HLE:
+    /// boots from the reset vector in SVC mode, SWIs vector to 0x08,
+    /// IRQs vector to 0x18 — no BIOS HLE anywhere.
+    pub fn new_with_bios(rom: Vec<u8>, bios: &[u8]) -> Machine {
+        let mut m = Machine::new(rom);
+        m.bus.load_bios(bios);
+        m.cpu.reset_hard_boot();
+        m
+    }
+
     /// Execute one instruction (or service interrupt machinery).
     pub fn step(&mut self) -> StepEvent {
         // Wake from Halt when any enabled interrupt is latched (IME ignored).
@@ -60,14 +70,22 @@ impl Machine {
             }
         }
 
-        // HLE BIOS IRQ return stub.
-        if self.cpu.regs[15] == IRQ_RETURN_ADDR && self.cpu.mode() == Mode::Irq {
+        // HLE BIOS IRQ return stub (real-BIOS mode executes the actual
+        // dispatcher at this address instead).
+        if !self.bus.real_bios
+            && self.cpu.regs[15] == IRQ_RETURN_ADDR
+            && self.cpu.mode() == Mode::Irq
+        {
             self.irq_epilogue();
             return StepEvent::Idle;
         }
 
         if self.bus.irq_pending() && !self.cpu.flag(FLAG_I) {
-            self.dispatch_irq();
+            if self.bus.real_bios {
+                self.enter_irq_real();
+            } else {
+                self.dispatch_irq();
+            }
             return StepEvent::Idle;
         }
 
@@ -95,9 +113,37 @@ impl Machine {
         }
 
         let region = (self.cpu.regs[15] >> 24) as usize & 0xF;
-        let instr = exec::step_hle_cached(&mut self.cpu, &mut self.bus, &mut self.decode_cache);
+        let instr = if self.bus.real_bios {
+            exec::step_cached(&mut self.cpu, &mut self.bus, &mut self.decode_cache)
+        } else {
+            exec::step_hle_cached(&mut self.cpu, &mut self.bus, &mut self.decode_cache)
+        };
         self.bus.tick(instr_cost(region, &instr));
         StepEvent::Instr(instr)
+    }
+
+    /// Real-BIOS IRQ delivery: take the exception exactly as hardware
+    /// does and let the BIOS dispatcher at 0x18 run as guest code.
+    fn enter_irq_real(&mut self) {
+        {
+            static TRACE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+            if *TRACE.get_or_init(|| std::env::var_os("RECOMP_TRACE_IOW").is_some()) {
+                eprintln!(
+                    "IRQDISPATCH f={} line={} if={:04x} (real bios)",
+                    self.bus.frames,
+                    self.bus.scanline(),
+                    self.bus.reg_if
+                );
+            }
+        }
+        // lr_irq such that `subs pc, lr, #4` resumes at the interrupted
+        // instruction (regs[15] is the next fetch address).
+        let return_lr = self.cpu.regs[15].wrapping_add(4);
+        self.cpu
+            .enter_exception(crate::cpu::Exception::Irq, return_lr);
+        let target = self.cpu.branch.take().unwrap_or(0x18);
+        self.cpu.regs[15] = target & !3;
+        self.bus.tick(3); // exception entry (2S + 1N)
     }
 
     /// Run until the next completed frame (or a step budget runs out).
@@ -273,6 +319,53 @@ mod tests {
         }
         assert_eq!(m.cpu.mode(), Mode::Sys);
         assert_eq!(m.cpu.regs[15], 0x0800_0000);
+    }
+
+    /// Real-BIOS mode: boot from the reset vector, hand off to the cart,
+    /// vector a SWI into actual BIOS code (which must read its own
+    /// bytes), return via `movs pc, lr`, and leave the read-protection
+    /// value at the last BIOS opcode fetched.
+    #[test]
+    fn real_bios_boot_and_swi_round_trip() {
+        let mut bios = vec![0u8; 0x4000];
+        let put = |b: &mut [u8], addr: usize, w: u32| {
+            b[addr..addr + 4].copy_from_slice(&w.to_le_bytes());
+        };
+        put(&mut bios, 0x00, 0xEA00_000E); // reset: b 0x40
+        put(&mut bios, 0x08, 0xEA00_003C); // swi vector: b 0x100
+        // boot code: ldr r0, =0x08000000 ; bx r0
+        put(&mut bios, 0x40, 0xE59F_0000);
+        put(&mut bios, 0x44, 0xE12F_FF10);
+        put(&mut bios, 0x48, 0x0800_0000);
+        // swi handler: ldr r1, =0x03000000 ; mov r2, #0x77 ;
+        //              str r2, [r1] ; movs pc, lr
+        put(&mut bios, 0x100, 0xE59F_1008);
+        put(&mut bios, 0x104, 0xE3A0_2077);
+        put(&mut bios, 0x108, 0xE581_2000);
+        put(&mut bios, 0x10C, 0xE1B0_F00E);
+        put(&mut bios, 0x110, 0x0300_0000);
+        // What the pipeline has prefetched (+8) while the `movs pc, lr`
+        // return executes — the post-SWI protection value.
+        put(&mut bios, 0x114, 0xCAFE_F00D);
+
+        let mut rom = vec![0u8; 16];
+        rom[0..4].copy_from_slice(&0xEF00_0000u32.to_le_bytes()); // swi 0
+        rom[4..8].copy_from_slice(&0xEAFF_FFFEu32.to_le_bytes()); // b .
+
+        let mut m = Machine::new_with_bios(rom, &bios);
+        assert_eq!(m.cpu.regs[15], 0);
+        assert_eq!(m.cpu.mode(), Mode::Svc);
+
+        for _ in 0..32 {
+            m.step();
+        }
+        // The SWI handler ran from real BIOS bytes...
+        assert_eq!(m.bus.read32(0x0300_0000), 0x77);
+        // ...control returned to the cart (parked on `b .`)...
+        assert_eq!(m.cpu.regs[15], 0x0800_0004);
+        // ...and from outside the BIOS, region-0 reads return the last
+        // BIOS prefetch: +8 past the `movs pc, lr` return at 0x10C.
+        assert_eq!(m.bus.read32(0x0), 0xCAFE_F00D);
     }
 
     #[test]

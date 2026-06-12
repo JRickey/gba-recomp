@@ -82,12 +82,12 @@ compile time and rejected.
 
 | Command | Purpose |
 |---|---|
-| `recomp build <rom> [--ram]` | Translate to a native shared library in `out/`. `--ram` adds a short profiling run that discovers RAM-resident code and computed-branch targets, then bakes them in (recommended; this is what `play` uses). |
-| `recomp play <rom> [--interp] [--stats] [--status]` | Windowed play. First launch auto-translates into the cache (one-time, progress printed); `--interp` forces the interpreter; `--stats` prints perf readouts; `--status` emits machine-readable lifecycle lines (used by the launcher). |
-| `recomp runc <rom> [--frames N] [--out img.ppm]` | Headless run of the recompiled output from `out/`. |
-| `recomp verify <rom> [--frames N] [--reuse] [--dump prefix]` | Differential check: interpreter vs recompiled frame hash; prints `MATCH`/`MISMATCH`. `--reuse` skips the rebuild, `--dump` writes both final frames. |
-| `recomp run <rom> [--max-steps N] [--trace] [--hist]` | Headless interpreter run; `--hist` prints a hot-PC histogram. |
-| `recomp frames <rom> [--frames N] [--out img.ppm] [--keys MASK] [--demo] [--sav file]` | Headless boot to frame N; prints frame hash and boot diagnostics. `--demo` taps Start/A periodically; `--sav` preloads a save. |
+| `recomp build <rom> [--ram] [--bios file]` | Translate to a native shared library in `out/`. `--ram` adds a short profiling run that discovers RAM-resident code and computed-branch targets, then bakes them in (recommended; this is what `play` uses). `--bios` also recompiles a real 16 KB BIOS image (region 0, no BIOS HLE) into `out/<stem>-bios.dylib`. |
+| `recomp play <rom> [--interp] [--stats] [--status] [--bios file] [--no-bios]` | Windowed play. Boots the real BIOS when an image is installed (see below), BIOS HLE otherwise. First launch auto-translates into the cache (one-time, progress printed); `--interp` forces the interpreter; `--stats` prints perf readouts; `--status` emits machine-readable lifecycle lines (used by the launcher). |
+| `recomp runc <rom> [--frames N] [--out img.ppm] [--bios file]` | Headless run of the recompiled output from `out/`. |
+| `recomp verify <rom> [--frames N] [--reuse] [--dump prefix] [--bios file]` | Differential check: interpreter vs recompiled frame hash; prints `MATCH`/`MISMATCH`. `--reuse` skips the rebuild, `--dump` writes both final frames, `--bios` verifies under a real recompiled BIOS on both sides. |
+| `recomp run <rom> [--max-steps N] [--trace] [--hist] [--bios file]` | Headless interpreter run; `--hist` prints a hot-PC histogram. |
+| `recomp frames <rom> [--frames N] [--out img.ppm] [--keys MASK] [--demo] [--sav file] [--bios file]` | Headless boot to frame N; prints frame hash and boot diagnostics. `--demo` taps Start/A periodically; `--sav` preloads a save. |
 | `recomp dis <rom> [--addr HEX] [--count N] [--thumb]` | Disassemble at an address. |
 | `recomp entry-scan <dir>` | Validate entry decoding across a directory of images. |
 | `recomp mp2k-scan <rom\|dir>`, `recomp engine-scan <rom\|dir>` | Audio-engine detection reports (developer tools for the HLE shadow mixers). |
@@ -128,6 +128,16 @@ content guards keep execution correct if the game later swaps that
 memory (the snapshot stays on your machine — shared label files carry
 addresses only, so a recipient records their own snapshot by playing).
 `ewram` records are reserved and currently skipped.
+
+**BIOS image (real-BIOS boot).** `play` boots the user's real BIOS dump
+when one is installed, recompiling it alongside the cartridge (real-BIOS
+translations carry a `-b<bios-sha prefix>` cache suffix so they never
+shadow HLE builds). Resolution order: `$GBA_RECOMP_BIOS`, then
+`gba_bios.bin` next to the executable (portable release layout), then
+`<config_dir>/gba-recomp/gba_bios.bin`. The launcher's first-launch setup
+collects the dump and installs it (release directory preferred, config
+directory when that's read-only). No image installed = BIOS HLE, exactly
+the previous behavior; `--no-bios` forces HLE.
 
 ### `gba-launcher` — the frontend
 
