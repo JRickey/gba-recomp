@@ -57,31 +57,7 @@ pub struct RdrvSig {
 }
 
 pub fn detect(rom: &[u8]) -> Option<RdrvSig> {
-    find(rom, &NOTE_ON_SIG).map(|pos| RdrvSig { blob_rom_off: pos })
-}
-
-fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
-    if hay.len() < needle.len() {
-        return None;
-    }
-    let first = needle[0];
-    let mut i = 0;
-    while i + needle.len() <= hay.len() {
-        match hay[i..].iter().position(|&b| b == first) {
-            Some(o) => {
-                i += o;
-                if i + needle.len() > hay.len() {
-                    return None;
-                }
-                if &hay[i..i + needle.len()] == needle {
-                    return Some(i);
-                }
-                i += 1;
-            }
-            None => return None,
-        }
-    }
-    None
+    crate::engine::find(rom, &NOTE_ON_SIG, 0).map(|pos| RdrvSig { blob_rom_off: pos })
 }
 
 /// One shadowed voice. `pos` is an absolute guest byte address (s8 PCM,
@@ -229,7 +205,7 @@ impl RdrvHle {
         if self.engage_backoff % 16 != 0 {
             return;
         }
-        let Some(off) = find(mem.iwram, &NOTE_ON_SIG) else {
+        let Some(off) = crate::engine::find(mem.iwram, &NOTE_ON_SIG, 0) else {
             return;
         };
         let blob = 0x0300_0000 + off as u32;
@@ -344,14 +320,14 @@ impl RdrvHle {
                 } else {
                     let ch = (grp as u32) & 0xF;
                     let cv = mem.u8(self.lay.chanvol + ch).unwrap_or(0) as u32;
-                    let mut g = tunevol * (cv + 1) >> 7;
+                    let mut g = (tunevol * (cv + 1)) >> 7;
                     if self.lay.chanvol2 != 0 {
                         let cv2 = mem.u8(self.lay.chanvol2 + ch).unwrap_or(0x80) as u32;
-                        g = g * cv2 >> 7;
+                        g = (g * cv2) >> 7;
                     }
                     g
                 };
-                g = g * vol >> 7;
+                g = (g * vol) >> 7;
                 g = ((g as u64 * env as u64) >> 19) as u32;
                 v.pos = pos as f64 + frac as f64 / 8388608.0;
                 v.guest_pos = v.pos;
@@ -408,7 +384,8 @@ impl RdrvHle {
             } else {
                 prev.step / self.mix_step
             };
-            if !(step > 0.0) {
+            // NaN/inf step must take this branch (skip the voice).
+            if !(step.is_finite() && step > 0.0) {
                 continue;
             }
             *r = prev;

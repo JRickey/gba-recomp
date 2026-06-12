@@ -457,7 +457,7 @@ impl Mp2kHle {
                 if stopping {
                     dead = true;
                     env_now = 0;
-                } else if {
+                } else {
                     // Diagnostic: note-on field values.
                     if std::env::var_os("RECOMP_MP2K_TRACE").is_some() {
                         eprintln!(
@@ -465,19 +465,20 @@ impl Mp2kHle {
                             self.hooks
                         );
                     }
-                    note_on(v, mem, ctype, count, wav, self.count_mode)
-                } {
-                    env_now = attack.min(0xFF);
-                    phase = 3;
-                    if env_now >= 0xFF {
-                        phase = 2;
+                    let started = note_on(v, mem, ctype, count, wav, self.count_mode);
+                    if started {
+                        env_now = attack.min(0xFF);
+                        phase = 3;
+                        if env_now >= 0xFF {
+                            phase = 2;
+                        }
+                        stopping = false;
+                        iec = false;
+                    } else {
+                        self.bad_waves += 1;
+                        dead = true;
+                        env_now = 0;
                     }
-                    stopping = false;
-                    iec = false;
-                } else {
-                    self.bad_waves += 1;
-                    dead = true;
-                    env_now = 0;
                 }
             } else if iec {
                 // Pseudo-echo hold: env holds at echoVolume. The guest
@@ -723,7 +724,7 @@ fn note_on(v: &mut Voice, mem: &MemView, ctype: u8, count: u32, wav: u32, count_
     // The full data range must be resolvable now — no per-sample
     // surprises later.
     let bytes = if compressed {
-        ((size as u64 * 33 + 63) / 64) as usize
+        (size as u64 * 33).div_ceil(64) as usize
     } else {
         size as usize
     };

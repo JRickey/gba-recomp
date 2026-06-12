@@ -298,7 +298,7 @@ fn huff_uncomp<B: Bus>(cpu: &mut Cpu, bus: &mut B) {
     let src = cpu.regs[0];
     let dst = cpu.regs[1];
     let header = bus.read32(src);
-    let unit_bits = (header & 0xF).max(1).min(8);
+    let unit_bits = (header & 0xF).clamp(1, 8);
     let size = (header >> 8) as usize;
     let tree_size = bus.read8(src + 4) as u32;
     let root = src + 5;

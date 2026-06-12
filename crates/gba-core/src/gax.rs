@@ -77,31 +77,7 @@ pub struct GaxV1Sig {
 }
 
 pub fn detect_v1(rom: &[u8]) -> Option<GaxV1Sig> {
-    find(rom, &CALC_NOTE_SIG).map(|pos| GaxV1Sig { calc_note_off: pos })
-}
-
-fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
-    if hay.len() < needle.len() {
-        return None;
-    }
-    let first = needle[0];
-    let mut i = 0;
-    while i + needle.len() <= hay.len() {
-        match hay[i..].iter().position(|&b| b == first) {
-            Some(o) => {
-                i += o;
-                if i + needle.len() > hay.len() {
-                    return None;
-                }
-                if &hay[i..i + needle.len()] == needle {
-                    return Some(i);
-                }
-                i += 1;
-            }
-            None => return None,
-        }
-    }
-    None
+    crate::engine::find(rom, &CALC_NOTE_SIG, 0).map(|pos| GaxV1Sig { calc_note_off: pos })
 }
 
 /// One rendered voice for the current window — chunk N played back
@@ -729,7 +705,8 @@ impl GaxHle {
                     }
                 }
             }
-            if !(step > 0.0) {
+            // NaN/inf step must take this branch (skip the voice).
+            if !(step.is_finite() && step > 0.0) {
                 continue;
             }
             v.pos = start;

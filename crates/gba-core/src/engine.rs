@@ -39,8 +39,9 @@ impl Engine {
 }
 
 /// First-byte-skip substring search (memchr + verify) — the needles
-/// are long enough that this is effectively linear.
-fn find(hay: &[u8], needle: &[u8], from: usize) -> Option<usize> {
+/// are long enough that this is effectively linear. Shared by the
+/// engine-HLE detectors (gax, rdrv).
+pub(crate) fn find(hay: &[u8], needle: &[u8], from: usize) -> Option<usize> {
     if needle.is_empty() || hay.len() < needle.len() {
         return None;
     }

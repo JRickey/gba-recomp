@@ -135,7 +135,8 @@ pub struct Apu {
     wave_acc: u32,
     wave_freq: u32,
     wave_shift: u8, // volume shift (0 = mute)
-    wave_bank: usize,
+    /// Bit 5 of SOUND3CNT_L: 64-sample mode (both banks back-to-back).
+    wave_dim64: bool,
     // Noise channel.
     noise_on: bool,
     noise_lfsr: u16,
@@ -190,7 +191,10 @@ impl Apu {
                 }
             }
             0x70 => {
-                self.wave_bank = ((value >> 6) & 1) as usize;
+                // Bit 6 (bank select) is handled bus-side: the visible
+                // window and the playing-bank shadow swap on a flip, so
+                // `wave_playing` always holds the playing bank's bytes.
+                self.wave_dim64 = value & 0x20 != 0;
                 if value & 0x80 == 0 {
                     self.wave_on = false;
                 }
@@ -236,12 +240,13 @@ impl Apu {
         }
     }
 
-    /// Produce one mixed PSG sample for `cycles` elapsed master-clock
-    /// cycles, reading wave RAM / master volume from the I/O backing store.
     /// Produce one (left, right) PSG sample pair for `cycles` elapsed
     /// master-clock cycles, honoring SOUNDCNT_L per-channel L/R enables
-    /// and master volumes, and the SOUNDCNT_H PSG ratio.
-    pub fn sample(&mut self, io: &[u8], cycles: u32) -> (i16, i16) {
+    /// and master volumes, and the SOUNDCNT_H PSG ratio. `wave_playing`
+    /// is the playing wave-RAM bank (the one NOT visible at 0x90; the
+    /// bus keeps it in a shadow); the visible window in `io` supplies
+    /// the second half in 64-sample mode.
+    pub fn sample(&mut self, io: &[u8], wave_playing: &[u8; 16], cycles: u32) -> (i16, i16) {
         // 64 Hz frame count since last sample (almost always 0 or 1).
         self.frame_acc += cycles;
         let frames64 = self.frame_acc / 262144;
@@ -255,25 +260,28 @@ impl Apu {
 
         if self.wave_on && self.wave_shift != 0 {
             // 2097152/(2048-f) Hz, 32 samples per period; area-averaged
-            // over the window like the squares.
+            // over the window like the squares. Samples 0-31 come from
+            // the playing bank; in 64-sample mode 32-63 continue into
+            // the other (window-visible) bank.
             let per = (8 * (2048 - self.wave_freq.min(2047))).max(8);
-            let bank_base = 0x90 + self.wave_bank * 0; // single-bank approx
+            let span = if self.wave_dim64 { 64 } else { 32 };
             let mut area: i32 = 0;
             let mut rem = cycles;
             while rem > 0 {
                 let take = per.saturating_sub(self.wave_acc).min(rem);
-                let byte = io[bank_base + self.wave_pos / 2];
-                let nib = if self.wave_pos & 1 == 0 {
-                    byte >> 4
+                let pos = self.wave_pos % span;
+                let byte = if pos < 32 {
+                    wave_playing[pos / 2]
                 } else {
-                    byte & 0xF
-                } as i32;
+                    io[0x90 + pos / 2 - 16]
+                };
+                let nib = if pos & 1 == 0 { byte >> 4 } else { byte & 0xF } as i32;
                 area += (nib - 8) * 16 * take as i32;
                 self.wave_acc += take;
                 rem -= take;
                 if self.wave_acc >= per {
                     self.wave_acc = 0;
-                    self.wave_pos = (self.wave_pos + 1) & 31;
+                    self.wave_pos = (pos + 1) % span;
                 }
             }
             let centered = area / cycles as i32;
@@ -338,5 +346,88 @@ impl Apu {
             ((left << 4) >> vol_shift) as i16,
             ((right << 4) >> vol_shift) as i16,
         )
+    }
+
+    /// SOUNDCNT_X bits 0-3: per-channel active flags (channel triggered
+    /// and not yet expired). Length expiry lands lazily at the sample
+    /// grid, which is finer than anything that polls these bits.
+    pub fn active(&self) -> u8 {
+        (self.sq[0].on as u8)
+            | (self.sq[1].on as u8) << 1
+            | (self.wave_on as u8) << 2
+            | (self.noise_on as u8) << 3
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Route channel 3 alone at full volume: each output sample is
+    /// (nibble - 8) * 256, so the played nibble stream reads back.
+    fn wave_setup(io: &mut [u8], apu: &mut Apu, ctl70: u8) {
+        io[0x80] = 0x77; // master volume 7 both sides
+        io[0x81] = 0x44; // channel 3 to both sides
+        io[0x82] = 0x02; // PSG ratio 100%
+        io[0x70] = ctl70;
+        apu.write8(io, 0x70, ctl70);
+        io[0x73] = 0x20; // wave volume 100%
+        apu.write8(io, 0x73, 0x20);
+        io[0x74] = 0xFF;
+        apu.write8(io, 0x74, 0xFF);
+        // Trigger with freq 0x7FF: 8 cycles per wave step.
+        io[0x75] = 0x87;
+        apu.write8(io, 0x75, 0x87);
+    }
+
+    fn next_nibble(apu: &mut Apu, io: &[u8], playing: &[u8; 16]) -> u8 {
+        (apu.sample(io, playing, 8).0 / 256 + 8) as u8
+    }
+
+    #[test]
+    fn wave_single_bank_plays_playing_bank_only() {
+        let mut io = vec![0u8; 0x400];
+        let mut apu = Apu::default();
+        let playing: [u8; 16] = [
+            0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF, 0x01, 0x23, 0x45, 0x67, 0x89, 0xAB,
+            0xCD, 0xEF,
+        ];
+        io[0x90..0xA0].fill(0x40); // idle bank: must never be heard
+        wave_setup(&mut io, &mut apu, 0x80);
+        let got: Vec<u8> = (0..33)
+            .map(|_| next_nibble(&mut apu, &io, &playing))
+            .collect();
+        let want: Vec<u8> = (0..33)
+            .map(|i| {
+                let b = playing[(i % 32) / 2];
+                if i % 2 == 0 {
+                    b >> 4
+                } else {
+                    b & 0xF
+                }
+            })
+            .collect();
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn wave_64_sample_mode_spans_both_banks() {
+        let mut io = vec![0u8; 0x400];
+        let mut apu = Apu::default();
+        let playing: [u8; 16] = [0x12; 16];
+        io[0x90..0xA0].fill(0x40);
+        wave_setup(&mut io, &mut apu, 0xA0); // bit 5: 64-sample mode
+        let got: Vec<u8> = (0..65)
+            .map(|_| next_nibble(&mut apu, &io, &playing))
+            .collect();
+        let want: Vec<u8> = (0..65)
+            .map(|i| match (i % 64 < 32, i % 2 == 0) {
+                (true, true) => 1,
+                (true, false) => 2,
+                (false, true) => 4,
+                (false, false) => 0,
+            })
+            .collect();
+        assert_eq!(got, want);
     }
 }

@@ -137,6 +137,14 @@ pub struct MemMap {
 
     /// KEYINPUT value (active-low; 0x3FF = nothing pressed).
     pub keys: u16,
+    /// KEYCNT condition edge tracker: the keypad IRQ raises when the
+    /// match condition transitions false -> true.
+    keypad_prev: bool,
+    /// Wave RAM idle-bank shadow: the window at 0x90-0x9F (in `io`)
+    /// shows the bank NOT selected for playback, so the playing bank's
+    /// 16 bytes live here. A SOUND3CNT_L write that flips bit 6 swaps
+    /// the two — click-free double-buffering, no data lost.
+    wave_shadow: [u8; 16],
 
     timers: [Timer; 4],
     dma: [Dma; 4],
@@ -261,6 +269,8 @@ impl MemMap {
             halted: false,
             intr_wait_armed: false,
             keys: 0x3FF,
+            keypad_prev: false,
+            wave_shadow: [0; 16],
             timers: [Timer::default(); 4],
             dma: [Dma::default(); 4],
             vline_start: 0,
@@ -404,7 +414,9 @@ impl MemMap {
             // the APU (SOUNDCNT_L), and the master enable (SOUNDCNT_X).
             // Each side then clips at the hardware's 10-bit rail — that
             // clip is canon audible behavior on hot mixes.
-            let (psg_l, psg_r) = self.apu.sample(&self.io, AUDIO_SAMPLE_CYCLES as u32);
+            let (psg_l, psg_r) =
+                self.apu
+                    .sample(&self.io, &self.wave_shadow, AUDIO_SAMPLE_CYCLES as u32);
             let cnt_h = u16::from_le_bytes([self.io[0x82], self.io[0x83]]);
             let a = (self.fifo_sample[0] as i32 * 64) >> ((cnt_h >> 2 & 1) ^ 1);
             let b = (self.fifo_sample[1] as i32 * 64) >> ((cnt_h >> 3 & 1) ^ 1);
@@ -598,6 +610,7 @@ impl MemMap {
             VPhase::LineEnd => {
                 self.vline_start += CYCLES_PER_SCANLINE;
                 self.vphase = VPhase::Hblank;
+                self.check_keypad();
                 let line = self.scanline();
                 let dispstat = self.io[(DISPSTAT & 0x3FF) as usize];
                 let vcount_setting = self.io[(DISPSTAT & 0x3FF) as usize + 1];
@@ -618,6 +631,28 @@ impl MemMap {
 
     pub fn raise_irq(&mut self, bits: u16) {
         self.reg_if |= bits;
+    }
+
+    /// Evaluate the KEYCNT match condition (bits 0-9 select, bit 14
+    /// IRQ enable, bit 15: 0 = any selected pressed, 1 = all selected
+    /// pressed; KEYINPUT is active-low) and raise the keypad IRQ on a
+    /// false -> true transition. Runs on KEYCNT writes and once per
+    /// scanline — `keys` is written directly by frontends, so there is
+    /// no write hook to piggyback on.
+    fn check_keypad(&mut self) {
+        let keycnt = u16::from_le_bytes([self.io[0x132], self.io[0x133]]);
+        let sel = keycnt & 0x3FF;
+        let pressed = !self.keys & 0x3FF;
+        let cond = if keycnt & 0x8000 != 0 {
+            sel != 0 && pressed & sel == sel
+        } else {
+            pressed & sel != 0
+        };
+        let met = keycnt & 0x4000 != 0 && cond;
+        if met && !self.keypad_prev {
+            self.raise_irq(irq::KEYPAD);
+        }
+        self.keypad_prev = met;
     }
 
     // ---- timers ----
@@ -757,9 +792,11 @@ impl MemMap {
         }
     }
 
+    /// Hardware FIFO depth is 32 bytes; a push to a full FIFO drops the
+    /// incoming byte.
     fn fifo_push(&mut self, f: usize, value: u8) {
         self.fifo_pushes[f] += 1;
-        if self.fifo[f].len() < 64 {
+        if self.fifo[f].len() < 32 {
             self.fifo[f].push_back(value as i8);
         }
     }
@@ -949,6 +986,13 @@ impl MemMap {
             }
             // PSG channel registers.
             x if (0x0400_0060..0x0400_0080).contains(&x) => {
+                // SOUND3CNT_L bit 6 flip: the playing bank and the
+                // window-visible bank trade places.
+                if x == 0x0400_0070 && (self.io[0x70] ^ value) & 0x40 != 0 {
+                    for i in 0..16 {
+                        std::mem::swap(&mut self.wave_shadow[i], &mut self.io[0x90 + i]);
+                    }
+                }
                 self.io[off as usize] = value;
                 self.apu.write8(&self.io, off as usize, value);
             }
@@ -958,7 +1002,7 @@ impl MemMap {
                 self.fifo_push(f, value);
             }
             // SOUNDCNT_H: FIFO reset bits (11/15) clear the queues.
-            x if x == 0x0400_0083 => {
+            0x0400_0083 => {
                 self.io[off as usize] = value;
                 if value & 0x08 != 0 {
                     self.fifo[0].clear();
@@ -966,6 +1010,11 @@ impl MemMap {
                 if value & 0x80 != 0 {
                     self.fifo[1].clear();
                 }
+            }
+            // KEYCNT: re-evaluate the keypad IRQ condition.
+            0x0400_0132 | 0x0400_0133 => {
+                self.io[off as usize] = value;
+                self.check_keypad();
             }
             // Affine BG reference points: request an accumulator reload.
             x if (0x0400_0028..0x0400_0030).contains(&x) => {
@@ -991,6 +1040,16 @@ impl MemMap {
             REG_IF => self.reg_if as u8,
             x if x == REG_IF + 1 => (self.reg_if >> 8) as u8,
             REG_IME => self.ime as u8,
+            // SOUNDCNT_X: bits 0-3 read back live PSG channel-active
+            // flags; with the master enable off everything reads clear.
+            0x0400_0084 => {
+                let master = self.io[0x84] & 0x80;
+                if master == 0 {
+                    0
+                } else {
+                    master | self.apu.active()
+                }
+            }
             x if (0x0400_0100..0x0400_0110).contains(&x) && (x % 4 < 2) => {
                 let i = ((x - 0x0400_0100) / 4) as usize;
                 let count = self.timer_read_count(i);
@@ -1086,7 +1145,9 @@ impl Bus for MemMap {
                         (self.bios_open >> ((addr & 3) * 8)) as u8
                     }
                 } else {
-                    0 // open bus (unmodeled)
+                    // Open bus: the floating bus carries the current
+                    // instruction prefetch, byte-laned by address.
+                    (self.bios_open >> ((addr & 3) * 8)) as u8
                 }
             }
             0x02 => self.ewram[(addr & 0x3_FFFF) as usize],
@@ -1124,7 +1185,8 @@ impl Bus for MemMap {
                 Some(flash) => flash.read(addr),
                 None => self.sram[(addr & 0xFFFF) as usize],
             },
-            _ => 0, // open bus (unmodeled)
+            // Open bus (see region 0): the last prefetched word.
+            _ => (self.bios_open >> ((addr & 3) * 8)) as u8,
         }
     }
 
@@ -1637,5 +1699,131 @@ mod tests {
         assert!(mem.frame_ready);
         assert_ne!(mem.reg_if & irq::VBLANK, 0);
         assert_eq!(mem.read8(0x0400_0004) & 1, 1); // vblank flag visible
+    }
+
+    #[test]
+    fn wave_ram_bank_flip_swaps_window() {
+        let mut mem = MemMap::new(vec![]);
+        mem.write8(0x0400_0070, 0x80);
+        for i in 0..16u32 {
+            mem.write8(0x0400_0090 + i, 0xA0 | i as u8);
+        }
+        // Flip the playing bank: the window now shows the previously
+        // hidden (zeroed) bank; the A pattern moved behind it.
+        mem.write8(0x0400_0070, 0xC0);
+        for i in 0..16u32 {
+            assert_eq!(mem.read8(0x0400_0090 + i), 0);
+            mem.write8(0x0400_0090 + i, 0xB0 | i as u8);
+        }
+        // Flip back: the A pattern reappears intact.
+        mem.write8(0x0400_0070, 0x80);
+        for i in 0..16u32 {
+            assert_eq!(mem.read8(0x0400_0090 + i), 0xA0 | i as u8);
+        }
+    }
+
+    #[test]
+    fn wave_plays_hidden_bank_after_flip() {
+        let mut mem = MemMap::new(vec![]);
+        mem.write8(0x0400_0084, 0x80); // master enable
+        mem.write8(0x0400_0080, 0x77); // PSG volume 7 both sides
+        mem.write8(0x0400_0081, 0x44); // channel 3 to both sides
+        mem.write8(0x0400_0082, 0x02); // PSG ratio 100%
+        mem.write8(0x0400_0070, 0x80);
+        for i in 0..16u32 {
+            mem.write8(0x0400_0090 + i, 0xFF); // fill the idle bank
+        }
+        mem.write8(0x0400_0070, 0xC0); // flip: that bank now plays
+        mem.write8(0x0400_0073, 0x20); // wave volume 100%
+        mem.write8(0x0400_0074, 0xFF);
+        mem.write8(0x0400_0075, 0x87); // trigger, freq 0x7FF
+        mem.tick(256);
+        // Constant nibble 15 → (15-8)*256 per side at full routing. If
+        // the APU sampled the (zeroed) window instead, this would be
+        // (0-8)*256.
+        assert_eq!(*mem.audio_buf.last().unwrap(), 1792);
+    }
+
+    #[test]
+    fn soundcnt_x_reports_active_channels() {
+        let mut mem = MemMap::new(vec![]);
+        mem.write8(0x0400_0084, 0x80);
+        assert_eq!(mem.read8(0x0400_0084), 0x80);
+        // Channel 1: length 1/256 s, full envelope, trigger + length.
+        mem.write8(0x0400_0062, 0x3F);
+        mem.write8(0x0400_0063, 0xF0);
+        mem.write8(0x0400_0065, 0xC0);
+        assert_eq!(mem.read8(0x0400_0084), 0x81);
+        // Master off forces the flags clear.
+        mem.write8(0x0400_0084, 0x00);
+        assert_eq!(mem.read8(0x0400_0084), 0x00);
+        mem.write8(0x0400_0084, 0x80);
+        assert_eq!(mem.read8(0x0400_0084), 0x81);
+        // One 64 Hz frame expires the length.
+        mem.tick(262144 + 512);
+        assert_eq!(mem.read8(0x0400_0084), 0x80);
+    }
+
+    #[test]
+    fn fifo_depth_capped_at_32() {
+        let mut mem = MemMap::new(vec![]);
+        for i in 0..40u8 {
+            mem.write8(0x0400_00A0, i);
+        }
+        assert_eq!(mem.fifo[0].len(), 32);
+        // The first 32 bytes survive in order; overflow bytes dropped.
+        let queued: Vec<i8> = mem.fifo[0].iter().copied().collect();
+        assert_eq!(queued, (0..32).collect::<Vec<i8>>());
+        assert_eq!(mem.fifo_pushes[0], 40);
+    }
+
+    #[test]
+    fn keypad_irq_or_mode_edge() {
+        let mut mem = MemMap::new(vec![]);
+        mem.write16(0x0400_0132, 0x4001); // select A, IRQ enable, OR
+        assert_eq!(mem.reg_if & irq::KEYPAD, 0);
+        mem.keys &= !1; // press A (active-low)
+        mem.tick(CYCLES_PER_SCANLINE + 1);
+        assert_ne!(mem.reg_if & irq::KEYPAD, 0);
+        // Held condition: no re-raise after acknowledge.
+        mem.reg_if = 0;
+        mem.tick(CYCLES_PER_SCANLINE);
+        assert_eq!(mem.reg_if & irq::KEYPAD, 0);
+        // Release and re-press: a fresh edge raises again.
+        mem.keys |= 1;
+        mem.tick(CYCLES_PER_SCANLINE);
+        mem.keys &= !1;
+        mem.tick(CYCLES_PER_SCANLINE);
+        assert_ne!(mem.reg_if & irq::KEYPAD, 0);
+    }
+
+    #[test]
+    fn keypad_irq_and_mode_needs_all_selected() {
+        let mut mem = MemMap::new(vec![]);
+        mem.write16(0x0400_0132, 0xC003); // A+B, IRQ enable, AND
+        mem.keys &= !1; // only A
+        mem.tick(CYCLES_PER_SCANLINE + 1);
+        assert_eq!(mem.reg_if & irq::KEYPAD, 0);
+        mem.keys &= !2; // A+B
+        mem.tick(CYCLES_PER_SCANLINE);
+        assert_ne!(mem.reg_if & irq::KEYPAD, 0);
+    }
+
+    #[test]
+    fn unmapped_reads_return_prefetch_word() {
+        let mut mem = MemMap::new(vec![]);
+        // HLE: the seam-stepped protection value is the prefetch model.
+        assert_eq!(mem.read32(0x0000_4000), 0xE129_F000);
+        assert_eq!(mem.read32(0x0100_0000), 0xE129_F000);
+        assert_eq!(mem.read32(0x1000_0000), 0xE129_F000);
+        assert_eq!(mem.read16(0x0100_0002), 0xE129);
+        assert_eq!(mem.read8(0x0100_0003), 0xE1);
+        // Real BIOS: tracks the actual pipeline prefetch (+8 ARM).
+        let mut bios = vec![0u8; 0x4000];
+        bios[0x208..0x20C].copy_from_slice(&0xCAFE_F00Du32.to_le_bytes());
+        mem.load_bios(&bios);
+        mem.note_fetch(0x200);
+        assert_eq!(mem.read32(0x0000_8000), 0xCAFE_F00D);
+        assert_eq!(mem.read8(0x0100_0000), 0x0D);
     }
 }
