@@ -54,6 +54,24 @@ const ECHO_SIG: [u8; 16] = [
 
 const MAX_VOICES: usize = 16;
 
+/// One mix entry as read at a commit hook (post-chunk state). Two
+/// consecutive snapshots bracket one chunk exactly: start position,
+/// guest-true per-voice advance, and both gain endpoints.
+#[derive(Clone, Copy, Default)]
+struct SnapV {
+    on: bool,
+    /// Position including the 12-bit fraction.
+    pos: f64,
+    end: u32,
+    loop_ptr: u32,
+    loop_len: u32,
+    /// Decoded 4.12 step (source samples per guest output sample).
+    step: f64,
+    gl: f32,
+    gr: f32,
+    echo_send: bool,
+}
+
 /// Detection result: the lineage gate (pitch-routine match). The
 /// live state block is located at runtime by scanning guest RAM for
 /// its self-verifying shape — recompiled builds shuffle literal
@@ -91,10 +109,10 @@ fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
     None
 }
 
-/// One shadowed voice, mirrored from a 28-byte mix entry. Positions
-/// are absolute guest byte addresses (sample data is s8); the guest
-/// rewrites the entry in place each chunk, so every hook resyncs the
-/// sampler exactly.
+/// One rendered voice for the current window — chunk N played back
+/// verbatim during [hook N, hook N+1): start position from the
+/// previous snapshot, per-GRID-sample step from guest position
+/// telemetry, gains lerped between the two snapshot endpoints.
 #[derive(Clone, Copy)]
 struct Voice {
     on: bool,
@@ -103,11 +121,13 @@ struct Voice {
     dir: f64,
     loop_ptr: u32,
     loop_len: u32,
-    /// Source samples per guest output sample (4.12 -> float).
-    step: f64,
-    gl: f32,
-    /// Right gain; negated when the surround flag is set.
-    gr: f32,
+    /// Source samples per host GRID sample (telemetry / chunk span).
+    grid_step: f64,
+    gl0: f32,
+    gl1: f32,
+    /// Right gains; negated when the surround flag is set.
+    gr0: f32,
+    gr1: f32,
     echo_send: bool,
     dead: bool,
     /// Canon-domain check copy: guest-rate ZOH.
@@ -124,9 +144,11 @@ impl Default for Voice {
             dir: 1.0,
             loop_ptr: 0,
             loop_len: 0,
-            step: 0.0,
-            gl: 0.0,
-            gr: 0.0,
+            grid_step: 0.0,
+            gl0: 0.0,
+            gl1: 0.0,
+            gr0: 0.0,
+            gr1: 0.0,
             echo_send: false,
             dead: false,
             chk_hold: 0.0,
@@ -137,14 +159,18 @@ impl Default for Voice {
 
 /// Float port of the guest's feedback-delay echo. Cursor distance and
 /// gains are re-read each hook; contents are our own (zero-seeded).
+/// The stereo commit variant pairs with a stereo-INTERLEAVED delay
+/// buffer (the 256-halfword echo processor): per-channel independent
+/// delays, so the ring holds L/R pairs and cursors count pairs. The
+/// mono variant's ring is one halfword per sample.
 struct Echo {
-    ring: Vec<f32>,
+    ring: Vec<(f32, f32)>,
     rd: usize,
     wr: usize,
     g_fb: f32,
     g_in: f32,
     g_wet: f32,
-    wet_hold: f32,
+    wet_hold: (f32, f32),
     acc: f64,
 }
 
@@ -157,7 +183,7 @@ impl Echo {
             g_fb: 0.0,
             g_in: 0.0,
             g_wet: 0.0,
-            wet_hold: 0.0,
+            wet_hold: (0.0, 0.0),
             acc: 0.0,
         }
     }
@@ -226,6 +252,18 @@ pub struct GaxHle {
     echo: Echo,
     engage_backoff: u32,
     last_hook_cursor: u64,
+    /// Hook-cadence statistics (mix-rate estimation).
+    cad_sum: f64,
+    cad_n: u32,
+    cad_recent: [f64; 16],
+    cad_idx: u32,
+    /// Previous hook's entry snapshots (chunk start states).
+    pending: [SnapV; MAX_VOICES],
+    /// Render-window progress in grid samples (gain lerp phase).
+    win_pos: f64,
+    win_len: f64,
+    trace: bool,
+    trace_acc: Vec<(usize, f64, f64)>,
     // --- v3 state ---
     /// Work block base; hook PCs: mixer normal, mixer ping-pong,
     /// quantizer (frame edge + canon compare point).
@@ -259,6 +297,15 @@ impl GaxHle {
             echo: Echo::new(),
             engage_backoff: 0,
             last_hook_cursor: 0,
+            cad_sum: 0.0,
+            cad_n: 0,
+            cad_recent: [0.0; 16],
+            cad_idx: 0,
+            pending: [SnapV::default(); MAX_VOICES],
+            win_pos: 0.0,
+            win_len: f64::MAX,
+            trace: std::env::var_os("RECOMP_GAX_TRACE").is_some(),
+            trace_acc: Vec::new(),
             v3_work: 0,
             v3_hooks: [0; 3],
             v3_pending: Vec::new(),
@@ -367,6 +414,20 @@ impl GaxHle {
         self.hook_key = commit & !3;
         self.ss = ss;
         self.engaged = true;
+        if self.trace {
+            let mix_b = mem.u32(dma + 0x04).unwrap_or(0);
+            let echo_fn = mem.u32(dma + 0x0c).unwrap_or(0);
+            eprintln!(
+                "gaxengage ss={ss:08x} mixA={mix_a:08x} mixB={mix_b:08x} \
+                 commit={commit:08x} echo={echo_fn:08x} stereo={stereo}"
+            );
+            for (name, p) in [("mixA", mix_a), ("mixB", mix_b), ("echo", echo_fn)] {
+                if let Some(body) = mem.slice(p, 0x120) {
+                    let hex: String = body.iter().map(|b| format!("{b:02x}")).collect();
+                    eprintln!("gaxengage {name} body {hex}");
+                }
+            }
+        }
         true
     }
 
@@ -492,20 +553,53 @@ impl GaxHle {
         }
         let _ = (key, r0);
         self.hooks += 1;
-        // The guest renders exactly 128 samples per hook, so the hook
-        // cadence IS the mix rate — self-calibrating, no timer-reload
-        // semantics needed. EMA dampens IRQ-latency jitter.
         let gap = audio_cursor.saturating_sub(self.last_hook_cursor) / crate::mem::AUDIO_SAMPLE_CYCLES;
         self.last_hook_cursor = audio_cursor;
-        if (64..=4096).contains(&gap) {
-            let step = gap as f64 / 128.0;
-            self.mix_step = if self.hooks < 8 {
-                step
-            } else {
-                self.mix_step * 0.9 + step * 0.1
-            };
-        }
         let ss = self.ss;
+        // Mix rate from hook cadence — but as a long-run MEAN, not an
+        // EMA: IRQ-latency jitter cancels in the mean (the DAC clock
+        // is exact underneath), while an EMA's short memory turned it
+        // into a ±0.5% wobble = audible warble plus a position snap at
+        // every chunk resync. A 16-hook recent window re-seeds the
+        // mean when the driver actually retunes its rate. The state
+        // block's TM0 reload halfword (documented at +0xd0+0x22 in the
+        // reference build) is adopted as the exact rate only when it
+        // corroborates the cadence — earlier-lineage builds keep a
+        // different value there (this title reads back 4096 Hz against
+        // a measured ~8.2 kHz cadence).
+        if (64..=4096).contains(&gap) {
+            let g = gap as f64;
+            self.cad_recent[(self.cad_idx % 16) as usize] = g;
+            self.cad_idx += 1;
+            self.cad_sum += g;
+            self.cad_n += 1;
+            if self.cad_n > 4096 {
+                self.cad_sum *= 0.5;
+                self.cad_n /= 2;
+            }
+            if self.cad_idx >= 16 {
+                let recent = self.cad_recent.iter().sum::<f64>() / 16.0;
+                let mean = self.cad_sum / self.cad_n as f64;
+                if (recent / mean - 1.0).abs() > 0.05 {
+                    // Rate retune: restart the mean from the recent window.
+                    self.cad_sum = recent * 16.0;
+                    self.cad_n = 16;
+                }
+            }
+            if self.cad_n >= 8 {
+                let est = self.cad_sum / self.cad_n as f64 / 128.0;
+                let reload = mem
+                    .slice(ss + 0xd0 + 0x22, 2)
+                    .map(|b| u16::from_le_bytes([b[0], b[1]]))
+                    .unwrap_or(0);
+                let timer_step = (65536.0 - reload as f64) / 256.0;
+                self.mix_step = if (timer_step / est - 1.0).abs() < 0.05 {
+                    timer_step
+                } else {
+                    est
+                };
+            }
+        }
         // Cheap liveness check: the installed commit pointer must
         // still be the hooked one (driver reinit/realloc -> rescan).
         if mem.u32(ss + 0xd8).map(|p| p & !3) != Some(self.hook_key) {
@@ -522,56 +616,160 @@ impl GaxHle {
             self.stale_ticks += 1;
             return;
         };
-        for i in 0..MAX_VOICES {
-            if i >= self.count {
-                self.voices[i].on = false;
-                continue;
-            }
-            let v = &mut self.voices[i];
-            let Some(ep) = mem.u32(aux + 4 * i as u32) else {
-                v.on = false;
-                continue;
-            };
+        // Snapshot every entry (post-chunk state), then render the
+        // chunk these snapshots just closed: start positions from the
+        // previous snapshot, per-voice advance from the guest's own
+        // position telemetry, gain endpoints from both snapshots.
+        let prev_snap = self.pending;
+        let mut cur = [SnapV::default(); MAX_VOICES];
+        for (i, c) in cur.iter_mut().enumerate().take(self.count) {
+            let Some(ep) = mem.u32(aux + 4 * i as u32) else { continue };
             if ep == 0 || !matches!(ep >> 24, 2 | 3) {
-                v.on = false;
                 continue;
             }
-            let Some(e) = mem.slice(ep, 0x1c) else {
-                v.on = false;
-                continue;
-            };
+            let Some(e) = mem.slice(ep, 0x1c) else { continue };
             let u32at = |o: usize| u32::from_le_bytes([e[o], e[o + 1], e[o + 2], e[o + 3]]);
             let pos_ptr = u32at(0x04);
             let end_ptr = u32at(0x08);
-            let loop_ptr = u32at(0x0c);
-            let loop_len = u32at(0x10);
             let step = u16::from_le_bytes([e[0x14], e[0x15]]) as f64 / 4096.0;
             let frac = (u16::from_le_bytes([e[0x16], e[0x17]]) & 0xfff) as f64 / 4096.0;
             let vol_l = e[0x18];
             let vol_r = e[0x19];
             let surround = e[0x1a] == 1;
-            let echo_send = e[0x1b] != 0;
             // Sample data must be addressable (ROM or RAM).
             if mem.slice(pos_ptr, 1).is_none() || step <= 0.0 {
-                if v.on {
+                if prev_snap[i].on {
                     self.bad_waves += 1;
                 }
-                v.on = false;
                 continue;
             }
             let gl = if vol_l == 0 { 0.0 } else { (vol_l as f32 + 1.0) / 256.0 };
-            let gr0 = if vol_r == 0 { 0.0 } else { (vol_r as f32 + 1.0) / 256.0 };
-            v.pos = pos_ptr as f64 + frac;
-            v.end = end_ptr as f64;
-            v.dir = if end_ptr >= pos_ptr { 1.0 } else { -1.0 };
-            v.loop_ptr = loop_ptr;
-            v.loop_len = loop_len;
-            v.step = step;
-            v.gl = gl;
-            v.gr = if surround { -gr0 } else { gr0 };
-            v.echo_send = echo_send;
+            let gr = if vol_r == 0 { 0.0 } else { (vol_r as f32 + 1.0) / 256.0 };
+            *c = SnapV {
+                on: true,
+                pos: pos_ptr as f64 + frac,
+                end: end_ptr,
+                loop_ptr: u32at(0x0c),
+                loop_len: u32at(0x10),
+                step,
+                gl,
+                gr: if surround { -gr } else { gr },
+                echo_send: e[0x1b] != 0,
+            };
+        }
+        self.pending = cur;
+
+        // The chunk is always exactly 128 guest samples; the window it
+        // plays over is its DAC span, immune to hook (IRQ) jitter.
+        let chunk_grid = 128.0 * self.mix_step;
+        self.win_len = chunk_grid;
+        self.win_pos = 0.0;
+        for i in 0..MAX_VOICES {
+            let p = prev_snap[i];
+            let c = cur[i];
+            let v = &mut self.voices[i];
+            *v = Voice::default();
+            // Note identity: the loop region. The end pointer is
+            // rewritten by the guest on every loop wrap, so it cannot
+            // identify; a same-loop step change is a pitch slide, not
+            // a restart.
+            let same = p.on && c.on && p.loop_ptr == c.loop_ptr && p.loop_len == c.loop_len;
+            let (start, src, gl0, gr0) = if same {
+                (p.pos, c, p.gl, p.gr)
+            } else if c.on {
+                // New note this chunk: the mixer ran it a full chunk,
+                // so its start is one chunk's advance behind (loop
+                // wraps folded by the sampler's own machinery).
+                let dir = if c.end as f64 >= c.pos { 1.0 } else { -1.0 };
+                (c.pos - dir * c.step * 128.0, c, c.gl, c.gr)
+            } else if p.on {
+                // Voice gone: render its final chunk fading to zero.
+                (p.pos, p, p.gl, p.gr)
+            } else {
+                continue;
+            };
+            // Per-voice advance from guest telemetry where available:
+            // dpos across the chunk, forward-loop unwrapped. A failed
+            // unwrap (ping-pong reflection, restart) falls back to the
+            // decoded 4.12 step on the exact timer grid.
+            let mut grid_step = src.step * 128.0 / chunk_grid;
+            if same {
+                let mut d = c.pos - p.pos;
+                let mut wraps = 0;
+                while d < 0.0 && c.loop_len != 0 && wraps < 4 {
+                    d += c.loop_len as f64;
+                    wraps += 1;
+                }
+                let exp = p.step * 128.0;
+                if d > 0.0 && d < exp * 4.0 + 4.0 {
+                    grid_step = d / chunk_grid;
+                    if self.trace && exp > 0.0 {
+                        self.trace_acc.push((i, d / exp, p.step));
+                    }
+                }
+            }
+            if !(grid_step > 0.0) {
+                continue;
+            }
+            v.pos = start;
+            v.end = src.end as f64;
+            v.dir = if src.end as f64 >= start { 1.0 } else { -1.0 };
+            v.loop_ptr = src.loop_ptr;
+            v.loop_len = src.loop_len;
+            v.grid_step = grid_step;
+            v.gl0 = gl0;
+            v.gr0 = gr0;
+            v.gl1 = if c.on { c.gl } else { 0.0 };
+            v.gr1 = if c.on { c.gr } else { 0.0 };
+            v.echo_send = src.echo_send;
             v.dead = false;
             v.on = true;
+        }
+
+        if self.trace && self.hooks % 64 == 0 {
+            let mut flags = String::new();
+            for (i, c) in cur.iter().enumerate() {
+                if !c.on {
+                    continue;
+                }
+                let bwd = (c.end as f64) < c.pos;
+                flags += &format!(
+                    " v{i}[sur={} echo={} bwd={} loop={} step={:.3} gl={:.2} gr={:+.2}]",
+                    (c.gr < 0.0) as u8,
+                    c.echo_send as u8,
+                    bwd as u8,
+                    (c.loop_len != 0) as u8,
+                    c.step,
+                    c.gl,
+                    c.gr,
+                );
+            }
+            eprintln!("gaxflags hooks={} echo_on={}{}", self.hooks, self.echo_on, flags);
+        }
+        if self.trace && self.hooks % 256 == 0 && !self.trace_acc.is_empty() {
+            let mut by_slot: [(f64, f64, u32); MAX_VOICES] = [(0.0, 0.0, 0); MAX_VOICES];
+            for &(s, r, st) in &self.trace_acc {
+                by_slot[s].0 += r;
+                by_slot[s].1 += st;
+                by_slot[s].2 += 1;
+            }
+            let mut line = format!(
+                "gaxtrace hooks={} mix_step={:.3} (rate {:.0} Hz):",
+                self.hooks,
+                self.mix_step,
+                65536.0 / self.mix_step
+            );
+            for (s, &(rs, ss_, n)) in by_slot.iter().enumerate() {
+                if n > 0 {
+                    line += &format!(
+                        " v{s}:r={:.3},step={:.3},n={n}",
+                        rs / n as f64,
+                        ss_ / n as f64
+                    );
+                }
+            }
+            eprintln!("{line}");
+            self.trace_acc.clear();
         }
 
         // Echo configuration (gains share the guest's nonzero->+1 bias).
@@ -591,16 +789,19 @@ impl GaxHle {
             self.echo.g_fb = bias(g16(es + 0x14));
             self.echo.g_in = bias(g16(es + 0x16));
             self.echo.g_wet = bias(g16(es + 0x18));
-            let len = (end.saturating_sub(base) / 2) as usize;
+            // Stereo: the delay buffer is interleaved L/R halfwords, so
+            // a sample of delay is FOUR bytes; mono: two.
+            let stride = if self.stereo { 4 } else { 2 };
+            let len = (end.saturating_sub(base) / stride) as usize;
             if len > 0 && len <= 1 << 17 {
                 if self.echo.ring.len() != len {
-                    self.echo.ring = vec![0.0; len];
+                    self.echo.ring = vec![(0.0, 0.0); len];
                     self.echo.rd = 0;
                     self.echo.wr = 0;
                 }
                 if base != 0 && wr >= base && rd >= base {
-                    self.echo.rd = ((rd - base) / 2) as usize % len;
-                    self.echo.wr = ((wr - base) / 2) as usize % len;
+                    self.echo.rd = ((rd - base) / stride) as usize % len;
+                    self.echo.wr = ((wr - base) / stride) as usize % len;
                 }
             } else {
                 self.echo_on = false;
@@ -706,52 +907,71 @@ impl GaxHle {
         let gain = self.vf.gain();
         let (mut l, mut r) = (0.0f32, 0.0f32);
         let (mut chk_l, mut chk_r) = (0.0f32, 0.0f32);
-        let mut echo_in = 0.0f32;
+        let (mut echo_in_l, mut echo_in_r) = (0.0f32, 0.0f32);
         let mut echo_in_chk = 0.0f32;
-        let step_scale = 1.0 / self.mix_step;
+        // Gain lerp phase across the chunk window (held at 1 if the
+        // next hook is late — voices keep sampling smoothly).
+        let t = if self.win_len > 0.0 {
+            (self.win_pos / self.win_len).min(1.0) as f32
+        } else {
+            1.0
+        };
+        self.win_pos += 1.0;
 
         for v in self.voices.iter_mut() {
             if !v.on || v.dead {
                 continue;
             }
-            let s = sample_voice(v, mem, step_scale);
+            let s = sample_voice(v, mem);
             v.chk_acc -= 1.0;
             if v.chk_acc <= 0.0 {
                 v.chk_hold = s;
                 v.chk_acc += self.mix_step;
             }
+            let gl = v.gl0 + (v.gl1 - v.gl0) * t;
+            let gr = v.gr0 + (v.gr1 - v.gr0) * t;
             if v.echo_send {
                 // Echo-send voices feed the delay line INSTEAD of the
-                // main mix (mono input: averaged magnitude weights).
-                let w = (v.gl + v.gr.abs()) * 0.5 * gain;
-                echo_in += s * w;
-                echo_in_chk += v.chk_hold * w;
+                // main mix, at their panned (signed) gains.
+                echo_in_l += s * gl * gain;
+                echo_in_r += s * gr * gain;
+                echo_in_chk += v.chk_hold * (gl + gr) * 0.5 * gain;
             } else {
-                l += s * v.gl * gain;
-                r += s * v.gr * gain;
-                chk_l += v.chk_hold * v.gl * gain;
-                chk_r += v.chk_hold * v.gr * gain;
+                l += s * gl * gain;
+                r += s * gr * gain;
+                chk_l += v.chk_hold * gl * gain;
+                chk_r += v.chk_hold * gr * gain;
             }
         }
 
         // Echo at the guest sample cadence (delay time is in guest
-        // samples); the wet value holds between ticks.
+        // samples); per-channel independent delays in stereo mode (the
+        // guest's interleaved buffer never mixes the channels); the wet
+        // pair holds between ticks. Mono mode collapses to one line.
         if self.echo_on && !self.echo.ring.is_empty() {
             self.echo.acc -= 1.0;
             if self.echo.acc <= 0.0 {
                 self.echo.acc += self.mix_step;
                 let e = &mut self.echo;
                 let n = e.ring.len();
-                let wet = e.g_wet * e.ring[e.rd] + e.g_in * echo_in;
-                e.ring[e.wr] = echo_in + e.g_fb * e.ring[e.wr];
+                let (in_l, in_r) = if self.stereo {
+                    (echo_in_l, echo_in_r)
+                } else {
+                    let m = (echo_in_l + echo_in_r) * 0.5;
+                    (m, m)
+                };
+                let (dl, dr) = e.ring[e.rd];
+                let wet = (e.g_wet * dl + e.g_in * in_l, e.g_wet * dr + e.g_in * in_r);
+                let (wl, wr_) = e.ring[e.wr];
+                e.ring[e.wr] = (in_l + e.g_fb * wl, in_r + e.g_fb * wr_);
                 e.rd = (e.rd + 1) % n;
                 e.wr = (e.wr + 1) % n;
                 e.wet_hold = wet;
             }
-            l += self.echo.wet_hold;
-            r += self.echo.wet_hold;
-            chk_l += self.echo.wet_hold;
-            chk_r += self.echo.wet_hold;
+            l += self.echo.wet_hold.0;
+            r += self.echo.wet_hold.1;
+            chk_l += self.echo.wet_hold.0;
+            chk_r += self.echo.wet_hold.1;
         }
         let _ = echo_in_chk;
 
@@ -776,10 +996,11 @@ impl GaxHle {
 }
 
 /// Advance and fetch one voice sample (s8/128 units) with linear
-/// interpolation; handles forward loops and the backward (ping-pong)
-/// leg by reflection. Per-chunk resync bounds any semantic drift to
-/// one chunk.
-fn sample_voice(v: &mut Voice, mem: &MemView, step_scale: f64) -> f32 {
+/// interpolation (matching the guest's interpolating mixer variants);
+/// handles forward loops and the backward (ping-pong) leg by
+/// reflection. Per-chunk resync bounds any semantic drift to one
+/// chunk.
+fn sample_voice(v: &mut Voice, mem: &MemView) -> f32 {
     if v.dead {
         return 0.0;
     }
@@ -828,7 +1049,7 @@ fn sample_voice(v: &mut Voice, mem: &MemView, step_scale: f64) -> f32 {
             return 0.0;
         }
     };
-    v.pos += v.dir * v.step * step_scale;
+    v.pos += v.dir * v.grid_step;
     s
 }
 
@@ -893,12 +1114,12 @@ mod tests {
             dir: 1.0,
             loop_ptr: 0x0800_0008,
             loop_len: 8,
-            step: 3.0,
+            grid_step: 3.0,
             ..Voice::default()
         };
         // Looping: samples stay inside [8, 16) after wrap, voice alive.
         for _ in 0..64 {
-            let s = sample_voice(&mut v, &mem, 1.0) * 128.0;
+            let s = sample_voice(&mut v, &mem) * 128.0;
             assert!((0.0..16.0).contains(&s), "sample {s}");
         }
         assert!(!v.dead);
@@ -907,7 +1128,7 @@ mod tests {
         v2.pos = 0x0800_000Eu32 as f64;
         v2.end = 0x0800_0010u32 as f64;
         for _ in 0..4 {
-            sample_voice(&mut v2, &mem, 1.0);
+            sample_voice(&mut v2, &mem);
         }
         assert!(v2.dead);
     }
