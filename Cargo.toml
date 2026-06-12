@@ -5,6 +5,7 @@ members = [
     "crates/gba-core",
     "crates/input-config",
     "crates/launcher",
+    "crates/pack",
     "crates/recomp",
     "crates/screen",
 ]

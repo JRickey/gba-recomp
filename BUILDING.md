@@ -115,9 +115,11 @@ recomp play game.gba --record-labels     # just play; labels accumulate
 # cache key) — fallback at the places you visited is gone
 ```
 
-Label files are plain text keyed by the image's SHA-256, hold only
-addresses (never image content), and union-merge — so they accumulate
-across sessions and can be shared: a file named `<rom>.labels` next to
+Label files are keyed by the image's SHA-256, hold only addresses and
+names (never image content), and union-merge — so they accumulate
+across sessions and can be shared: a file named `<rom>.labels.toml`
+(the TOML interchange format disassembly tooling emits — see
+docs/labels.md) or `<rom>.labels` (the recorder's line format) next to
 the image is picked up automatically alongside the recorder's own
 accumulator in `<config_dir>/gba-recomp/labels/`. ROM entries are pure
 hints (the translation derives from the image itself, so a wrong label
