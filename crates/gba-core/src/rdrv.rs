@@ -100,6 +100,14 @@ struct Voice {
     looping: bool,
     /// Source samples per guest output sample.
     step: f64,
+    /// Guest position as snapshotted at the mix hook (render mutates
+    /// `pos`; this keeps the tick's ground truth for telemetry).
+    guest_pos: f64,
+    /// Wave identity for telemetry validity (same note, no restart).
+    instr: u32,
+    /// Source samples per 65536 Hz grid sample. NaN until derived from
+    /// guest position telemetry or the step-cache fallback.
+    grid_step: f64,
     /// Integer gain chain result (0..~0x80) over 128.
     gain: f32,
     dead: bool,
@@ -115,6 +123,9 @@ impl Default for Voice {
             loop_len: 0,
             looping: false,
             step: 0.0,
+            guest_pos: 0.0,
+            instr: 0,
+            grid_step: f64::NAN,
             gain: 0.0,
             dead: false,
         }
@@ -264,6 +275,10 @@ impl RdrvHle {
                 let va = base + i * V_STRIDE;
                 let v = &mut self.pending[n];
                 n += 1;
+                // The slot's previous content is this voice's snapshot
+                // from the last mix hook (slot indices are stable per
+                // address) — the baseline for position telemetry.
+                let prev = *v;
                 *v = Voice { addr: va, ..Voice::default() };
                 let Some(state) = mem.u8(va + V_STATE) else { continue };
                 if state != 0x11 && state != 0x12 {
@@ -309,14 +324,61 @@ impl RdrvHle {
                 g = g * vol >> 7;
                 g = ((g as u64 * env as u64) >> 19) as u32;
                 v.pos = pos as f64 + frac as f64 / 8388608.0;
+                v.guest_pos = v.pos;
                 v.end = end as f64;
                 v.loop_len = loop_len;
                 v.looping = matches!(mode, 2 | 4);
+                v.instr = instr;
                 v.gain = g as f32 / 128.0;
                 v.on = true;
+                // Per-voice pitch from guest position telemetry: the
+                // step cache at +0x08 is only truthful on the steady
+                // music path — the jingle/tune path computes its pitch
+                // elsewhere. The guest's own position advance since the
+                // previous tick IS the per-grid-sample step, no rate
+                // table or chunk knowledge needed.
+                v.grid_step = f64::NAN;
+                if (256..=4096).contains(&gap) && prev.addr == va && prev.on && prev.instr == instr
+                {
+                    let mut dpos = v.guest_pos - prev.guest_pos;
+                    // Loop wrap: the guest rewinds by loop_len.
+                    let mut wraps = 0;
+                    while dpos < 0.0 && prev.looping && prev.loop_len != 0 && wraps < 4 {
+                        dpos += prev.loop_len as f64;
+                        wraps += 1;
+                    }
+                    // Accept only a plausible forward advance (a
+                    // backward jump is a note restart).
+                    if dpos > 0.0 && dpos < gap as f64 * 4.0 {
+                        v.grid_step = dpos / gap as f64;
+                    }
+                }
             }
         }
         self.count = n;
+        // Diagnostic (RECOMP_RDRV_TRACE): per-tick mixer snapshot.
+        if std::env::var_os("RECOMP_RDRV_TRACE").is_some() && self.hooks < 600 {
+            eprintln!(
+                "RDRV tick={} gap={gap} chunk={chunk} mix_step={:.4} gate_music={gate_music} fxvol={fxvol} tunevol={tunevol}",
+                self.hooks, self.mix_step
+            );
+            for v in self.pending[..n].iter() {
+                if !v.on {
+                    continue;
+                }
+                let state = mem.u8(v.addr + V_STATE).unwrap_or(0);
+                let mode = mem.u8(v.addr + V_MODE).unwrap_or(0);
+                eprintln!(
+                    "  v@{:08x} st={state:02x} mode={mode} pos={:.1} end={:.1} loop={} gain={:.3} fx={}",
+                    v.addr,
+                    v.pos,
+                    v.end,
+                    v.loop_len,
+                    v.gain,
+                    v.addr < self.lay.music_base
+                );
+            }
+        }
     }
 
     /// Advance-entry hook: the guest mixer cached each rendered voice's
@@ -339,6 +401,20 @@ impl RdrvHle {
                 let step = mem.u32(v.addr + V_STEP).unwrap_or(0);
                 v.step = step as f64 / 8388608.0;
                 v.on = step != 0;
+                // First tick of a note has no position telemetry yet —
+                // fall back to the cache step on the calibrated grid.
+                if v.grid_step.is_nan() {
+                    v.grid_step = v.step / self.mix_step;
+                }
+                if std::env::var_os("RECOMP_RDRV_TRACE").is_some() && self.hooks < 600 && v.on {
+                    eprintln!(
+                        "  step v@{:08x} raw={step:#010x} step={:.4} grid_step={:.5} key_is_fx={}",
+                        v.addr,
+                        v.step,
+                        v.grid_step,
+                        key == self.lay.adv_fx
+                    );
+                }
             }
         }
         self.voices[..self.count].copy_from_slice(&self.pending[..self.count]);
@@ -385,13 +461,12 @@ impl RdrvHle {
             return (0.0, 0.0);
         }
         let gain = self.vf.gain();
-        let step_scale = 1.0 / self.mix_step;
         let mut sum = 0.0f32;
         for v in self.voices[..self.count].iter_mut() {
             if !v.on || v.dead {
                 continue;
             }
-            sum += sample_voice(v, mem, step_scale) * v.gain * gain;
+            sum += sample_voice(v, mem) * v.gain * gain;
         }
         // Canon-domain check copy: the guest mixes on its own grid and
         // saturates the SUM to s8 — one stream-level ZOH at the guest
@@ -590,7 +665,7 @@ fn harvest(mem: &MemView, blob: u32) -> Option<Layout> {
 /// interpolation, mirroring the guest inner loop: loop modes rewind by
 /// the loop length at the end address; one-shots die there. Per-chunk
 /// resync bounds any drift to one chunk.
-fn sample_voice(v: &mut Voice, mem: &MemView, step_scale: f64) -> f32 {
+fn sample_voice(v: &mut Voice, mem: &MemView) -> f32 {
     let mut guard = 0;
     while v.pos >= v.end {
         guard += 1;
@@ -613,7 +688,7 @@ fn sample_voice(v: &mut Voice, mem: &MemView, step_scale: f64) -> f32 {
             return 0.0;
         }
     };
-    v.pos += v.step * step_scale;
+    v.pos += v.grid_step;
     s
 }
 
@@ -645,12 +720,13 @@ mod tests {
             loop_len: 8,
             looping: true,
             step: 3.0,
+            grid_step: 3.0,
             gain: 1.0,
             ..Voice::default()
         };
         // Loop: rewinds by loop_len at end, stays alive and in range.
         for _ in 0..64 {
-            let s = sample_voice(&mut v, &mem, 1.0) * 128.0;
+            let s = sample_voice(&mut v, &mem) * 128.0;
             assert!((0.0..16.0).contains(&s), "sample {s}");
         }
         assert!(!v.dead);
@@ -659,7 +735,7 @@ mod tests {
         v2.pos = 0x0800_000Eu32 as f64;
         v2.end = 0x0800_0010u32 as f64;
         for _ in 0..4 {
-            sample_voice(&mut v2, &mem, 1.0);
+            sample_voice(&mut v2, &mem);
         }
         assert!(v2.dead);
     }
