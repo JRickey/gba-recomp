@@ -2228,6 +2228,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "menu"
+version = "0.1.0"
+dependencies = [
+ "input-config",
+ "screen",
+]
+
+[[package]]
 name = "metal"
 version = "0.32.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3226,6 +3234,7 @@ dependencies = [
  "gilrs",
  "input-config",
  "libloading",
+ "menu",
  "minifb",
  "screen",
  "sha2",

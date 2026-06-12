@@ -16,6 +16,16 @@ mod font;
 use input_config::AvConfig;
 use screen::{DisplayTarget, ResponseMode, ScreenKind};
 
+// Overlay palette — drawn into the BGR555-derived frame, so these are
+// plain sRGB-ish bytes. Tuned to echo the launcher's procedural chrome.
+const PANEL_BG: [u8; 3] = [16, 18, 34];
+const PANEL_EDGE: [u8; 3] = [0x6f, 0x66, 0xdd]; // launcher VIOLET
+const TITLE_FG: [u8; 3] = [0xee, 0xf1, 0xf8]; // launcher SILVER_HI
+const ROW_FG: [u8; 3] = [188, 198, 222];
+const VALUE_FG: [u8; 3] = [0x7d, 0xe8, 0xff]; // launcher CYAN
+const SELECT_FG: [u8; 3] = [255, 240, 150]; // amber, the selected row
+const SELECT_BAR: [u8; 3] = [44, 50, 96];
+
 /// One edge-triggered navigation event. The play loop debounces its own
 /// keyboard/gamepad poll into these (a held direction yields one event on
 /// the press edge, never a stream), so the menu logic stays stateless
@@ -175,6 +185,10 @@ impl Menu {
     /// ignored by both present paths). Drawn entirely in the frame's own
     /// pixel space so it scales with the window at present time and works
     /// identically under the GPU presenter and the CPU blit.
+    ///
+    /// Palette echoes the launcher's Y2K chrome (violet edge, silver
+    /// title, cyan values, amber selection) so the two settings surfaces
+    /// read as one product.
     pub fn draw(&self, av: &AvConfig, rgba: &mut [[u8; 4]], w: usize, h: usize) {
         // Darken the whole frame so the panel reads regardless of scene.
         for px in rgba.iter_mut() {
@@ -194,31 +208,25 @@ impl Menu {
         let n = Row::ALL.len();
         let panel_h = (pad * 2 + line_h + 6 + n * line_h + 6).min(h.saturating_sub(panel_y * 2));
 
-        fill_rect(rgba, w, h, panel_x, panel_y, panel_w, panel_h, [18, 22, 40]);
-        frame_rect(rgba, w, h, panel_x, panel_y, panel_w, panel_h, [90, 120, 200]);
+        fill_rect(rgba, w, h, panel_x, panel_y, panel_w, panel_h, PANEL_BG);
+        frame_rect(rgba, w, h, panel_x, panel_y, panel_w, panel_h, PANEL_EDGE);
 
         let tx = panel_x + pad;
         let mut ty = panel_y + pad;
 
-        draw_text(rgba, w, h, tx, ty, "PAUSED", [230, 235, 255], 1);
-        ty += line_h + 6;
+        draw_text(rgba, w, h, tx, ty, "PAUSED", TITLE_FG, 1);
+        ty += line_h;
+        // Title rule, in the launcher's accent — ties the surfaces together.
+        fill_rect(rgba, w, h, panel_x + pad, ty, panel_w - pad * 2, 1, PANEL_EDGE);
+        ty += 6;
 
         for (i, row) in Row::ALL.iter().enumerate() {
             let sel = i == self.selected;
             if sel {
                 // Selection highlight bar behind the row.
-                fill_rect(
-                    rgba,
-                    w,
-                    h,
-                    panel_x + 2,
-                    ty - 2,
-                    panel_w - 4,
-                    (line_h) as usize,
-                    [40, 60, 110],
-                );
+                fill_rect(rgba, w, h, panel_x + 2, ty - 2, panel_w - 4, line_h, SELECT_BAR);
             }
-            let fg = if sel { [255, 240, 140] } else { [200, 210, 230] };
+            let fg = if sel { SELECT_FG } else { ROW_FG };
             let cursor = if sel { ">" } else { " " };
             draw_text(rgba, w, h, tx, ty, cursor, fg, 1);
 
@@ -230,12 +238,27 @@ impl Menu {
             if matches!(row, Row::Gamut) && !self.gamut_live {
                 label.push_str(" (restart)");
             }
-            draw_text(rgba, w, h, tx + font::W + 2, ty, &label, fg, 1);
 
-            if let Some(val) = value_of(*row, av) {
-                // Right-align the value text within the panel.
-                let vx = panel_x + panel_w - pad - val.chars().count() * (font::W + 1);
-                draw_text(rgba, w, h, vx, ty, &val, fg, 1);
+            // The value (right-aligned) is laid out first so the label can
+            // be clipped to never collide with it — a long label + wide
+            // value must read cleanly, not overlap into garbage.
+            let val = value_of(*row, av);
+            let glyph = font::W + 1;
+            let lx = tx + glyph;
+            let val_left = val.as_ref().map(|v| {
+                panel_x + panel_w - pad - v.chars().count() * glyph
+            });
+            let label_cap = match val_left {
+                Some(vl) if vl > lx => (vl - lx) / glyph,
+                Some(_) => 0,
+                None => (panel_x + panel_w - pad).saturating_sub(lx) / glyph,
+            };
+            if label.chars().count() > label_cap {
+                label.truncate(label_cap.saturating_sub(1).min(label.len()));
+            }
+            draw_text(rgba, w, h, lx, ty, &label, fg, 1);
+            if let (Some(v), Some(vx)) = (val, val_left) {
+                draw_text(rgba, w, h, vx, ty, &v, if sel { SELECT_FG } else { VALUE_FG }, 1);
             }
             ty += line_h;
         }

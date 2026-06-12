@@ -1009,16 +1009,21 @@ Place your own dump as gba_bios.bin next to the executable:\n  {}",
     // from its own timer-derived rate straight to the device rate, PSG
     // band-limited from its grid, summed in float behind a DC blocker.
     let av = input_config::AvConfig::load();
-    m.bus.tap_channels = av.audio_enhanced;
-    // MP2K HLE (Stage 3): arm the shadow mixer when the stock driver
-    // is present. It engages on the first live driver tick and reverts
-    // loudly if its output stops matching the canon FIFO stream.
-    if av.audio_enhanced {
-        let desc = arm_audio_hle(&mut m);
-        eprintln!("audio engine: {desc}");
-    }
+    // Both audio paths run at once so the in-game menu can crossfade
+    // between faithful and enhanced live (the callback slews between
+    // them, the producer fills both rings). tap_channels gates only the
+    // extra per-channel work; the faithful mix is produced regardless.
+    m.bus.tap_channels = true;
+    // MP2K/engine HLE: arm the shadow mixer when the stock driver is
+    // present so the enhanced path is ready the instant it's selected.
+    // It engages on the first live driver tick and reverts loudly if its
+    // output stops matching the canon FIFO stream; the shadow is
+    // read-only, so arming it always is free of correctness risk.
+    let desc = arm_audio_hle(&mut m);
+    eprintln!("audio engine: {desc}");
     let streams = std::sync::Arc::new(std::sync::Mutex::new(AudioStreams::default()));
-    let _stream = start_audio(streams.clone(), av.audio_enhanced);
+    streams.lock().unwrap().enhanced_on = av.audio_enhanced;
+    let _stream = start_audio(streams.clone());
 
     // Bindings come from the launcher-managed config (defaults match the
     // historical hardcoded map). Keyboard always works; a configured
@@ -1099,6 +1104,11 @@ Place your own dump as gba_bios.bin next to the executable:\n  {}",
     let mut fallback_run = 0u64;
     let mut sav_seen = m.bus.save_data().map(fnv64);
     let mut next_frame = std::time::Instant::now();
+    // The rings start empty and the device consumes immediately, so the
+    // first second always underruns while the buffer primes — that is
+    // cold-start latency, not a defect. Clear the counters once both
+    // rings first reach target so priming never reports as DEGRADED.
+    let mut primed = false;
 
     // In-game menu (press Escape). Available unless a package pins it off,
     // in which case Escape quits as it did before the menu existed.
@@ -1108,7 +1118,10 @@ Place your own dump as gba_bios.bin next to the executable:\n  {}",
     // rows so the change is honest. The video model/darken/response/grid
     // rebuild live below.
     let menu_enabled = manifest.as_ref().map(|m| m.menu).unwrap_or(true);
-    let mut menu = menu::Menu::new(false, false);
+    // Enhanced audio switches live (both paths warm + crossfade);
+    // output gamut is still baked into the GPU presenter, so it stays
+    // restart-required and the menu labels it so.
+    let mut menu = menu::Menu::new(true, false);
     let mut paused = false;
     // Edge state for the host-side menu (debounced from the raw poll so a
     // held key yields one event per press): Escape, the four directions,
@@ -1177,12 +1190,13 @@ Place your own dump as gba_bios.bin next to the executable:\n  {}",
                 nav.right |= gp.is_pressed(Gb::DPadRight) || gp.value(Axis::LeftStickX) > dz;
                 nav.confirm |= gp.is_pressed(Gb::South);
                 nav.cancel |= gp.is_pressed(Gb::East);
-                // Opening from the pad uses a control no GBA button maps
-                // to: the guide/Mode button if present, else the
-                // Start+Select chord (held together). Neither is a normal
-                // in-game press, so the menu never steals gameplay input.
-                nav.open |= gp.is_pressed(Gb::Mode)
-                    || (gp.is_pressed(Gb::Start) && gp.is_pressed(Gb::Select));
+                // Opening from the pad uses the guide/Mode button — the
+                // one control no GBA button maps to. (Keyboard Escape
+                // always works too.) A chord like Start+Select is
+                // deliberately NOT a default: those are real in-game
+                // buttons and a player pressing both would not expect a
+                // pause.
+                nav.open |= gp.is_pressed(Gb::Mode);
             }
         }
 
@@ -1251,6 +1265,7 @@ Place your own dump as gba_bios.bin next to the executable:\n  {}",
                             apply_av_change(
                                 what,
                                 &av,
+                                &streams,
                                 &mut screen_kind,
                                 &mut response,
                                 &mut lut,
@@ -1318,9 +1333,12 @@ Place your own dump as gba_bios.bin next to the executable:\n  {}",
         let mut ran = 0u32;
         while ran < 4 {
             if _stream.is_some() {
+                // Both rings are live (the menu can crossfade between
+                // them), so pace on the emptier one — neither faithful
+                // nor enhanced may be allowed to starve.
                 let fill = {
                     let st = streams.lock().unwrap();
-                    if av.audio_enhanced { st.psg.len() / 2 } else { st.mixed.len() / 2 }
+                    (st.mixed.len() / 2).min(st.psg.len() / 2)
                 };
                 if fill >= RING_TARGET {
                     break;
@@ -1418,8 +1436,20 @@ Place your own dump as gba_bios.bin next to the executable:\n  {}",
                 let mut st = streams.lock().unwrap();
                 st.route = [(cnt_h >> 8 & 3) as u8, (cnt_h >> 12 & 3) as u8];
                 st.vol_half = [cnt_h & 4 == 0, cnt_h & 8 == 0];
-                if av.audio_enhanced {
-                    m.bus.audio_buf.clear();
+                // Faithful ring: always produced (the menu may crossfade
+                // to it at any moment), so it must always be primed.
+                for pair in m.bus.audio_buf.chunks_exact(2) {
+                    if st.mixed.len() < 65536 {
+                        st.mixed.push_back(pair[0]);
+                        st.mixed.push_back(pair[1]);
+                    } else {
+                        st.drops += 1;
+                    }
+                }
+                m.bus.audio_buf.clear();
+                // Enhanced rings: also always produced (tap_channels is
+                // on), so the enhanced path stays warm for a live switch.
+                {
                     for pair in m.bus.psg_tap.chunks_exact(2) {
                         if st.psg.len() < 65536 {
                             st.psg.push_back(pair[0] as f32 / 32768.0);
@@ -1490,17 +1520,19 @@ Place your own dump as gba_bios.bin next to the executable:\n  {}",
                             }
                         }
                     }
-                } else {
-                    for pair in m.bus.audio_buf.chunks_exact(2) {
-                        if st.mixed.len() < 65536 {
-                            st.mixed.push_back(pair[0]);
-                            st.mixed.push_back(pair[1]);
-                        } else {
-                            st.drops += 1;
-                        }
-                    }
-                    m.bus.audio_buf.clear();
                 }
+            }
+        }
+
+        // Once both rings first reach target, the buffer has primed:
+        // discard the cold-start underruns so they don't report as a
+        // defect (steady state is what the alarm is for).
+        if !primed && _stream.is_some() {
+            let st = streams.lock().unwrap();
+            if (st.mixed.len() / 2).min(st.psg.len() / 2) >= RING_TARGET {
+                drop(st);
+                primed = true;
+                reset_audio_counters(&streams);
             }
         }
 
@@ -1577,13 +1609,15 @@ struct NavEdges {
 /// Apply a live A/V change the in-game menu made. Video settings rebuild
 /// the cheap derived objects in place (color LUT, temporal response,
 /// grid); the temporal history resets, which is a single frame and
-/// invisible. Audio (the enhanced path) and the output gamut are
-/// restart-required — they're baked at stream/presenter construction — so
-/// the menu only persists them to av.cfg; nothing to rebuild here.
+/// invisible. Enhanced audio flips the shared crossfade target — both
+/// paths are always warm, so the callback slews between them seamlessly.
+/// Only the output gamut stays restart-required (baked into the GPU
+/// presenter); the menu persists it to av.cfg for the next launch.
 #[allow(clippy::too_many_arguments)]
 fn apply_av_change(
     what: menu::Changed,
     av: &input_config::AvConfig,
+    streams: &std::sync::Arc<std::sync::Mutex<AudioStreams>>,
     screen_kind: &mut screen::ScreenKind,
     response: &mut screen::ResponseMode,
     lut: &mut screen::ColorLut,
@@ -1592,10 +1626,15 @@ fn apply_av_change(
     display_target: screen::DisplayTarget,
 ) {
     match what {
-        menu::Changed::Audio | menu::Changed::Gamut => {
+        menu::Changed::Audio => {
+            // Live: the producer keeps both rings filled; the callback
+            // crossfades to the selected path over ~40 ms.
+            streams.lock().unwrap().enhanced_on = av.audio_enhanced;
+        }
+        menu::Changed::Gamut => {
             // Restart-required: persisted to av.cfg by the caller, applied
-            // on the next launch. Live rebuild would mean tearing down the
-            // cpal stream / GPU presenter mid-session.
+            // on the next launch. Live rebuild would tear down the GPU
+            // presenter mid-session.
         }
         menu::Changed::Video => {
             *screen_kind = screen::ScreenKind::by_name(&av.screen)
@@ -1748,13 +1787,18 @@ fn load_native(lib_path: &Path) -> Result<(libloading::Library, BlockTable), Str
 }
 
 /// Streams shared between the emulation loop (producer) and the cpal
-/// callback (consumer). Faithful mode uses only `mixed`; enhanced mode
-/// uses the per-channel taps. `mixed` and `psg` are interleaved stereo.
+/// callback (consumer). BOTH rings are always filled so the callback can
+/// crossfade between the faithful mix (`mixed`) and the enhanced
+/// per-channel taps live. `mixed` and `psg` are interleaved stereo.
 #[derive(Default)]
 struct AudioStreams {
     mixed: std::collections::VecDeque<i16>,
     psg: std::collections::VecDeque<f32>,
     fifo: [std::collections::VecDeque<(i8, u32)>; 2],
+    /// Target for the faithful↔enhanced crossfade: the callback slews
+    /// toward 1.0 (enhanced) or 0.0 (faithful) over ~40 ms. The in-game
+    /// menu flips it; both paths stay warm so the switch is seamless.
+    enhanced_on: bool,
     /// MP2K HLE shadow-mixer stereo (65536 Hz grid, hardware-rail
     /// units like `psg`). When `hle_on`, the callback substitutes this
     /// for the FIFO A/B channels; reverting mid-session falls straight
@@ -1798,7 +1842,6 @@ struct Enhanced {
 /// zero-order-hold behavior exactly.
 fn start_audio(
     streams: std::sync::Arc<std::sync::Mutex<AudioStreams>>,
-    enhanced: bool,
 ) -> Option<cpal::Stream> {
     use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
     let device = cpal::default_host().default_output_device()?;
@@ -1807,18 +1850,20 @@ fn start_audio(
     let channels = cfg.channels() as usize;
     let src = gba_core::mem::AUDIO_RATE_HZ as f64;
 
-    let mut eng = if enhanced {
-        Some(Enhanced {
-            psg: SincResampler::new(src, rate),
-            fifo: [FifoInterp::new(rate), FifoInterp::new(rate)],
-            hle: SincResampler::new(src, rate),
-            xfade: 0.0,
-            xfade_k: (1.0 / (0.040 * rate)) as f32,
-            dc: [DcBlock::new(rate), DcBlock::new(rate)],
-        })
-    } else {
-        None
+    // Both paths run every callback; the menu crossfades between them.
+    let mut eng = Enhanced {
+        psg: SincResampler::new(src, rate),
+        fifo: [FifoInterp::new(rate), FifoInterp::new(rate)],
+        hle: SincResampler::new(src, rate),
+        xfade: 0.0,
+        xfade_k: (1.0 / (0.040 * rate)) as f32,
+        dc: [DcBlock::new(rate), DcBlock::new(rate)],
     };
+    // Faithful↔enhanced crossfade: start matched to the loaded setting so
+    // there's no fade at launch, then slew (~40 ms) whenever the menu
+    // flips `enhanced_on`.
+    let mut mode_x: f32 = if streams.lock().unwrap().enhanced_on { 1.0 } else { 0.0 };
+    let mode_k = (1.0 / (0.040 * rate)) as f32;
     let step = src / rate;
     let mut frac = 0.0f64;
     let mut last = (0i16, 0i16);
@@ -1832,11 +1877,14 @@ fn start_audio(
             move |out: &mut [f32], _| {
                 let mut st = streams.lock().unwrap();
                 for frame in out.chunks_mut(channels) {
-                    let (l, r) = match eng.as_mut() {
-                        Some(e) => {
-                            let (pl, pr) = e.psg.next(&mut st.psg);
-                            let mut l = pl;
-                            let mut r = pr;
+                    // Enhanced output (always computed so the ring stays
+                    // drained and the path is warm for a live switch).
+                    let (el, er) = {
+                        let e = &mut eng;
+                        let (pl, pr) = e.psg.next(&mut st.psg);
+                        let mut l = pl;
+                        let mut r = pr;
+                        {
                             // BOTH Direct Sound paths stay warm — the
                             // per-channel interpolators and the MP2K
                             // shadow stream — and a short equal-power-
@@ -1887,29 +1935,38 @@ fn start_audio(
                             if l.abs() > RAIL || r.abs() > RAIL {
                                 st.clipped += 1;
                             }
-                            (e.dc[0].next(soft_clip(l)), e.dc[1].next(soft_clip(r)))
                         }
-                        None => {
-                            // The emulated DAC runs on the 59.73 Hz frame
-                            // grid while the window paces 60 — steer the
-                            // faithful path too, or the ring overflows
-                            // into a burst-drop buzz at the cap.
-                            let pairs = (st.mixed.len() / 2) as f64;
-                            let err = (pairs - RING_TARGET as f64) / RING_TARGET as f64;
-                            frac += step * (1.0 + 0.02 * err.clamp(-1.0, 1.0));
-                            while frac >= 1.0 {
-                                frac -= 1.0;
-                                match (st.mixed.pop_front(), st.mixed.pop_front()) {
-                                    (Some(l), Some(r)) => last = (l, r),
-                                    _ => st.holds += 1,
-                                }
-                            }
-                            (
-                                faithful_dc[0].next(last.0 as f32 / 32768.0),
-                                faithful_dc[1].next(last.1 as f32 / 32768.0),
-                            )
-                        }
+                        (e.dc[0].next(soft_clip(l)), e.dc[1].next(soft_clip(r)))
                     };
+                    // Faithful output (also always computed, also drained).
+                    let (fl, fr) = {
+                        // The emulated DAC runs on the 59.73 Hz frame
+                        // grid while the window paces 60 — steer the
+                        // faithful path too, or the ring overflows
+                        // into a burst-drop buzz at the cap.
+                        let pairs = (st.mixed.len() / 2) as f64;
+                        let err = (pairs - RING_TARGET as f64) / RING_TARGET as f64;
+                        frac += step * (1.0 + 0.02 * err.clamp(-1.0, 1.0));
+                        while frac >= 1.0 {
+                            frac -= 1.0;
+                            match (st.mixed.pop_front(), st.mixed.pop_front()) {
+                                (Some(l), Some(r)) => last = (l, r),
+                                _ => st.holds += 1,
+                            }
+                        }
+                        (
+                            faithful_dc[0].next(last.0 as f32 / 32768.0),
+                            faithful_dc[1].next(last.1 as f32 / 32768.0),
+                        )
+                    };
+                    // Crossfade between the two finished paths. Both are
+                    // level-matched (shared OUT_GAIN below), so a linear
+                    // blend across the ~40 ms slew is seam-free — the
+                    // music is the same, only the rendering differs.
+                    let target = if st.enhanced_on { 1.0 } else { 0.0 };
+                    mode_x += (target - mode_x) * mode_k;
+                    let l = fl + (el - fl) * mode_x;
+                    let r = fr + (er - fr) * mode_x;
                     // Calibrate the hardware rail (±0x200 units = ±0.5
                     // here) toward device full scale. Both paths share
                     // the gain so the A/V toggle stays level-matched;
