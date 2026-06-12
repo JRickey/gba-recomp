@@ -38,11 +38,13 @@ pub struct Analysis {
     pub blocks: Vec<Block>,
 }
 
-/// Composite code view: ROM plus optional profiled RAM snapshots.
+/// Composite code view: ROM plus optional profiled RAM snapshots and an
+/// optional real BIOS image (region 0, fixed like ROM).
 pub struct View<'a> {
     pub rom: &'a [u8],
     pub ewram: Option<&'a [u8]>,
     pub iwram: Option<&'a [u8]>,
+    pub bios: Option<&'a [u8]>,
 }
 
 impl View<'_> {
@@ -54,6 +56,7 @@ impl View<'_> {
             }
             0x02 => self.ewram.map(|m| (m, (addr & 0x3_FFFF) as usize)),
             0x03 => self.iwram.map(|m| (m, (addr & 0x7FFF) as usize)),
+            0x00 if addr < 0x4000 => self.bios.map(|m| (m, addr as usize)),
             _ => None,
         }
     }
@@ -141,7 +144,10 @@ pub fn analyze(view: &View, seeds: &[u32]) -> Analysis {
     // entries — that is where snapshot-data-as-code explodes.
     let may_enqueue = |target_key: u32, from_ram: bool, seed_set: &BTreeSet<u32>| -> bool {
         let region = (target_key & !1) >> 24;
-        if region == 8 {
+        // ROM and BIOS are fixed images: speculative discovery is safe
+        // (junk blocks are never dispatched). View::valid gates BIOS
+        // targets on an image actually being present.
+        if region == 8 || region == 0 {
             return true;
         }
         from_ram || seed_set.contains(&target_key)
@@ -161,7 +167,7 @@ pub fn analyze(view: &View, seeds: &[u32]) -> Analysis {
             continue;
         }
 
-        let from_ram = start >> 24 != 0x08;
+        let from_ram = !matches!(start >> 24, 0x08 | 0x00);
         let max_len = if from_ram { 512 } else { 4096 };
         let mut instrs = Vec::new();
         let mut addr = start;

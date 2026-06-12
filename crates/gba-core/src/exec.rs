@@ -28,6 +28,12 @@ pub fn step_hle_cached<B: Bus>(cpu: &mut Cpu, bus: &mut B, cache: &mut DecodeCac
     step_inner(cpu, bus, true, Some(cache))
 }
 
+/// Like [`step`] (no BIOS HLE — SWIs vector to the real BIOS at 0x08),
+/// memoizing decodes through `cache`.
+pub fn step_cached<B: Bus>(cpu: &mut Cpu, bus: &mut B, cache: &mut DecodeCache) -> Instr {
+    step_inner(cpu, bus, false, Some(cache))
+}
+
 /// Content-keyed decode memoization. An entry hits only when both its
 /// key (instruction address | thumb bit) and its raw encoding match the
 /// words just fetched, and decoding is a pure function of exactly those
@@ -92,6 +98,7 @@ fn step_inner<B: Bus>(
     cache: Option<&mut DecodeCache>,
 ) -> Instr {
     let pc = cpu.regs[PC as usize];
+    bus.note_fetch(pc | cpu.thumb() as u32);
     let instr = match cache {
         Some(c) => {
             if cpu.thumb() {

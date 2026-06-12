@@ -164,6 +164,14 @@ pub struct MemMap {
     /// machine stepped at the HLE seams (hardware values per the
     /// hardware reference): startup, after-SWI, in-IRQ, after-IRQ.
     pub bios_open: u32,
+    /// True when a real BIOS image was loaded (`load_bios`): the guest
+    /// executes the BIOS itself — no SWI/IRQ/IntrWait HLE — and
+    /// `bios_open` is maintained from actual fetches.
+    pub real_bios: bool,
+    /// True while the CPU is fetching from the BIOS region (updated by
+    /// `note_fetch`, and by the native dispatch loop at block entry).
+    /// Region-0 data reads return real bytes only then.
+    pub pc_in_bios: bool,
     /// Detected backup medium (drives 0x0D/0x0E region behavior).
     pub backup: BackupKind,
     pub flash: Option<Flash>,
@@ -256,6 +264,8 @@ impl MemMap {
             aff_dirty: [true; 2],
             unhandled_swis: 0,
             bios_open: 0xE129_F000, // after startup
+            real_bios: false,
+            pc_in_bios: false,
             backup,
             flash,
             eeprom,
@@ -277,6 +287,15 @@ impl MemMap {
             apu: crate::apu::Apu::default(),
             next_event: HBLANK_FLAG_CYCLE,
         }
+    }
+
+    /// Load a real BIOS image and switch the bus to real-BIOS mode:
+    /// region-0 reads return actual bytes while the CPU executes there,
+    /// and the read-protection value tracks real fetches.
+    pub fn load_bios(&mut self, bytes: &[u8]) {
+        let n = bytes.len().min(self.bios.len());
+        self.bios[..n].copy_from_slice(&bytes[..n]);
+        self.real_bios = true;
     }
 
     /// Current backup-media contents, for .sav persistence.
@@ -1044,10 +1063,16 @@ impl Bus for MemMap {
         match addr >> 24 {
             0x00 => {
                 if addr < 0x4000 {
-                    // BIOS read protection: the guest (HLE, never
-                    // executing from BIOS) sees the last-fetched BIOS
-                    // opcode, byte-laned by address.
-                    (self.bios_open >> ((addr & 3) * 8)) as u8
+                    if self.pc_in_bios {
+                        // Real-BIOS execution: code running in the BIOS
+                        // reads its own bytes.
+                        self.bios[addr as usize]
+                    } else {
+                        // BIOS read protection: from outside, the guest
+                        // sees the last-fetched BIOS opcode, byte-laned
+                        // by address.
+                        (self.bios_open >> ((addr & 3) * 8)) as u8
+                    }
                 } else {
                     0 // open bus (unmodeled)
                 }
@@ -1140,8 +1165,13 @@ impl Bus for MemMap {
         match addr >> 24 {
             0x00 => {
                 if addr < 0x4000 {
-                    // BIOS read protection (see read8).
-                    (self.bios_open >> ((addr & 2) * 8)) as u16
+                    if self.pc_in_bios {
+                        let off = (addr & !1) as usize;
+                        u16::from_le_bytes([self.bios[off], self.bios[off + 1]])
+                    } else {
+                        // BIOS read protection (see read8).
+                        (self.bios_open >> ((addr & 2) * 8)) as u16
+                    }
                 } else {
                     self.rd16_bytes(addr)
                 }
@@ -1206,8 +1236,13 @@ impl Bus for MemMap {
         match addr >> 24 {
             0x00 => {
                 if addr < 0x4000 {
-                    // BIOS read protection (see read8).
-                    self.bios_open
+                    if self.pc_in_bios {
+                        let off = (addr & !3) as usize;
+                        u32::from_le_bytes(self.bios[off..off + 4].try_into().unwrap())
+                    } else {
+                        // BIOS read protection (see read8).
+                        self.bios_open
+                    }
                 } else {
                     self.rd32_halves(addr)
                 }
@@ -1400,6 +1435,30 @@ impl Bus for MemMap {
     fn note_swi_returned(&mut self) {
         self.bios_open = 0xE3A0_2004; // after SWI
     }
+
+    fn note_fetch(&mut self, key: u32) {
+        if !self.real_bios {
+            return;
+        }
+        let pc = key & !1;
+        let in_bios = pc < 0x4000;
+        self.pc_in_bios = in_bios;
+        if in_bios {
+            // Hardware: the protection value is the last opcode the CPU
+            // *fetched* from the BIOS — the pipeline prefetch, two
+            // instructions ahead of the one executing (+8 ARM, +4
+            // Thumb; the external conformance suite encodes the four
+            // canonical seams as 0xDC+8 / 0x188+8 / 0x134+8 / 0x13C+8).
+            // Tracking it per executed instruction reproduces them all
+            // by construction.
+            let ahead = if key & 1 != 0 { 4 } else { 8 };
+            let off = ((pc.wrapping_add(ahead)) & !3) as usize;
+            if off + 4 <= self.bios.len() {
+                self.bios_open =
+                    u32::from_le_bytes(self.bios[off..off + 4].try_into().unwrap());
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1417,6 +1476,28 @@ mod tests {
         assert_eq!(mem.read16(0x2), 0xE129);
         mem.note_swi_returned();
         assert_eq!(mem.read32(0x10), 0xE3A0_2004);
+    }
+
+    #[test]
+    fn real_bios_reads_track_fetch_location() {
+        let mut mem = MemMap::new(vec![]);
+        let mut bios = vec![0u8; 0x4000];
+        bios[0x100..0x104].copy_from_slice(&0xDEAD_BEEFu32.to_le_bytes());
+        // The protection value is the pipeline prefetch: executing at
+        // 0x200 has fetched 0x208 (ARM, +8).
+        bios[0x208..0x20C].copy_from_slice(&0x1234_5678u32.to_le_bytes());
+        mem.load_bios(&bios);
+
+        // Fetching inside the BIOS: reads return real bytes.
+        mem.note_fetch(0x200);
+        assert_eq!(mem.read32(0x100), 0xDEAD_BEEF);
+        assert_eq!(mem.read16(0x102), 0xDEAD);
+        assert_eq!(mem.read8(0x100), 0xEF);
+
+        // Fetching outside: protection value = last BIOS prefetch.
+        mem.note_fetch(0x0800_0000);
+        assert_eq!(mem.read32(0x100), 0x1234_5678);
+        assert_eq!(mem.read8(0x0), 0x78);
     }
 
     #[test]

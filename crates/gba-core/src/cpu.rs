@@ -99,6 +99,20 @@ impl Cpu {
         cpu
     }
 
+    /// Hardware reset state, for booting a real BIOS from the reset
+    /// vector: SVC mode with IRQ+FIQ masked, ARM state, PC = 0, every
+    /// register and bank zeroed — the BIOS sets up the stacks itself.
+    pub fn reset_hard_boot(&mut self) {
+        self.regs = [0; 16];
+        self.cpsr = Mode::Svc as u32 | FLAG_I | FLAG_F;
+        self.branch = None;
+        self.bank_r13 = [0; 6];
+        self.bank_r14 = [0; 6];
+        self.spsr = [0; 6];
+        self.usr_r8_12 = [0; 5];
+        self.fiq_r8_12 = [0; 5];
+    }
+
     pub fn mode(&self) -> Mode {
         Mode::from_bits(self.cpsr)
     }

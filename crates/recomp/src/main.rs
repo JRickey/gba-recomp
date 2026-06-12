@@ -55,9 +55,11 @@ fn main() -> ExitCode {
 /// `(name, synopsis, flag lines, description)` per command — the single
 /// source for both the overview listing and per-command help.
 const HELP: &[(&str, &str, &[&str], &str)] = &[
-    ("build", "recomp build <rom> [--ram]", &[
+    ("build", "recomp build <rom> [--ram] [--bios file]", &[
         "--ram    profile a short interpreter run first, translating the RAM-resident \
 code and computed-branch targets it discovers (recommended; play's cache builds use it)",
+        "--bios FILE    experimental: recompile a real 16 KB BIOS image too (region 0) \
+and disable all BIOS HLE; output goes to out/<stem>-bios.dylib",
     ], "Translate a ROM image to a native shared library at out/<stem>.dylib. \
 Emits C11 in bounded chunks and compiles them with cc."),
     ("play", "recomp play <rom> [--interp] [--stats] [--status]", &[
@@ -67,31 +69,35 @@ Emits C11 in bounded chunks and compiles them with cc."),
     ], "Windowed play. First launch translates the image into the per-user cache \
 (one-time, progress printed); later launches load it instantly. Reads input.cfg/av.cfg \
 from the shared config directory."),
-    ("runc", "recomp runc <rom> [--frames N] [--out img.ppm] [--input file]", &[
+    ("runc", "recomp runc <rom> [--frames N] [--out img.ppm] [--input file] [--bios file]", &[
         "--frames N      frames to run (default 600)",
         "--out PATH      write the final frame as a PPM",
         "--input FILE    replay a recorded input script (see play's RECOMP_RECORD_INPUT)",
+        "--bios FILE     run a real-BIOS build (loads out/<stem>-bios.dylib; no BIOS HLE)",
     ], "Run the recompiled output from out/<stem>.dylib headless (build first); \
 prints frame hash and native/fallback counts."),
-    ("verify", "recomp verify <rom> [--frames N] [--reuse] [--dump prefix] [--input file]", &[
+    ("verify", "recomp verify <rom> [--frames N] [--reuse] [--dump prefix] [--input file] [--bios file]", &[
         "--frames N       frames to compare (default 600)",
         "--reuse          skip the rebuild if out/<stem>.dylib exists",
         "--dump PREFIX    write both final frames as PREFIX.interp.ppm / PREFIX.recomp.ppm",
         "--input FILE     replay a recorded input script on both sides (instead of demo taps)",
+        "--bios FILE      verify with a real recompiled BIOS on both sides (no BIOS HLE)",
     ], "Differential check: run the interpreter and the recompiled output, compare \
 frame hashes, print MATCH or MISMATCH (exit code follows)."),
-    ("run", "recomp run <rom> [--max-steps N] [--trace] [--hist]", &[
+    ("run", "recomp run <rom> [--max-steps N] [--trace] [--hist] [--bios file]", &[
         "--max-steps N    stop after N interpreter steps",
         "--trace          disassemble every executed instruction to stderr",
         "--hist           print a hot-PC histogram at exit",
+        "--bios FILE      execute a real 16 KB BIOS image (boot from the reset vector; no HLE)",
     ], "Headless interpreter run; the conformance-suite driver (a pass parks with r12=0)."),
-    ("frames", "recomp frames <rom> [--frames N] [--out img.ppm] [--keys MASK] [--demo] [--input file] [--sav file]", &[
+    ("frames", "recomp frames <rom> [--frames N] [--out img.ppm] [--keys MASK] [--demo] [--input file] [--sav file] [--bios file]", &[
         "--frames N      frames to run (default 600)",
         "--out PATH      write the final frame as a PPM",
         "--keys MASK     hold a KEYINPUT mask for the whole run (hex)",
         "--demo          deterministic demo input: periodic Start, then A taps",
         "--input FILE    replay a recorded input script (see play's RECOMP_RECORD_INPUT)",
         "--sav FILE      preload a save file",
+        "--bios FILE     execute a real 16 KB BIOS image (boot from the reset vector; no HLE)",
     ], "Headless boot to frame N on the interpreter; prints the frame hash plus \
 boot diagnostics (DISPCNT/PC/SWI and live disassembly at PC)."),
     ("dis", "recomp dis <rom> [--addr HEX] [--count N] [--thumb]", &[
@@ -170,6 +176,27 @@ impl InputScript {
             0 => 0x3FF,
             n => self.0[n - 1].1,
         }
+    }
+}
+
+/// Load and sanity-check a real BIOS image for --bios runs.
+fn load_bios_file(path: &str) -> Result<Vec<u8>, String> {
+    let bytes = std::fs::read(path).map_err(|e| format!("{path}: {e}"))?;
+    if bytes.len() != 0x4000 {
+        return Err(format!(
+            "{path}: expected a 16384-byte BIOS image, got {} bytes",
+            bytes.len()
+        ));
+    }
+    Ok(bytes)
+}
+
+/// Construct the machine for a run: real-BIOS mode when an image is
+/// given (boots from the reset vector, no HLE), HLE boot otherwise.
+fn make_machine(rom: Vec<u8>, bios: Option<&[u8]>) -> Machine {
+    match bios {
+        Some(b) => Machine::new_with_bios(rom, b),
+        None => Machine::new(rom),
     }
 }
 
@@ -261,6 +288,7 @@ fn cmd_run(args: &[String]) -> Result<(), String> {
     let mut max_steps = 200_000_000u64;
     let mut trace = false;
     let mut hist = false;
+    let mut bios: Option<Vec<u8>> = None;
 
     let mut it = args.iter();
     while let Some(arg) = it.next() {
@@ -271,6 +299,7 @@ fn cmd_run(args: &[String]) -> Result<(), String> {
             }
             "--trace" => trace = true,
             "--hist" => hist = true,
+            "--bios" => bios = Some(load_bios_file(it.next().ok_or("--bios needs a value")?)?),
             other if rom_path.is_none() => rom_path = Some(other.to_string()),
             other => return Err(format!("unexpected argument {other:?}")),
         }
@@ -278,7 +307,7 @@ fn cmd_run(args: &[String]) -> Result<(), String> {
     let rom_path = rom_path.ok_or("missing ROM path")?;
     let rom = std::fs::read(&rom_path).map_err(|e| format!("{rom_path}: {e}"))?;
 
-    let mut m = Machine::new(rom);
+    let mut m = make_machine(rom, bios.as_deref());
     let mut counts: std::collections::HashMap<u32, u64> = std::collections::HashMap::new();
 
     let mut steps = 0u64;
@@ -336,6 +365,7 @@ fn cmd_frames(args: &[String]) -> Result<(), String> {
     let mut demo = false; // verify-style Start/A taps (menus need edges)
     let mut input: Option<InputScript> = None; // recorded-session replay
     let mut sav: Option<String> = None; // load backup media before boot
+    let mut bios: Option<Vec<u8>> = None; // real-BIOS execution (no HLE)
 
     let mut it = args.iter();
     while let Some(arg) = it.next() {
@@ -351,6 +381,7 @@ fn cmd_frames(args: &[String]) -> Result<(), String> {
                 input = Some(InputScript::load(it.next().ok_or("--input needs a value")?)?)
             }
             "--sav" => sav = Some(it.next().ok_or("--sav needs a value")?.to_string()),
+            "--bios" => bios = Some(load_bios_file(it.next().ok_or("--bios needs a value")?)?),
             other if rom_path.is_none() => rom_path = Some(other.to_string()),
             other => return Err(format!("unexpected argument {other:?}")),
         }
@@ -358,7 +389,7 @@ fn cmd_frames(args: &[String]) -> Result<(), String> {
     let rom_path = rom_path.ok_or("missing ROM path")?;
     let rom = std::fs::read(&rom_path).map_err(|e| format!("{rom_path}: {e}"))?;
 
-    let mut m = Machine::new(rom);
+    let mut m = make_machine(rom, bios.as_deref());
     m.bus.keys = keys;
     if let Some(p) = &sav {
         let data = std::fs::read(p).map_err(|e| format!("{p}: {e}"))?;
@@ -1272,7 +1303,7 @@ fn ensure_native(
         if status {
             status_line("building 0");
         }
-        build_dylib(rom_path, true, lib_str, &mut |pct| {
+        build_dylib(rom_path, true, None, lib_str, &mut |pct| {
             if status {
                 status_line(&format!("building {pct}"));
             }
@@ -1725,9 +1756,12 @@ fn pad_pressed(gp: &gilrs::Gamepad, name: &str) -> bool {
 fn cmd_build(args: &[String]) -> Result<(), String> {
     let mut rom_path = None;
     let mut ram = false;
-    for arg in args {
+    let mut bios: Option<Vec<u8>> = None;
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
         match arg.as_str() {
             "--ram" => ram = true,
+            "--bios" => bios = Some(load_bios_file(it.next().ok_or("--bios needs a value")?)?),
             other if rom_path.is_none() => rom_path = Some(other.to_string()),
             other => return Err(format!("unexpected argument {other:?}")),
         }
@@ -1736,7 +1770,10 @@ fn cmd_build(args: &[String]) -> Result<(), String> {
     std::fs::create_dir_all("out").map_err(|e| e.to_string())?;
     let stem = Path::new(rom_path)
         .file_stem().and_then(|s| s.to_str()).unwrap_or("game").to_string();
-    build_dylib(rom_path, ram, &format!("out/{stem}.dylib"), &mut |_| {})
+    // Real-BIOS builds get their own artifact: the translation bakes in
+    // different boot/SWI semantics, so it must never shadow an HLE build.
+    let suffix = if bios.is_some() { "-bios" } else { "" };
+    build_dylib(rom_path, ram, bios.as_deref(), &format!("out/{stem}{suffix}.dylib"), &mut |_| {})
 }
 
 /// The build pipeline behind `cmd_build`, parameterized on the output
@@ -1748,6 +1785,7 @@ fn cmd_build(args: &[String]) -> Result<(), String> {
 fn build_dylib(
     rom_path: &str,
     ram: bool,
+    bios: Option<&[u8]>,
     lib_path: &str,
     progress: &mut dyn FnMut(u8),
 ) -> Result<(), String> {
@@ -1762,18 +1800,36 @@ fn build_dylib(
     // Default-off pending the resident-vs-streamed-overlay measurements
     // for the labels design.
     let ewram_xlat = std::env::var_os("RECOMP_EWRAM").is_some();
-    let (seeds, ewram, iwram) = if !ram {
+    let (mut seeds, ewram, iwram) = if !ram {
         (Vec::new(), Vec::new(), Vec::new())
     } else {
-        let mut m = Machine::new(rom.clone());
+        // Profile under the same boot semantics the output will run with:
+        // a real-BIOS build profiles a real-BIOS run.
+        let mut m = make_machine(rom.clone(), bios);
         let mut seeds = std::collections::BTreeSet::new();
         let mut prev_end = 0u32;
         let mut steps = 0u64;
         let mut last_pct = 0u8;
-        while m.bus.frames < 240 && steps < 60_000_000 {
+        // The profiling window counts frames of *game* execution: under a
+        // real BIOS the boot animation runs ~230 frames before the cart
+        // entry is ever reached, which would otherwise consume the whole
+        // window (measured: 0 entry points profiled).
+        let mut cart_frame0: Option<u64> = None;
+        loop {
+            if cart_frame0.is_none() && m.cpu.regs[15] >= 0x0800_0000 {
+                cart_frame0 = Some(m.bus.frames);
+            }
+            let done = match cart_frame0 {
+                Some(f0) => m.bus.frames >= f0 + 240,
+                None => false,
+            };
+            if done || steps >= 60_000_000 {
+                break;
+            }
             steps += 1;
             // Profiling occupies the first 20% of the reported build.
-            let pct = (m.bus.frames * 20 / 240) as u8;
+            let f0 = cart_frame0.unwrap_or(m.bus.frames);
+            let pct = ((m.bus.frames - f0) * 20 / 240) as u8;
             if pct != last_pct {
                 last_pct = pct;
                 progress(pct);
@@ -1787,10 +1843,16 @@ fn build_dylib(
             // entry guards detect the swap but the hash-then-interpret
             // cycle is pure overhead; RECOMP_EWRAM opts in (resident
             // EWRAM engines, where the guard always passes).
+            // Real-BIOS builds also seed observed BIOS entries: the
+            // vectors + pointer sweep cover the static reachables, but
+            // indirect returns (IntrWait re-entry, handler exits) are
+            // only visible dynamically — and the BIOS is as immutable
+            // as ROM, so they need no guard either.
             let seedable = |pc: u32| {
                 pc >> 24 == 3
                     || (ewram_xlat && pc >> 24 == 2)
                     || (0x08..=0x0D).contains(&(pc >> 24))
+                    || (bios.is_some() && pc < 0x4000)
             };
             match m.step() {
                 StepEvent::Instr(instr) => {
@@ -1812,10 +1874,31 @@ fn build_dylib(
         (seeds.into_iter().collect::<Vec<u32>>(), m.bus.ewram.clone(), m.bus.iwram.clone())
     };
 
+    // Real-BIOS translation seeds: the exception vectors, plus a sweep of
+    // every aligned word in the image that looks like an in-BIOS code
+    // pointer — the SWI dispatcher reaches its handlers through an
+    // address table (an indexed load, not a PC-relative literal), which
+    // recursive traversal alone cannot follow. Junk seeds are harmless:
+    // unreached blocks just bloat the output (translate-everything).
+    if let Some(b) = bios {
+        seeds.extend([0x00u32, 0x08, 0x18]);
+        let mut swept = 0usize;
+        for off in (0..b.len() - 3).step_by(4) {
+            let v = u32::from_le_bytes(b[off..off + 4].try_into().unwrap());
+            let t = v & !1;
+            if v != 0 && t < 0x4000 && (v & 1 == 1 || v & 3 == 0) {
+                seeds.push(if v & 1 == 1 { t | 1 } else { t });
+                swept += 1;
+            }
+        }
+        println!("bios: seeded 3 vectors + {swept} swept pointer words");
+    }
+
     let view = analyze::View {
         rom: &rom,
         ewram: if ram && ewram_xlat { Some(&ewram) } else { None },
         iwram: if ram { Some(&iwram) } else { None },
+        bios,
     };
     let analysis = analyze::analyze(&view, &seeds);
     let n_instrs: usize = analysis.blocks.iter().map(|b| b.instrs.len()).sum();
@@ -1883,6 +1966,8 @@ struct BlockTable {
     /// Dense EWRAM table, allocated only when an EWRAM block exists
     /// (experimental RECOMP_EWRAM builds).
     ewram: Vec<Option<BlockFn>>,
+    /// Dense BIOS table (region 0), allocated only for --bios builds.
+    bios: Vec<Option<BlockFn>>,
     other: std::collections::HashMap<u32, BlockFn>,
     len: usize,
 }
@@ -1910,10 +1995,12 @@ impl BlockTable {
         let any_ewram = blocks
             .iter()
             .any(|b| (b.key.wrapping_sub(EWRAM_BASE) as usize) < 0x4_0000);
+        let any_bios = blocks.iter().any(|b| b.key < 0x4000);
         let mut t = BlockTable {
             rom: vec![None; rom_max],
             iwram: vec![None; 0x8000],
             ewram: vec![None; if any_ewram { 0x4_0000 } else { 0 }],
+            bios: vec![None; if any_bios { 0x4000 } else { 0 }],
             other: std::collections::HashMap::new(),
             len: blocks.len(),
         };
@@ -1925,7 +2012,9 @@ impl BlockTable {
         for b in blocks {
             let r = b.key.wrapping_sub(ROM_BASE) as usize;
             let w = b.key.wrapping_sub(IWRAM_BASE) as usize;
-            if r < t.rom.len() {
+            if (b.key as usize) < t.bios.len() {
+                t.bios[b.key as usize] = Some(b.func);
+            } else if r < t.rom.len() {
                 t.rom[r] = Some(b.func);
             } else if w < t.iwram.len() {
                 if let Some(mx) = iwram_max {
@@ -1960,6 +2049,9 @@ impl BlockTable {
         if e < self.ewram.len() {
             return self.ewram[e];
         }
+        if (key as usize) < self.bios.len() {
+            return self.bios[key as usize];
+        }
         if self.other.is_empty() {
             None
         } else {
@@ -1992,8 +2084,11 @@ fn run_frame_native(
     while !m.bus.frame_ready && steps < max_steps {
         steps += 1;
         // Interrupt machinery and sleep states go through Machine::step.
+        // (The IRQ-return-stub check is HLE-only: under a real BIOS that
+        // address is ordinary BIOS code.)
         if m.bus.halted
-            || (m.cpu.regs[15] == gba_core::machine::IRQ_RETURN_ADDR
+            || (!m.bus.real_bios
+                && m.cpu.regs[15] == gba_core::machine::IRQ_RETURN_ADDR
                 && m.cpu.mode() == gba_core::Mode::Irq)
             || (m.bus.irq_pending() && !m.cpu.flag(gba_core::cpu::FLAG_I))
         {
@@ -2001,6 +2096,12 @@ fn run_frame_native(
             continue;
         }
         let key = m.cpu.regs[15] | m.cpu.thumb() as u32;
+        // Real-BIOS mode: native blocks bypass the interpreter's fetch
+        // hook, so maintain the executing-in-BIOS flag at dispatch
+        // (region-0 reads return real bytes only while it is set).
+        if m.bus.real_bios {
+            m.bus.pc_in_bios = key < 0x4000;
+        }
         // MP2K HLE hook at block granularity (SoundMainRAM is a call
         // target, so its entry is always a dispatch point). The
         // interpreter fallback re-checks inside step(); the hook is
@@ -2124,6 +2225,7 @@ fn cmd_runc(args: &[String]) -> Result<(), String> {
     let mut frames = 600u64;
     let mut out: Option<String> = None;
     let mut input: Option<InputScript> = None;
+    let mut bios: Option<Vec<u8>> = None;
     let mut it = args.iter();
     while let Some(arg) = it.next() {
         match arg.as_str() {
@@ -2135,6 +2237,7 @@ fn cmd_runc(args: &[String]) -> Result<(), String> {
             "--input" => {
                 input = Some(InputScript::load(it.next().ok_or("--input needs a value")?)?)
             }
+            "--bios" => bios = Some(load_bios_file(it.next().ok_or("--bios needs a value")?)?),
             other if rom_path.is_none() => rom_path = Some(other.to_string()),
             other => return Err(format!("unexpected argument {other:?}")),
         }
@@ -2143,14 +2246,15 @@ fn cmd_runc(args: &[String]) -> Result<(), String> {
     let rom = std::fs::read(&rom_path).map_err(|e| format!("{rom_path}: {e}"))?;
     let stem = Path::new(&rom_path)
         .file_stem().and_then(|s| s.to_str()).unwrap_or("game").to_string();
-    let lib_path = format!("out/{stem}.dylib");
+    let suffix = if bios.is_some() { "-bios" } else { "" };
+    let lib_path = format!("out/{stem}{suffix}.dylib");
 
     let lib = unsafe { libloading::Library::new(&lib_path) }
         .map_err(|e| format!("{lib_path}: {e}"))?;
     let table = BlockTable::load(&lib)?;
     println!("loaded {} translated blocks", table.len);
 
-    let mut m = Machine::new(rom);
+    let mut m = make_machine(rom, bios.as_deref());
     // RECOMP_MP2K=1: arm the HLE shadow under native dispatch — the
     // hook-at-block-boundary path play uses, validated headless here.
     if std::env::var_os("RECOMP_MP2K").is_some() {
@@ -2180,7 +2284,8 @@ fn cmd_runc(args: &[String]) -> Result<(), String> {
                 let pc = m.cpu.regs[15];
                 let c0 = m.bus.clock;
                 if m.bus.halted
-                    || (m.cpu.regs[15] == gba_core::machine::IRQ_RETURN_ADDR
+                    || (!m.bus.real_bios
+                        && m.cpu.regs[15] == gba_core::machine::IRQ_RETURN_ADDR
                         && m.cpu.mode() == gba_core::Mode::Irq)
                     || (m.bus.irq_pending() && !m.cpu.flag(gba_core::cpu::FLAG_I))
                 {
@@ -2189,6 +2294,9 @@ fn cmd_runc(args: &[String]) -> Result<(), String> {
                     continue;
                 }
                 let key = m.cpu.regs[15] | m.cpu.thumb() as u32;
+                if m.bus.real_bios {
+                    m.bus.pc_in_bios = key < 0x4000;
+                }
                 match table.get(key) {
                     Some(f) => {
                         f(&RT_API, mptr);
@@ -2310,6 +2418,7 @@ fn cmd_verify(args: &[String]) -> Result<(), String> {
     let mut reuse = false;
     let mut dump: Option<String> = None;
     let mut input: Option<String> = None;
+    let mut bios_path: Option<String> = None;
     let mut it = args.iter();
     while let Some(arg) = it.next() {
         match arg.as_str() {
@@ -2325,21 +2434,30 @@ fn cmd_verify(args: &[String]) -> Result<(), String> {
             "--input" => {
                 input = Some(it.next().ok_or("--input needs a value")?.to_string())
             }
+            "--bios" => {
+                bios_path = Some(it.next().ok_or("--bios needs a value")?.to_string())
+            }
             other if rom_path.is_none() => rom_path = Some(other.to_string()),
             other => return Err(format!("unexpected argument {other:?}")),
         }
     }
     let rom_path = rom_path.ok_or("missing ROM path")?;
+    let bios = bios_path.as_deref().map(load_bios_file).transpose()?;
 
     let stem = Path::new(&rom_path)
         .file_stem().and_then(|s| s.to_str()).unwrap_or("game").to_string();
-    if !(reuse && Path::new(&format!("out/{stem}.dylib")).is_file()) {
-        cmd_build(&[rom_path.clone()])?;
+    let suffix = if bios.is_some() { "-bios" } else { "" };
+    if !(reuse && Path::new(&format!("out/{stem}{suffix}.dylib")).is_file()) {
+        let mut build_args = vec![rom_path.clone()];
+        if let Some(p) = &bios_path {
+            build_args.extend(["--bios".to_string(), p.clone()]);
+        }
+        cmd_build(&build_args)?;
     }
     let script = input.as_deref().map(InputScript::load).transpose()?;
-    let interp = run_hash(&rom_path, frames, false, script.as_ref(),
+    let interp = run_hash(&rom_path, frames, false, script.as_ref(), bios.as_deref(),
         dump.as_ref().map(|p| format!("{p}.interp.ppm")))?;
-    let recomp = run_hash(&rom_path, frames, true, script.as_ref(),
+    let recomp = run_hash(&rom_path, frames, true, script.as_ref(), bios.as_deref(),
         dump.as_ref().map(|p| format!("{p}.recomp.ppm")))?;
     let verdict = if interp == recomp { "MATCH" } else { "MISMATCH" };
     println!("verify {verdict} interp={interp:016x} recomp={recomp:016x}");
@@ -2388,10 +2506,11 @@ fn run_hash(
     frames: u64,
     recompiled: bool,
     input: Option<&InputScript>,
+    bios: Option<&[u8]>,
     dump: Option<String>,
 ) -> Result<u64, String> {
     let rom = std::fs::read(rom_path).map_err(|e| format!("{rom_path}: {e}"))?;
-    let mut m = Machine::new(rom);
+    let mut m = make_machine(rom, bios);
     let keys_at = |frame: u64| match input {
         Some(s) => s.keys_at(frame),
         None => demo_keys(frame),
@@ -2406,7 +2525,8 @@ fn run_hash(
     }
     let stem = Path::new(rom_path)
         .file_stem().and_then(|s| s.to_str()).unwrap_or("game").to_string();
-    let lib_path = format!("out/{stem}.dylib");
+    let suffix = if bios.is_some() { "-bios" } else { "" };
+    let lib_path = format!("out/{stem}{suffix}.dylib");
     let lib = unsafe { libloading::Library::new(&lib_path) }
         .map_err(|e| format!("{lib_path}: {e}"))?;
     let table = BlockTable::load(&lib)?;
