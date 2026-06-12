@@ -1,0 +1,130 @@
+name: release
+
+# Tag a version to cut a release:  git tag v0.2.0 && git push origin v0.2.0
+# Builds the CLI toolkit and the player runtime as separate, portable
+# archives for macOS (universal), Linux, and Windows, then attaches them
+# to a GitHub Release.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Tag or SHA to build (no release is published)"
+        required: false
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build ${{ matrix.name }}
+    runs-on: ${{ matrix.runs-on }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macos-universal
+            runs-on: macos-14
+            target: universal-apple-darwin
+          - name: linux-x86_64
+            runs-on: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+          - name: windows-x86_64
+            runs-on: windows-latest
+            target: x86_64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve version
+        id: ver
+        shell: bash
+        run: |
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=$(grep -m1 '^version' Cargo.toml | cut -d'\"' -f2)" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.name == 'macos-universal' && 'x86_64-apple-darwin,aarch64-apple-darwin' || matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      # Build deps for the audio (ALSA), input (udev), window (X11) and
+      # launcher (GTK file dialogs) stacks. Built on the oldest supported
+      # Ubuntu image so the glibc baseline stays portable.
+      - name: Linux build dependencies
+        if: matrix.name == 'linux-x86_64'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libasound2-dev libudev-dev libx11-dev libxkbcommon-dev \
+            libwayland-dev libgtk-3-dev pkg-config
+
+      - name: Build (universal macOS)
+        if: matrix.name == 'macos-universal'
+        shell: bash
+        run: |
+          cargo build --release --target x86_64-apple-darwin
+          cargo build --release --target aarch64-apple-darwin
+          mkdir -p dist/bin
+          for b in recomp gba-pack gba-launcher; do
+            lipo -create -output "dist/bin/$b" \
+              "target/x86_64-apple-darwin/release/$b" \
+              "target/aarch64-apple-darwin/release/$b"
+            # Ad-hoc sign — Apple Silicon kills unsigned binaries on launch.
+            codesign --force --sign - --timestamp=none "dist/bin/$b"
+            codesign --verify --verbose "dist/bin/$b"
+          done
+
+      - name: Build (Linux / Windows)
+        if: matrix.name != 'macos-universal'
+        shell: bash
+        run: |
+          cargo build --release --target ${{ matrix.target }}
+          mkdir -p dist/bin
+          EXE=""
+          [ "${{ runner.os }}" = "Windows" ] && EXE=".exe"
+          for b in recomp gba-pack gba-launcher; do
+            cp "target/${{ matrix.target }}/release/${b}${EXE}" "dist/bin/"
+          done
+
+      - name: Stage and archive bundles
+        shell: bash
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+          TARGET: ${{ matrix.target }}
+          BINDIR: dist/bin
+          OUTDIR: dist/out
+          RUNNER_OS: ${{ runner.os }}
+        run: |
+          [ "${{ runner.os }}" = "Windows" ] && export EXE=".exe"
+          bash scripts/package-release.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bundles-${{ matrix.target }}
+          path: dist/out/*
+          if-no-files-found: error
+
+  release:
+    name: publish release
+    needs: build
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: Publish
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true

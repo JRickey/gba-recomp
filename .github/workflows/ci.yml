@@ -1,0 +1,58 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: build & test (${{ matrix.name }})
+    runs-on: ${{ matrix.runs-on }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux
+            runs-on: ubuntu-22.04
+          - name: macos
+            runs-on: macos-14
+          - name: windows
+            runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Linux build dependencies
+        if: matrix.name == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libasound2-dev libudev-dev libx11-dev libxkbcommon-dev \
+            libwayland-dev libgtk-3-dev pkg-config
+
+      # The unit tests are self-contained — they need no ROM/BIOS test
+      # data (the corpus is gitignored), so CI runs the whole suite.
+      - run: cargo build --release --workspace
+      - run: cargo test --release --workspace
+
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all --check
