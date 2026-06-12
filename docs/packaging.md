@@ -60,8 +60,11 @@ c-source = false             # also emit the recompiled C tree with the
 Everything under `[runtime]` is borrowing from this repository: the
 packaged binary links the same crates `play` uses (gba-core, screen,
 input-config, the dispatch loop). Flexibility is the point — a recomp
-author takes the modules they want and nothing else, and the three
-planned reference implementations will exercise exactly this surface.
+author takes the modules they want and nothing else. The three
+planned reference implementations will exercise exactly this surface,
+and they live in **their own repositories**: nothing produced by the
+packager — binaries, translated code, C trees — is ever bundled or
+distributed in this repository. gba-lib ships the toolkit only.
 
 ## The in-game menu
 
@@ -90,9 +93,9 @@ ROM/BIOS flow is the packaged binary's equivalent.
   implementations).
 - **C source tree** (`c-source = true`): the emitted translation
   units, with functions named from the label map. This is the
-  inspection/hacking surface — note it is *derived from the image*,
-  so distributing it alongside a "no proprietary data" claim is the
-  packager's own judgment call, not ours.
+  inspection/hacking surface. Like the binary, it is *derived from
+  the image*; each recomp's own repository decides what it
+  distributes — this repository never carries either.
 
 ## Status
 
