@@ -1803,13 +1803,57 @@ fn build_dylib(
         let mut prev_end = 0u32;
         let mut steps = 0u64;
         let mut last_pct = 0u8;
-        while m.bus.frames < 240 && steps < 60_000_000 {
+        let mut last_frame = u64::MAX;
+        // Profile until the title has actually made sound, not a fixed
+        // boot window: silent-boot titles install their IWRAM mixer
+        // early but first execute it when music starts (often behind a
+        // menu), which a 240-frame profile never sees. Demo input
+        // drives the menus; engagement = the first nonzero audio
+        // output sample (FIFO init-priming is silent zeros, so pushes
+        // alone are a false signal), then a margin seeds the mixer's
+        // hot paths. RAM-seed quiescence extends further if discovery
+        // is still live; caps bound titles that never make sound.
+        const PROFILE_MIN_FRAMES: u64 = 240;
+        const PROFILE_MAX_FRAMES: u64 = 1800;
+        const PROFILE_AUDIO_MARGIN: u64 = 120;
+        let mut audio_from: Option<u64> = None;
+        let mut audio_base: Option<i16> = None;
+        loop {
+            let done = m.bus.frames >= PROFILE_MAX_FRAMES
+                || audio_from
+                    .is_some_and(|f0| m.bus.frames >= (f0 + PROFILE_AUDIO_MARGIN).max(PROFILE_MIN_FRAMES));
+            if done || steps >= 200_000_000 {
+                break;
+            }
             steps += 1;
-            // Profiling occupies the first 20% of the reported build.
-            let pct = (m.bus.frames * 20 / 240) as u8;
-            if pct != last_pct {
-                last_pct = pct;
-                progress(pct);
+            if m.bus.frames != last_frame {
+                last_frame = m.bus.frames;
+                m.bus.keys = demo_keys(m.bus.frames);
+                if audio_from.is_none() && !m.bus.audio_buf.is_empty() {
+                    // Engagement = output CHANGING, not merely nonzero
+                    // (a constant bias level is still silence). The
+                    // buffer must be drained: production self-caps
+                    // when nothing consumes it.
+                    let base = *audio_base.get_or_insert(m.bus.audio_buf[0]);
+                    if m.bus.audio_buf.iter().any(|&s| s != base) {
+                        audio_from = Some(m.bus.frames);
+                    }
+                    m.bus.audio_buf.clear();
+                }
+                // Profiling occupies the first 20% of the reported
+                // build; the endpoint moves until audio engages, so
+                // estimate it (the report only ever advances).
+                let est_end = match audio_from {
+                    None => PROFILE_MAX_FRAMES,
+                    Some(f0) => {
+                        PROFILE_MAX_FRAMES.min((f0 + PROFILE_AUDIO_MARGIN).max(PROFILE_MIN_FRAMES))
+                    }
+                };
+                let pct = (m.bus.frames * 20 / est_end.max(1)).min(20) as u8;
+                if pct > last_pct {
+                    last_pct = pct;
+                    progress(pct);
+                }
             }
             // Seed observed control-transfer targets in IWRAM and ROM.
             // ROM targets recover code static traversal can't reach
@@ -1825,20 +1869,16 @@ fn build_dylib(
                     || (ewram_xlat && pc >> 24 == 2)
                     || (0x08..=0x0D).contains(&(pc >> 24))
             };
-            match m.step() {
-                StepEvent::Instr(instr) => {
-                    let pc = m.cpu.regs[15];
-                    if pc != prev_end && seedable(pc) {
-                        seeds.insert(pc | m.cpu.thumb() as u32);
-                    }
-                    prev_end = instr.addr.wrapping_add(instr.size());
-                }
-                StepEvent::Idle => {
-                    let pc = m.cpu.regs[15];
-                    if pc != prev_end && seedable(pc) {
-                        seeds.insert(pc | m.cpu.thumb() as u32);
-                    }
-                }
+            let end = match m.step() {
+                StepEvent::Instr(instr) => Some(instr.addr.wrapping_add(instr.size())),
+                StepEvent::Idle => None,
+            };
+            let pc = m.cpu.regs[15];
+            if pc != prev_end && seedable(pc) {
+                seeds.insert(pc | m.cpu.thumb() as u32);
+            }
+            if let Some(e) = end {
+                prev_end = e;
             }
         }
         println!("profiled {} RAM entry points over {} frames", seeds.len(), m.bus.frames);
