@@ -1272,13 +1272,15 @@ fn ensure_native(
     // Experimental EWRAM translations get their own cache entry so they
     // can never be loaded by (or shadow) a normal run.
     let suffix = if std::env::var_os("RECOMP_EWRAM").is_some() { "-e" } else { "" };
-    // The label set participates in the key: a grown set means new
-    // coverage, so the next launch retranslates automatically.
+    // The label set (and the IWRAM snapshot backing it) participates
+    // in the key: grown coverage retranslates on the next launch.
     let lbl = labels::load_all(rom_path, &sha, rom.len());
-    let lsuffix = if lbl.rom.is_empty() {
+    let lsuffix = if lbl.is_empty() {
         String::new()
     } else {
-        format!("-l{:08x}", lbl.digest() as u32 ^ (lbl.digest() >> 32) as u32)
+        let blob = labels::Blob::load(&labels::blob_path(&sha));
+        let d = lbl.digest(blob.as_ref());
+        format!("-l{:08x}", d as u32 ^ (d >> 32) as u32)
     };
     let lib_path = dir.join(format!("{sha}{suffix}{lsuffix}.dylib"));
     let lib_str = lib_path.to_str().ok_or("non-UTF8 cache path")?;
@@ -1843,24 +1845,57 @@ fn build_dylib(
         (seeds.into_iter().collect::<Vec<u32>>(), m.bus.ewram.clone(), m.bus.iwram.clone())
     };
 
-    // Label-file seeds: runtime-discovered ROM entry points (recorded
+    // Label-file seeds: runtime-discovered entry points (recorded
     // play/runc sessions, community files) join the profile seeds.
-    // ROM is immutable, so these need no guard and a bogus entry can at
-    // worst translate unreachable code.
+    // ROM entries are immutable and unguarded; IWRAM entries translate
+    // from the recorder's local content snapshot, overlaid onto the
+    // profile snapshot, and run behind the whole-block content guards
+    // like every RAM-resident block.
+    let sha = rom_sha256(&rom);
     let mut seeds = seeds;
-    let lbl = labels::load_all(rom_path, &rom_sha256(&rom), rom.len());
-    if !lbl.rom.is_empty() {
-        let before = seeds.len();
+    let mut iwram = iwram;
+    let lbl = labels::load_all(rom_path, &sha, rom.len());
+    if !lbl.is_empty() {
         let mut set: std::collections::BTreeSet<u32> = seeds.iter().copied().collect();
+        let before = set.len();
         set.extend(&lbl.rom);
+        let rom_added = set.len() - before;
+        let mut iw_added = 0usize;
+        let mut iw_unbacked = 0usize;
+        if !lbl.iwram.is_empty() {
+            match labels::Blob::load(&labels::blob_path(&sha)) {
+                Some(blob) => {
+                    if iwram.is_empty() {
+                        iwram = vec![0; labels::IWRAM_LEN];
+                    }
+                    for i in 0..labels::IWRAM_LEN {
+                        if blob.mask[i] != 0 {
+                            iwram[i] = blob.img[i];
+                        }
+                    }
+                    for &key in &lbl.iwram {
+                        if blob.valid_at(key) && set.insert(key) {
+                            iw_added += 1;
+                        }
+                    }
+                }
+                None => iw_unbacked = lbl.iwram.len(),
+            }
+        }
         seeds = set.into_iter().collect();
-        println!("labels: +{} rom seeds", seeds.len() - before);
+        println!("labels: +{rom_added} rom, +{iw_added} iwram seeds");
+        if iw_unbacked != 0 {
+            println!(
+                "labels: {iw_unbacked} iwram entries lack a local snapshot — \
+run play/runc --record-labels to capture one"
+            );
+        }
     }
 
     let view = analyze::View {
         rom: &rom,
         ewram: if ram && ewram_xlat { Some(&ewram) } else { None },
-        iwram: if ram { Some(&iwram) } else { None },
+        iwram: if !iwram.is_empty() { Some(&iwram) } else { None },
     };
     let analysis = analyze::analyze(&view, &seeds);
     let n_instrs: usize = analysis.blocks.iter().map(|b| b.instrs.len()).sum();
@@ -2084,8 +2119,18 @@ fn run_frame_native(
                 // profiler applies.
                 if trace_fallback() {
                     if key & !1 != fb_prev_end {
-                        FALLBACK_ENTRIES
-                            .with(|h| *h.borrow_mut().entry(key).or_insert(0u64) += 1);
+                        let new = FALLBACK_ENTRIES.with(|h| {
+                            let mut h = h.borrow_mut();
+                            let len0 = h.len();
+                            *h.entry(key).or_insert(0u64) += 1;
+                            h.len() != len0
+                        });
+                        if new
+                            && key >> 24 == 3
+                            && FALLBACK_COLLECT.load(std::sync::atomic::Ordering::Relaxed)
+                        {
+                            capture_iwram(&m.bus.iwram, key);
+                        }
                     }
                     fb_prev_end = match m.step() {
                         StepEvent::Instr(i) => i.addr.wrapping_add(i.size()),
@@ -2115,6 +2160,35 @@ thread_local! {
     /// hit counts. Entries only, not straight-line continuations.
     static FALLBACK_ENTRIES: std::cell::RefCell<std::collections::HashMap<u32, u64>> =
         std::cell::RefCell::new(std::collections::HashMap::new());
+
+    /// --record-labels: IWRAM content accumulated at the moment each
+    /// new IWRAM entry point is discovered (the code is certainly live
+    /// right then; an end-of-session snapshot could miss swapped
+    /// overlays). Saved as the image's local snapshot blob.
+    static IWRAM_CAP: std::cell::RefCell<Option<Box<labels::Blob>>> =
+        std::cell::RefCell::new(None);
+}
+
+/// Fold the live IWRAM into the capture accumulator: first capture
+/// fills everything; later new-entry events force-refresh a window
+/// around the new entry (its code is live NOW; elsewhere, first-seen
+/// content stands and the runtime guards reject anything stale).
+fn capture_iwram(iwram: &[u8], entry: u32) {
+    IWRAM_CAP.with(|c| {
+        let mut c = c.borrow_mut();
+        let blob = c.get_or_insert_with(|| Box::new(labels::Blob::new()));
+        let n = iwram.len().min(labels::IWRAM_LEN);
+        for i in 0..n {
+            if blob.mask[i] == 0 {
+                blob.img[i] = iwram[i];
+                blob.mask[i] = 1;
+            }
+        }
+        let at = (entry & !1) as usize & (labels::IWRAM_LEN - 1);
+        let (lo, hi) = (at.saturating_sub(64), (at + 2048).min(n));
+        blob.img[lo..hi].copy_from_slice(&iwram[lo..hi]);
+        blob.mask[lo..hi].fill(1);
+    });
 }
 
 /// Census collection runs under RECOMP_TRACE_FALLBACK (prints at exit)
@@ -2139,9 +2213,11 @@ fn record_labels(rom_len: usize, sha: &str) -> Result<(), String> {
                 0x08..=0x0D if ((key & !1 & 0x01FF_FFFF) as usize) < rom_len => {
                     new.rom.insert(key);
                 }
-                r @ (0x02 | 0x03) => new.reserved.push(format!(
-                    "{} {:08x} {}",
-                    if r == 2 { "ewram" } else { "iwram" },
+                0x03 => {
+                    new.iwram.insert(key);
+                }
+                0x02 => new.reserved.push(format!(
+                    "ewram {:08x} {}",
                     key & !1,
                     if key & 1 != 0 { "t" } else { "a" }
                 )),
@@ -2154,17 +2230,35 @@ fn record_labels(rom_len: usize, sha: &str) -> Result<(), String> {
         true => labels::Labels::load(&path, sha, rom_len)?,
         false => labels::Labels::default(),
     };
-    let (rom0, ram0) = (all.rom.len(), all.reserved.len());
+    let (rom0, iw0) = (all.rom.len(), all.iwram.len());
     all.merge(new);
     all.save(&path, sha)?;
+    // Persist the IWRAM content captured at entry discovery: this
+    // session's bytes override prior sessions where captured (they
+    // reflect the overlays actually seen; guards reject the rest).
+    IWRAM_CAP.with(|c| -> Result<(), String> {
+        let Some(cap) = c.borrow_mut().take() else { return Ok(()) };
+        let bp = labels::blob_path(sha);
+        let mut blob = labels::Blob::load(&bp).unwrap_or_else(labels::Blob::new);
+        for i in 0..labels::IWRAM_LEN {
+            if cap.mask[i] != 0 {
+                blob.img[i] = cap.img[i];
+                blob.mask[i] = 1;
+            }
+        }
+        blob.save(&bp)?;
+        eprintln!("labels: iwram snapshot updated ({} bytes valid)", blob.valid_bytes());
+        Ok(())
+    })?;
     eprintln!(
-        "labels: +{} rom, +{} ram entries recorded ({} rom total) -> {}",
+        "labels: +{} rom, +{} iwram entries recorded ({} rom, {} iwram total) -> {}",
         all.rom.len() - rom0,
-        all.reserved.len() - ram0,
+        all.iwram.len() - iw0,
         all.rom.len(),
+        all.iwram.len(),
         path.display()
     );
-    if all.rom.len() > rom0 {
+    if all.rom.len() > rom0 || all.iwram.len() > iw0 {
         eprintln!("labels: the next translation rebuild covers the new entries");
     }
     Ok(())

@@ -29,11 +29,67 @@ use std::path::PathBuf;
 pub struct Labels {
     /// ROM entry points, `guest address | thumb bit`.
     pub rom: BTreeSet<u32>,
-    /// Reserved (iwram/ewram) record lines, preserved verbatim so a
-    /// rewrite never drops forward-compatibility data.
+    /// IWRAM entry points, `guest address | thumb bit`. Translatable
+    /// when a local content snapshot exists (see [`Blob`]); the record
+    /// itself stays portable presence data.
+    pub iwram: BTreeSet<u32>,
+    /// Reserved (ewram) record lines, preserved verbatim so a rewrite
+    /// never drops forward-compatibility data.
     pub reserved: Vec<String>,
     /// Malformed or out-of-range lines encountered while loading.
     pub skipped: usize,
+}
+
+/// Local IWRAM content snapshot backing the image's `iwram` labels:
+/// the 32 KB image plus a per-byte validity mask, accumulated by the
+/// recorder at the moment each new IWRAM entry point is discovered.
+/// Machine-local (it contains image-derived bytes) — never shared, and
+/// never part of the portable label file.
+pub struct Blob {
+    pub img: Vec<u8>,
+    pub mask: Vec<u8>,
+}
+
+const BLOB_MAGIC: &[u8] = b"gba-iwram v1\n";
+pub const IWRAM_LEN: usize = 0x8000;
+
+impl Blob {
+    pub fn new() -> Blob {
+        Blob { img: vec![0; IWRAM_LEN], mask: vec![0; IWRAM_LEN] }
+    }
+
+    pub fn load(path: &std::path::Path) -> Option<Blob> {
+        let data = std::fs::read(path).ok()?;
+        let body = data.strip_prefix(BLOB_MAGIC)?;
+        if body.len() != 2 * IWRAM_LEN {
+            return None;
+        }
+        Some(Blob { img: body[..IWRAM_LEN].to_vec(), mask: body[IWRAM_LEN..].to_vec() })
+    }
+
+    pub fn save(&self, path: &std::path::Path) -> Result<(), String> {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        }
+        let mut data = Vec::with_capacity(BLOB_MAGIC.len() + 2 * IWRAM_LEN);
+        data.extend_from_slice(BLOB_MAGIC);
+        data.extend_from_slice(&self.img);
+        data.extend_from_slice(&self.mask);
+        std::fs::write(path, data).map_err(|e| format!("{}: {e}", path.display()))
+    }
+
+    pub fn valid_at(&self, key: u32) -> bool {
+        self.mask[(key & !1) as usize & (IWRAM_LEN - 1)] != 0
+    }
+
+    pub fn valid_bytes(&self) -> usize {
+        self.mask.iter().filter(|&&m| m != 0).count()
+    }
+}
+
+/// The blob path for an image (next to its label accumulator).
+pub fn blob_path(sha: &str) -> PathBuf {
+    config_path(sha).with_extension("iwram")
 }
 
 /// Sanity cap: far above any real title, far below a runaway recorder.
@@ -87,7 +143,12 @@ impl Labels {
                 {
                     out.rom.insert(addr | thumb);
                 }
-                Some(("iwram" | "ewram", ..)) => out.reserved.push(line.to_string()),
+                Some(("iwram", addr, thumb))
+                    if addr >> 24 == 3 && addr & 1 == 0 && out.iwram.len() < MAX_LABELS =>
+                {
+                    out.iwram.insert(addr | thumb);
+                }
+                Some(("ewram", ..)) => out.reserved.push(line.to_string()),
                 _ => out.skipped += 1,
             }
         }
@@ -97,6 +158,7 @@ impl Labels {
     /// Union another set into this one.
     pub fn merge(&mut self, other: Labels) {
         self.rom.extend(other.rom);
+        self.iwram.extend(other.iwram);
         for l in other.reserved {
             if !self.reserved.contains(&l) {
                 self.reserved.push(l);
@@ -113,6 +175,9 @@ impl Labels {
         for &key in &self.rom {
             let _ = writeln!(s, "rom {:08x} {}", key & !1, if key & 1 != 0 { "t" } else { "a" });
         }
+        for &key in &self.iwram {
+            let _ = writeln!(s, "iwram {:08x} {}", key & !1, if key & 1 != 0 { "t" } else { "a" });
+        }
         for l in &self.reserved {
             let _ = writeln!(s, "{l}");
         }
@@ -123,16 +188,27 @@ impl Labels {
     }
 
     /// Stable content digest — participates in the translation cache
-    /// key so a grown label set retranslates automatically.
-    pub fn digest(&self) -> u64 {
+    /// key so a grown label set retranslates automatically. Includes
+    /// the local IWRAM snapshot when one backs the iwram records,
+    /// since translated output depends on its bytes.
+    pub fn digest(&self, blob: Option<&Blob>) -> u64 {
         let mut h = 0xcbf2_9ce4_8422_2325u64;
-        for &key in &self.rom {
-            for b in key.to_le_bytes() {
-                h ^= b as u64;
-                h = h.wrapping_mul(0x1_0000_01b3);
-            }
+        let mut eat = |b: u8| {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x1_0000_01b3);
+        };
+        for &key in self.rom.iter().chain(&self.iwram) {
+            key.to_le_bytes().into_iter().for_each(&mut eat);
+        }
+        if let Some(b) = blob {
+            b.img.iter().copied().for_each(&mut eat);
+            b.mask.iter().copied().for_each(&mut eat);
         }
         h
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.rom.is_empty() && self.iwram.is_empty()
     }
 }
 
@@ -157,13 +233,14 @@ pub fn load_all(rom_path: &str, sha: &str, rom_len: usize) -> Labels {
         match Labels::load(&p, sha, rom_len) {
             Ok(l) => {
                 eprintln!(
-                    "labels: {} rom entries from {}{}",
+                    "labels: {} rom + {} iwram entries from {}{}",
                     l.rom.len(),
+                    l.iwram.len(),
                     p.display(),
                     if l.reserved.is_empty() {
                         String::new()
                     } else {
-                        format!(" (+{} ram records, not yet translatable)", l.reserved.len())
+                        format!(" (+{} reserved records)", l.reserved.len())
                     }
                 );
                 out.merge(l);
@@ -186,10 +263,12 @@ mod tests {
         let mut l = Labels::default();
         l.rom.insert(0x0800_1234);
         l.rom.insert(0x0800_2001); // thumb
-        l.reserved.push("iwram 03001090 t".to_string());
+        l.iwram.insert(0x0300_1091); // thumb
+        l.reserved.push("ewram 02000420 a".to_string());
         l.save(&p, &sha).unwrap();
         let back = Labels::load(&p, &sha, 0x10000).unwrap();
         assert_eq!(back.rom, l.rom);
+        assert_eq!(back.iwram, l.iwram);
         assert_eq!(back.reserved, l.reserved);
         assert_eq!(back.skipped, 0);
         // Out-of-range and malformed lines skip; wrong sha refuses.
@@ -208,10 +287,28 @@ mod tests {
         let mut b = Labels::default();
         b.rom.insert(0x0800_0010);
         b.rom.insert(0x0800_0021);
-        let d0 = a.digest();
+        let d0 = a.digest(None);
         a.merge(b);
         assert_eq!(a.rom.len(), 2);
-        assert_ne!(a.digest(), d0);
+        assert_ne!(a.digest(None), d0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn blob_roundtrip_and_digest() {
+        let dir = std::env::temp_dir().join("gba-labels-blob-test");
+        let p = dir.join("t.iwram");
+        let mut blob = Blob::new();
+        blob.img[0x1090] = 0xAB;
+        blob.mask[0x1090] = 1;
+        blob.save(&p).unwrap();
+        let back = Blob::load(&p).unwrap();
+        assert_eq!(back.img[0x1090], 0xAB);
+        assert!(back.valid_at(0x0300_1091));
+        assert!(!back.valid_at(0x0300_1093));
+        assert_eq!(back.valid_bytes(), 1);
+        let l = Labels::default();
+        assert_ne!(l.digest(Some(&back)), l.digest(None));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

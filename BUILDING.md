@@ -121,8 +121,13 @@ across sessions and can be shared: a file named `<rom>.labels` next to
 the image is picked up automatically alongside the recorder's own
 accumulator in `<config_dir>/gba-recomp/labels/`. ROM entries are pure
 hints (the translation derives from the image itself, so a wrong label
-is harmless); `iwram`/`ewram` records are reserved for content-guarded
-RAM translation and currently counted but skipped.
+is harmless). `iwram` entries cover RAM-resident code: the recorder
+captures a machine-local content snapshot the moment each entry is
+discovered, the build translates from it, and the standard whole-block
+content guards keep execution correct if the game later swaps that
+memory (the snapshot stays on your machine — shared label files carry
+addresses only, so a recipient records their own snapshot by playing).
+`ewram` records are reserved and currently skipped.
 
 ### `gba-launcher` — the frontend
 
