@@ -232,3 +232,12 @@ opt in explicitly:
 
 Anything printed as `DEGRADED` is a defect surface (interpreter
 fallback, audio ring drops, slow frames) — it is intentionally loud.
+
+## Git hooks
+
+Enable the repo's formatting gate once per clone:
+
+    git config core.hooksPath .githooks
+
+The pre-commit hook runs `cargo fmt --all -- --check` (the same check CI's
+fmt job enforces) so formatting failures never reach CI.
