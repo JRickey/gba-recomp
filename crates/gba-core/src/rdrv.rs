@@ -110,6 +110,9 @@ struct Voice {
     grid_step: f64,
     /// Integer gain chain result (0..~0x80) over 128.
     gain: f32,
+    /// Render-set ramp target: this window ends at this gain (the next
+    /// tick's gain, or 0 for a voice's final window).
+    gain_target: f32,
     dead: bool,
 }
 
@@ -127,6 +130,7 @@ impl Default for Voice {
             instr: 0,
             grid_step: f64::NAN,
             gain: 0.0,
+            gain_target: 0.0,
             dead: false,
         }
     }
@@ -178,6 +182,10 @@ pub struct RdrvHle {
     /// Cursor of the last step pickup, so the fx-advance hook only
     /// commits when the music pass didn't (music paused).
     steps_cursor: u64,
+    /// Render-window gain ramp: samples into the window / expected
+    /// window length (the last hook gap).
+    win_pos: f64,
+    win_len: f64,
 }
 
 impl RdrvHle {
@@ -199,6 +207,8 @@ impl RdrvHle {
             engage_backoff: 0,
             last_hook_cursor: 0,
             steps_cursor: 0,
+            win_pos: 0.0,
+            win_len: f64::MAX,
         }
     }
 
@@ -262,6 +272,15 @@ impl RdrvHle {
         let fxvol = mem.u8(self.lay.fxvol).unwrap_or(0) as u32;
         let tunevol = mem.u8(self.lay.tunevol).unwrap_or(0) as u32;
 
+        // One-tick-delayed rendering: this hook closes the book on the
+        // guest's PREVIOUS tick — its start positions (last snapshot),
+        // its true per-voice steps (position telemetry over this gap),
+        // and both gain endpoints are now all known exactly. The render
+        // set below therefore reproduces tick N-1 verbatim, attacks
+        // included, at the cost of one tick of stream latency (which
+        // also matches the guest's own mix-to-DMA pipeline lag).
+        let prev_snap = self.pending;
+
         let mut n = 0usize;
         let groups: [(u32, u32, bool); 2] = [
             (self.lay.fx_base, self.lay.fx_count, false),
@@ -274,11 +293,11 @@ impl RdrvHle {
                 }
                 let va = base + i * V_STRIDE;
                 let v = &mut self.pending[n];
-                n += 1;
                 // The slot's previous content is this voice's snapshot
                 // from the last mix hook (slot indices are stable per
                 // address) — the baseline for position telemetry.
-                let prev = *v;
+                let prev = prev_snap[n];
+                n += 1;
                 *v = Voice { addr: va, ..Voice::default() };
                 let Some(state) = mem.u8(va + V_STATE) else { continue };
                 if state != 0x11 && state != 0x12 {
@@ -356,6 +375,40 @@ impl RdrvHle {
             }
         }
         self.count = n;
+
+        // Assemble the render set for the coming window from the
+        // previous tick's snapshot: exact pitch (telemetry), exact gain
+        // endpoints (prev → current, 0 for a voice's final window).
+        let render_ok = (256..=4096).contains(&gap);
+        self.win_len = if render_ok { gap as f64 } else { f64::MAX };
+        self.win_pos = 0.0;
+        for i in 0..n {
+            let prev = prev_snap[i];
+            let cur = self.pending[i];
+            let r = &mut self.voices[i];
+            *r = Voice::default();
+            if !render_ok || !prev.on || prev.addr != cur.addr {
+                continue;
+            }
+            let step = if cur.grid_step.is_finite() {
+                cur.grid_step
+            } else if prev.grid_step.is_finite() {
+                prev.grid_step
+            } else {
+                prev.step / self.mix_step
+            };
+            if !(step > 0.0) {
+                continue;
+            }
+            *r = prev;
+            r.pos = prev.guest_pos;
+            r.dead = false;
+            r.grid_step = step;
+            r.gain = prev.gain;
+            r.gain_target = if cur.on { cur.gain } else { 0.0 };
+            r.on = true;
+        }
+
         // Diagnostic (RECOMP_RDRV_TRACE): per-tick mixer snapshot.
         if std::env::var_os("RECOMP_RDRV_TRACE").is_some() && self.hooks < 600 {
             eprintln!(
@@ -417,7 +470,9 @@ impl RdrvHle {
                 }
             }
         }
-        self.voices[..self.count].copy_from_slice(&self.pending[..self.count]);
+        // The render set was assembled at the mix hook from the
+        // previous tick; the cache pickup above only feeds the NEXT
+        // tick's prev.on / fallback step.
     }
 
     /// Dispatch-loop entry: PC landed on one of the hook keys.
@@ -461,12 +516,18 @@ impl RdrvHle {
             return (0.0, 0.0);
         }
         let gain = self.vf.gain();
+        // Envelope ramp position within the window (both gain endpoints
+        // are guest ground truth; the lerp removes the per-tick zipper
+        // the 8-bit canon mixer steps through).
+        let t = (self.win_pos / self.win_len).min(1.0) as f32;
+        self.win_pos += 1.0;
         let mut sum = 0.0f32;
         for v in self.voices[..self.count].iter_mut() {
             if !v.on || v.dead {
                 continue;
             }
-            sum += sample_voice(v, mem) * v.gain * gain;
+            let g = v.gain + (v.gain_target - v.gain) * t;
+            sum += sample_voice(v, mem) * g * gain;
         }
         // Canon-domain check copy: the guest mixes on its own grid and
         // saturates the SUM to s8 — one stream-level ZOH at the guest

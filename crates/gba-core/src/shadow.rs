@@ -69,9 +69,10 @@ impl SelfCheck {
             return None;
         }
 
-        // The canon stream lags the shadow (mix-ahead + FIFO depth):
-        // correlate canon[t] against shadow[t - lag], lag >= 0.
-        let n = CHECK_WINDOW - CHECK_MAX_LAG;
+        // Pipeline skew between canon and shadow varies by engine and
+        // render model (mix-ahead + FIFO depth one way, delayed-render
+        // shadows the other): search the lag both ways.
+        let n = CHECK_WINDOW - 2 * CHECK_MAX_LAG;
         let mean = |v: &[(f32, f32)], side: usize| -> f64 {
             v.iter().map(|e| if side == 0 { e.0 as f64 } else { e.1 as f64 }).sum::<f64>()
                 / v.len() as f64
@@ -102,15 +103,16 @@ impl SelfCheck {
                 verdict = Some((1.0, ratio));
             } else {
                 let mut best: Option<f32> = None;
-                for lag in (0..=CHECK_MAX_LAG).step_by(2) {
+                for lag in (-(CHECK_MAX_LAG as isize)..=CHECK_MAX_LAG as isize).step_by(2) {
                     let mut sum = 0.0;
                     let mut sides = 0;
                     for side in 0..2 {
-                        let x: Vec<f64> = self.ex[CHECK_MAX_LAG..CHECK_WINDOW]
+                        let x: Vec<f64> = self.ex[CHECK_MAX_LAG..CHECK_WINDOW - CHECK_MAX_LAG]
                             .iter()
                             .map(|e| if side == 0 { e.0 as f64 } else { e.1 as f64 })
                             .collect();
-                        let y: Vec<f64> = self.ey[CHECK_MAX_LAG - lag..CHECK_WINDOW - lag]
+                        let y0 = (CHECK_MAX_LAG as isize - lag) as usize;
+                        let y: Vec<f64> = self.ey[y0..y0 + n]
                             .iter()
                             .map(|e| if side == 0 { e.0 as f64 } else { e.1 as f64 })
                             .collect();
