@@ -24,6 +24,11 @@ pub struct Manifest {
     pub rom_sha256: String,
     pub bios_sha256: String,
     pub interpreter: bool,
+    /// Whether the press-Escape in-game menu is available. Default true;
+    /// a package may pin it off, in which case Escape quits as it did
+    /// before the menu existed and the binary is configured by its
+    /// config file only.
+    pub menu: bool,
     /// Translation library file name, relative to the manifest.
     pub translation: String,
     /// The directory the manifest was loaded from.
@@ -76,6 +81,11 @@ fn parse(path: &Path, dir: PathBuf) -> Result<Manifest, String> {
         interpreter: doc
             .get("runtime")
             .and_then(|t| t.get("interpreter"))
+            .and_then(toml::Value::as_bool)
+            .unwrap_or(true),
+        menu: doc
+            .get("runtime")
+            .and_then(|t| t.get("menu"))
             .and_then(toml::Value::as_bool)
             .unwrap_or(true),
         translation: s(["translation", "file"])?,

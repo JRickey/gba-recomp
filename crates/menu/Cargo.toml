@@ -1,0 +1,10 @@
+[package]
+name = "menu"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "In-game pause/settings overlay for the play runtime"
+
+[dependencies]
+input-config = { version = "0.1.0", path = "../input-config" }
+screen = { version = "0.1.0", path = "../screen" }

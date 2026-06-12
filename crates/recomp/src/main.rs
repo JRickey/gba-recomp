@@ -1045,7 +1045,10 @@ Place your own dump as gba_bios.bin next to the executable:\n  {}",
     // emulated-frame stream, color LUT to the display's colorspace, and a
     // GPU grid/scaling pass on this same window. Settings come from the
     // launcher-managed A/V config; unknown values fall back loudly.
-    let screen_kind = screen::ScreenKind::by_name(&av.screen).unwrap_or_else(|| {
+    // A/V config is `mut`: the in-game menu edits it live (below), so the
+    // screen objects derived from it rebuild in place on a change.
+    let mut av = av;
+    let mut screen_kind = screen::ScreenKind::by_name(&av.screen).unwrap_or_else(|| {
         eprintln!("av.cfg: unknown video.screen {:?} — using frontlit", av.screen);
         screen::ScreenKind::Frontlit
     });
@@ -1054,14 +1057,14 @@ Place your own dump as gba_bios.bin next to the executable:\n  {}",
             eprintln!("av.cfg: unknown video.gamut {:?} — using auto", av.display_gamut);
             screen::DisplayTarget::Auto
         });
-    let lut = screen::ColorLut::build(&screen::ColorSettings {
+    let mut lut = screen::ColorLut::build(&screen::ColorSettings {
         screen: screen_kind,
         darken: input_config::AvConfig::knob(&av.screen_darken)
             .map(f64::from)
             .unwrap_or(f64::NAN),
         target: display_target,
     });
-    let response = screen::ResponseMode::by_name(&av.response).unwrap_or_else(|| {
+    let mut response = screen::ResponseMode::by_name(&av.response).unwrap_or_else(|| {
         eprintln!("av.cfg: unknown video.response {:?} — using smart", av.response);
         screen::ResponseMode::Smart
     });
@@ -1072,7 +1075,7 @@ Place your own dump as gba_bios.bin next to the executable:\n  {}",
         input_config::AvConfig::knob(&av.response_keep)
             .unwrap_or_else(|| screen::blend::default_rho(screen_kind)),
     );
-    let grid_params = screen::present::GridParams::with_strength(
+    let mut grid_params = screen::present::GridParams::with_strength(
         input_config::AvConfig::knob(&av.grid)
             .unwrap_or_else(|| screen_kind.default_grid_strength()),
     );
@@ -1096,7 +1099,22 @@ Place your own dump as gba_bios.bin next to the executable:\n  {}",
     let mut fallback_run = 0u64;
     let mut sav_seen = m.bus.save_data().map(fnv64);
     let mut next_frame = std::time::Instant::now();
-    while window.is_open() && !window.is_key_down(Key::Escape) {
+
+    // In-game menu (press Escape). Available unless a package pins it off,
+    // in which case Escape quits as it did before the menu existed.
+    // Enhanced audio and the output gamut are restart-required toggles
+    // (the audio path is baked at stream construction, the gamut at
+    // presenter creation); the menu writes them to av.cfg and labels the
+    // rows so the change is honest. The video model/darken/response/grid
+    // rebuild live below.
+    let menu_enabled = manifest.as_ref().map(|m| m.menu).unwrap_or(true);
+    let mut menu = menu::Menu::new(false, false);
+    let mut paused = false;
+    // Edge state for the host-side menu (debounced from the raw poll so a
+    // held key yields one event per press): Escape, the four directions,
+    // and confirm — plus the gamepad equivalents.
+    let mut nav_prev = NavEdges::default();
+    while window.is_open() {
         // KEYINPUT is active-low.
         let mut keys = 0x3FFu16;
         for (key, bit) in &key_pairs {
@@ -1104,6 +1122,20 @@ Place your own dump as gba_bios.bin next to the executable:\n  {}",
                 keys &= !bit;
             }
         }
+        // Host-menu navigation down-states, gathered from the SAME poll as
+        // the GBA keys so the menu costs no extra input plumbing. On the
+        // keyboard Escape both opens and backs out (it never aliases a GBA
+        // key); on the pad the d-pad/South/East drive the menu once it's
+        // open, and a non-colliding control opens it (set below).
+        let mut nav = NavEdges {
+            up: window.is_key_down(Key::Up),
+            down: window.is_key_down(Key::Down),
+            left: window.is_key_down(Key::Left),
+            right: window.is_key_down(Key::Right),
+            confirm: window.is_key_down(Key::Enter),
+            cancel: window.is_key_down(Key::Escape),
+            open: window.is_key_down(Key::Escape),
+        };
         if let Some(g) = pad.as_mut() {
             while g.next_event().is_some() {}
             let chosen = g
@@ -1134,8 +1166,141 @@ Place your own dump as gba_bios.bin next to the executable:\n  {}",
                     if y > dz { keys &= !(1 << 6); } // Up
                     if y < -dz { keys &= !(1 << 7); } // Down
                 }
+                // Menu nav from the pad: d-pad and sticks move the cursor;
+                // South confirms, East backs out. These steer the menu
+                // only while it is open, so reusing the gameplay face
+                // buttons here is safe.
+                use gilrs::{Axis, Button as Gb};
+                nav.up |= gp.is_pressed(Gb::DPadUp) || gp.value(Axis::LeftStickY) > dz;
+                nav.down |= gp.is_pressed(Gb::DPadDown) || gp.value(Axis::LeftStickY) < -dz;
+                nav.left |= gp.is_pressed(Gb::DPadLeft) || gp.value(Axis::LeftStickX) < -dz;
+                nav.right |= gp.is_pressed(Gb::DPadRight) || gp.value(Axis::LeftStickX) > dz;
+                nav.confirm |= gp.is_pressed(Gb::South);
+                nav.cancel |= gp.is_pressed(Gb::East);
+                // Opening from the pad uses a control no GBA button maps
+                // to: the guide/Mode button if present, else the
+                // Start+Select chord (held together). Neither is a normal
+                // in-game press, so the menu never steals gameplay input.
+                nav.open |= gp.is_pressed(Gb::Mode)
+                    || (gp.is_pressed(Gb::Start) && gp.is_pressed(Gb::Select));
             }
         }
+
+        // The open control (Escape, or the pad's guide/chord) toggles the
+        // pause overlay. With the menu disabled (a package pin), its
+        // rising edge quits instead, preserving the historical Escape =
+        // quit behavior.
+        let toggle_edge = nav.open && !nav_prev.open;
+        let reset_audio_counters =
+            |streams: &std::sync::Arc<std::sync::Mutex<AudioStreams>>| {
+                // Crossing the pause boundary, clear the audio defect
+                // counters so the drained-ring underruns during pause
+                // don't false-fire the DEGRADED alarm next report window.
+                let mut st = streams.lock().unwrap();
+                st.drops = 0;
+                st.holds = 0;
+                st.clipped = 0;
+            };
+        if toggle_edge {
+            if !menu_enabled {
+                break;
+            }
+            paused = !paused;
+            if paused {
+                menu.reset();
+            }
+            reset_audio_counters(&streams);
+            // A toggle press is fully consumed here — while paused, fall
+            // through to the overlay redraw; the same press must not also
+            // be fed to the menu as a Cancel.
+            if !paused {
+                nav_prev = nav;
+                continue;
+            }
+        }
+
+        if paused {
+            // Feed the menu the rising edges and apply any setting change
+            // live (video) or to av.cfg only (restart-required audio/
+            // gamut). The GBA sees all keys released while the menu is up.
+            m.bus.keys = 0x3FF;
+            let events = [
+                (nav.up && !nav_prev.up, menu::MenuInput::Up),
+                (nav.down && !nav_prev.down, menu::MenuInput::Down),
+                (nav.left && !nav_prev.left, menu::MenuInput::Left),
+                (nav.right && !nav_prev.right, menu::MenuInput::Right),
+                (nav.confirm && !nav_prev.confirm, menu::MenuInput::Confirm),
+                // East backs out of the menu; Escape already toggled above,
+                // so only feed Cancel when this frame wasn't a toggle.
+                (
+                    !toggle_edge && nav.cancel && !nav_prev.cancel,
+                    menu::MenuInput::Cancel,
+                ),
+            ];
+            nav_prev = nav;
+            let mut quit = false;
+            for (fired, ev) in events {
+                if !fired {
+                    continue;
+                }
+                if let Some(action) = menu.handle(ev, &mut av) {
+                    match action {
+                        menu::MenuAction::Resume => paused = false,
+                        menu::MenuAction::Quit => quit = true,
+                        menu::MenuAction::Changed(what) => {
+                            apply_av_change(
+                                what,
+                                &av,
+                                &mut screen_kind,
+                                &mut response,
+                                &mut lut,
+                                &mut temporal,
+                                &mut grid_params,
+                                display_target,
+                            );
+                            if let Err(e) = av.save() {
+                                eprintln!("menu: could not save av.cfg ({e})");
+                            }
+                        }
+                    }
+                }
+            }
+            if quit {
+                break;
+            }
+            if !paused {
+                // Resume (Resume row or East): clear the counters again so
+                // the pause tail doesn't bleed into the next report.
+                reset_audio_counters(&streams);
+                continue;
+            }
+            // Redraw the overlay over the last emulated frame at a modest
+            // fixed cadence. Re-compose from the frozen `temporal` each
+            // time (emulation, temporal, and the frame counter all stand
+            // still while paused) so the overlay's darkening never
+            // compounds across redraws. Both present paths consume `rgba`.
+            temporal.compose(&lut, &mut rgba);
+            menu.draw(&av, &mut rgba, 240, 160);
+            if let Some(p) = presenter.as_mut() {
+                let phys = p.physical_size(window.get_size());
+                if let Err(e) = p.present(&rgba, phys, &grid_params) {
+                    eprintln!("video: GPU presenter failed ({e}); basic scaling active");
+                    presenter = None;
+                }
+            }
+            if presenter.is_none() {
+                for (dst, px) in buf.iter_mut().zip(rgba.iter()) {
+                    *dst = (px[0] as u32) << 16 | (px[1] as u32) << 8 | px[2] as u32;
+                }
+                window.update_with_buffer(&buf, 240, 160).map_err(|e| e.to_string())?;
+            } else {
+                window.update();
+            }
+            std::thread::sleep(std::time::Duration::from_millis(16));
+            continue;
+        }
+        nav_prev = nav;
+
         m.bus.keys = keys;
         if let Some((f, last)) = &mut record {
             if keys != *last {
@@ -1387,6 +1552,76 @@ Place your own dump as gba_bios.bin next to the executable:\n  {}",
         record_labels(m.bus.rom.len(), &rom_sha256(&m.bus.rom))?;
     }
     Ok(())
+}
+
+/// Per-frame down-state of the host-menu navigation inputs, debounced
+/// against the previous frame to produce rising-edge events. Kept
+/// separate from the GBA key state — menu input never leaks to the game.
+#[derive(Clone, Copy, Default)]
+struct NavEdges {
+    up: bool,
+    down: bool,
+    left: bool,
+    right: bool,
+    confirm: bool,
+    /// Back out of the menu (Escape / pad East). Only consulted while the
+    /// menu is open — East is the player's B button during gameplay, so
+    /// it must never open the menu.
+    cancel: bool,
+    /// Open the menu from gameplay: keyboard Escape, or a dedicated pad
+    /// control that doesn't collide with any GBA button (the guide/Mode
+    /// button, or the Start+Select combo).
+    open: bool,
+}
+
+/// Apply a live A/V change the in-game menu made. Video settings rebuild
+/// the cheap derived objects in place (color LUT, temporal response,
+/// grid); the temporal history resets, which is a single frame and
+/// invisible. Audio (the enhanced path) and the output gamut are
+/// restart-required — they're baked at stream/presenter construction — so
+/// the menu only persists them to av.cfg; nothing to rebuild here.
+#[allow(clippy::too_many_arguments)]
+fn apply_av_change(
+    what: menu::Changed,
+    av: &input_config::AvConfig,
+    screen_kind: &mut screen::ScreenKind,
+    response: &mut screen::ResponseMode,
+    lut: &mut screen::ColorLut,
+    temporal: &mut screen::Temporal,
+    grid_params: &mut screen::present::GridParams,
+    display_target: screen::DisplayTarget,
+) {
+    match what {
+        menu::Changed::Audio | menu::Changed::Gamut => {
+            // Restart-required: persisted to av.cfg by the caller, applied
+            // on the next launch. Live rebuild would mean tearing down the
+            // cpal stream / GPU presenter mid-session.
+        }
+        menu::Changed::Video => {
+            *screen_kind = screen::ScreenKind::by_name(&av.screen)
+                .unwrap_or(screen::ScreenKind::Frontlit);
+            *response = screen::ResponseMode::by_name(&av.response)
+                .unwrap_or(screen::ResponseMode::Smart);
+            *lut = screen::ColorLut::build(&screen::ColorSettings {
+                screen: *screen_kind,
+                darken: input_config::AvConfig::knob(&av.screen_darken)
+                    .map(f64::from)
+                    .unwrap_or(f64::NAN),
+                target: display_target,
+            });
+            *temporal = screen::Temporal::new(
+                240 * 160,
+                *response,
+                0,
+                input_config::AvConfig::knob(&av.response_keep)
+                    .unwrap_or_else(|| screen::blend::default_rho(*screen_kind)),
+            );
+            *grid_params = screen::present::GridParams::with_strength(
+                input_config::AvConfig::knob(&av.grid)
+                    .unwrap_or_else(|| screen_kind.default_grid_strength()),
+            );
+        }
+    }
 }
 
 /// One machine-readable lifecycle line on stdout, for the launcher
