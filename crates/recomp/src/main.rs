@@ -1123,6 +1123,12 @@ Place your own dump as gba_bios.bin next to the executable:\n  {}",
     // restart-required and the menu labels it so.
     let mut menu = menu::Menu::new(true, false);
     let mut paused = false;
+    // Buttons held when the menu closed (active-low bits). A face button
+    // used to navigate/resume — South is the GBA A, East the GBA B — is
+    // still down on the first resumed frame; without this it buffers into
+    // the game. Each suppressed button is neutralized until the player
+    // actually releases it, so the menu interaction never leaks.
+    let mut suppress: u16 = 0;
     // Edge state for the host-side menu (debounced from the raw poll so a
     // held key yields one event per press): Escape, the four directions,
     // and confirm — plus the gamepad equivalents.
@@ -1200,6 +1206,13 @@ Place your own dump as gba_bios.bin next to the executable:\n  {}",
             }
         }
 
+        // Drop any button from the suppression mask once it is observed
+        // released (active-low bit set → cleared from the still-pressed
+        // mask `!keys`), then force the buttons still held over from a
+        // menu interaction to read as released.
+        suppress &= !keys;
+        keys |= suppress;
+
         // The open control (Escape, or the pad's guide/chord) toggles the
         // pause overlay. With the menu disabled (a package pin), its
         // rising edge quits instead, preserving the historical Escape =
@@ -1228,6 +1241,8 @@ Place your own dump as gba_bios.bin next to the executable:\n  {}",
             // through to the overlay redraw; the same press must not also
             // be fed to the menu as a Cancel.
             if !paused {
+                // Neutralize whatever is held at resume until released.
+                suppress = !keys & 0x3FF;
                 nav_prev = nav;
                 continue;
             }
@@ -1285,8 +1300,11 @@ Place your own dump as gba_bios.bin next to the executable:\n  {}",
             }
             if !paused {
                 // Resume (Resume row or East): clear the counters again so
-                // the pause tail doesn't bleed into the next report.
+                // the pause tail doesn't bleed into the next report, and
+                // neutralize the buttons held to select Resume/back out
+                // (South=A, East=B) so they don't buffer into the game.
                 reset_audio_counters(&streams);
+                suppress = !keys & 0x3FF;
                 continue;
             }
             // Redraw the overlay over the last emulated frame at a modest
