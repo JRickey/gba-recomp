@@ -39,6 +39,7 @@ fn main() -> ExitCode {
         Some("engine-scan") => cmd_engine_scan(&args[1..]),
         Some("runc") => cmd_runc(&args[1..]),
         Some("verify") => cmd_verify(&args[1..]),
+        Some("labels") => cmd_labels(&args[1..]),
         _ => {
             print_help(None);
             return ExitCode::FAILURE;
@@ -99,6 +100,12 @@ frame hashes, print MATCH or MISMATCH (exit code follows)."),
         "--sav FILE      preload a save file",
     ], "Headless boot to frame N on the interpreter; prints the frame hash plus \
 boot diagnostics (DISPCNT/PC/SWI and live disassembly at PC)."),
+    ("labels", "recomp labels <show|import|export> <rom> [file]", &[
+        "show              sources, entry counts, snapshot status, cache key",
+        "import FILE       union a shared label file into this image's accumulator",
+        "export [FILE]     write a shareable label file (default <rom>.labels; addresses only)",
+    ], "Inspect and exchange label files — runtime-discovered entry points that \
+feed translation coverage (see BUILDING.md and docs/labels.md)."),
     ("dis", "recomp dis <rom> [--addr HEX] [--count N] [--thumb]", &[
         "--addr HEX    start address (default ROM base)",
         "--count N     instructions to print (default 16)",
@@ -2302,6 +2309,86 @@ fn record_labels(rom_len: usize, sha: &str) -> Result<(), String> {
         eprintln!("labels: the next translation rebuild covers the new entries");
     }
     Ok(())
+}
+
+/// Label-file tooling: inspect, import a shared file, export for
+/// sharing. The local IWRAM snapshot is shown but never exported.
+fn cmd_labels(args: &[String]) -> Result<(), String> {
+    const USAGE: &str = "usage: recomp labels <show|import|export> <rom> [file]";
+    let sub = args.first().ok_or(USAGE)?.as_str();
+    let rom_path = args.get(1).ok_or(USAGE)?;
+    let rom = std::fs::read(rom_path).map_err(|e| format!("{rom_path}: {e}"))?;
+    let sha = rom_sha256(&rom);
+    match sub {
+        "show" => {
+            let all = labels::load_all(rom_path, &sha, rom.len());
+            println!("image {sha}");
+            println!(
+                "labels: {} rom, {} iwram, {} reserved (ewram)",
+                all.rom.len(),
+                all.iwram.len(),
+                all.reserved.len()
+            );
+            match labels::Blob::load(&labels::blob_path(&sha)) {
+                Some(b) => println!(
+                    "iwram snapshot: {} bytes valid ({})",
+                    b.valid_bytes(),
+                    labels::blob_path(&sha).display()
+                ),
+                None => println!("iwram snapshot: none (run play/runc --record-labels)"),
+            }
+            if !all.is_empty() {
+                let blob = labels::Blob::load(&labels::blob_path(&sha));
+                let d = all.digest(blob.as_ref());
+                println!("cache key suffix: -l{:08x}", d as u32 ^ (d >> 32) as u32);
+            }
+            Ok(())
+        }
+        "import" => {
+            let file = args.get(2).ok_or("import needs a label file")?;
+            let incoming = labels::Labels::load(std::path::Path::new(file), &sha, rom.len())?;
+            let path = labels::config_path(&sha);
+            let mut all = match path.is_file() {
+                true => labels::Labels::load(&path, &sha, rom.len())?,
+                false => labels::Labels::default(),
+            };
+            let (r0, i0) = (all.rom.len(), all.iwram.len());
+            all.merge(incoming);
+            all.save(&path, &sha)?;
+            println!(
+                "imported: +{} rom, +{} iwram ({} rom, {} iwram total) -> {}",
+                all.rom.len() - r0,
+                all.iwram.len() - i0,
+                all.rom.len(),
+                all.iwram.len(),
+                path.display()
+            );
+            if all.iwram.len() > 0 && labels::Blob::load(&labels::blob_path(&sha)).is_none() {
+                println!(
+                    "note: iwram entries activate after a local --record-labels session \
+captures their content"
+                );
+            }
+            Ok(())
+        }
+        "export" => {
+            let default = format!("{}.labels", rom_path.trim_end_matches(".gba"));
+            let out = args.get(2).cloned().unwrap_or(default);
+            let all = labels::load_all(rom_path, &sha, rom.len());
+            if all.is_empty() && all.reserved.is_empty() {
+                return Err("nothing to export — record some labels first".into());
+            }
+            all.save(std::path::Path::new(&out), &sha)?;
+            println!(
+                "exported {} rom + {} iwram entries -> {out} (addresses only; \
+the local iwram snapshot is never exported)",
+                all.rom.len(),
+                all.iwram.len()
+            );
+            Ok(())
+        }
+        other => Err(format!("unknown labels subcommand {other:?}; {USAGE}")),
+    }
 }
 
 /// SHA-256 of the image, hex — the cross-tool image identity.
