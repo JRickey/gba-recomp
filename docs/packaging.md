@@ -81,11 +81,16 @@ during play to get an overlay with
 - input: rebinding (keyboard + pad, the input-config surface),
 - ROM/BIOS: re-run the file selection flow.
 
-It renders into the existing presentation path (the screen-sim wgpu
-surface over the play window), so it works identically in `recomp
-play` and in packaged binaries; `[runtime] menu = false` builds it
-out. The launcher keeps its own first-launch BIOS setup — the menu's
-ROM/BIOS flow is the packaged binary's equivalent.
+It renders into the existing presentation path (composited into the
+frame buffer before present, so it works under both the wgpu presenter
+and the CPU blit), identically in `recomp play` and in packaged
+binaries; `[runtime] menu = false` gates it out (Escape then quits as
+before). Audio/video changes apply **live** — screen model, darken,
+response, grid, and the enhanced-audio toggle all take effect without
+a relaunch (enhanced audio crossfades over ~40 ms; both paths stay
+warm). Only the output gamut is restart-required (baked into the GPU
+presenter) and is labeled so. The pad opener is the guide/Mode button;
+keyboard Escape always works.
 
 ## Outputs
 
