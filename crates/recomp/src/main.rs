@@ -62,13 +62,17 @@ code and computed-branch targets it discovers (recommended; play's cache builds 
 and disable all BIOS HLE; output goes to out/<stem>-bios.dylib",
     ], "Translate a ROM image to a native shared library at out/<stem>.dylib. \
 Emits C11 in bounded chunks and compiles them with cc."),
-    ("play", "recomp play <rom> [--interp] [--stats] [--status]", &[
+    ("play", "recomp play <rom> [--interp] [--stats] [--status] [--bios file] [--no-bios]", &[
         "--interp    force the interpreter (skip/ignore native translation)",
         "--stats     print performance readouts (frame time, native vs fallback)",
         "--status    emit machine-readable lifecycle lines on stdout (used by the launcher)",
-    ], "Windowed play. First launch translates the image into the per-user cache \
-(one-time, progress printed); later launches load it instantly. Reads input.cfg/av.cfg \
-from the shared config directory."),
+        "--bios FILE    boot a specific real BIOS image (recompiled; no BIOS HLE)",
+        "--no-bios      force BIOS HLE even when an image is installed",
+    ], "Windowed play. Boots the real BIOS when one is installed ($GBA_RECOMP_BIOS, \
+gba_bios.bin next to the executable, or the user config dir — the launcher's first-launch \
+setup installs it); BIOS HLE otherwise. First launch translates the image into the \
+per-user cache (one-time, progress printed); later launches load it instantly. Reads \
+input.cfg/av.cfg from the shared config directory."),
     ("runc", "recomp runc <rom> [--frames N] [--out img.ppm] [--input file] [--bios file]", &[
         "--frames N      frames to run (default 600)",
         "--out PATH      write the final frame as a PPM",
@@ -180,11 +184,14 @@ impl InputScript {
 }
 
 /// Load and sanity-check a real BIOS image for --bios runs.
-fn load_bios_file(path: &str) -> Result<Vec<u8>, String> {
-    let bytes = std::fs::read(path).map_err(|e| format!("{path}: {e}"))?;
-    if bytes.len() != 0x4000 {
+fn load_bios_file(path: impl AsRef<Path>) -> Result<Vec<u8>, String> {
+    let path = path.as_ref();
+    let bytes = std::fs::read(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    if bytes.len() != input_config::BIOS_SIZE {
         return Err(format!(
-            "{path}: expected a 16384-byte BIOS image, got {} bytes",
+            "{}: expected a {}-byte BIOS image, got {} bytes",
+            path.display(),
+            input_config::BIOS_SIZE,
             bytes.len()
         ));
     }
@@ -790,11 +797,16 @@ fn cmd_play(args: &[String]) -> Result<(), String> {
     // out-of-box experience stays clean.
     let mut show_stats =
         cfg!(debug_assertions) || std::env::var_os("GBA_RECOMP_STATS").is_some();
-    for arg in args {
+    let mut bios_arg: Option<String> = None;
+    let mut no_bios = false;
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
         match arg.as_str() {
             "--interp" => interp_only = true,
             "--status" => status = true,
             "--stats" => show_stats = true,
+            "--bios" => bios_arg = Some(it.next().ok_or("--bios needs a value")?.to_string()),
+            "--no-bios" => no_bios = true,
             other if rom_path.is_none() => rom_path = Some(other.to_string()),
             other => return Err(format!("unexpected argument {other:?}")),
         }
@@ -802,6 +814,41 @@ fn cmd_play(args: &[String]) -> Result<(), String> {
     let rom_path = rom_path.ok_or("missing ROM path")?;
     let rom = std::fs::read(&rom_path).map_err(|e| format!("{rom_path}: {e}"))?;
     let sav_path = format!("{}.sav", rom_path.trim_end_matches(".gba"));
+
+    // Product boot path: real BIOS when an image is installed (explicit
+    // --bios > the launcher-installed image via the shared resolution),
+    // BIOS HLE otherwise. An explicit --bios that fails to load is a
+    // hard error; a discovered image that fails is loud but non-fatal —
+    // the player still gets a working session.
+    let bios: Option<Vec<u8>> = if no_bios {
+        eprintln!("boot: BIOS HLE (--no-bios)");
+        None
+    } else if let Some(p) = &bios_arg {
+        let b = load_bios_file(p)?;
+        eprintln!("boot: real BIOS ({p})");
+        Some(b)
+    } else if let Some(p) = input_config::find_bios() {
+        match load_bios_file(&p) {
+            Ok(b) => {
+                eprintln!("boot: real BIOS ({})", p.display());
+                Some(b)
+            }
+            Err(e) => {
+                eprintln!("DEGRADED: installed BIOS unusable ({e}); using BIOS HLE");
+                None
+            }
+        }
+    } else {
+        eprintln!("boot: BIOS HLE (no BIOS image installed)");
+        None
+    };
+    if let Some(b) = &bios {
+        use sha2::{Digest, Sha256};
+        let sha = Sha256::digest(b).iter().map(|x| format!("{x:02x}")).collect::<String>();
+        if sha != input_config::BIOS_SHA256 {
+            eprintln!("bios: image is not the canonical dump (sha256 {sha}) — trying it as-is");
+        }
+    }
 
     // Native translation: load from the per-user cache, building it on
     // first launch. The product bar is full speed at full accuracy — the
@@ -812,7 +859,7 @@ fn cmd_play(args: &[String]) -> Result<(), String> {
     let native = if interp_only {
         None
     } else {
-        match ensure_native(&rom_path, &rom, status) {
+        match ensure_native(&rom_path, &rom, status, bios.as_deref()) {
             Ok(v) => Some(v),
             Err(e) => {
                 eprintln!("DEGRADED: native translation unavailable ({e}); interpreter only");
@@ -821,7 +868,7 @@ fn cmd_play(args: &[String]) -> Result<(), String> {
         }
     };
 
-    let mut m = Machine::new(rom);
+    let mut m = make_machine(rom, bios.as_deref());
     if let Ok(sav) = std::fs::read(&sav_path) {
         m.bus.load_save_data(&sav);
         eprintln!("loaded {sav_path}");
@@ -1268,6 +1315,7 @@ fn ensure_native(
     rom_path: &str,
     rom: &[u8],
     status: bool,
+    bios: Option<&[u8]>,
 ) -> Result<(libloading::Library, BlockTable), String> {
     use sha2::{Digest, Sha256};
     let sha = Sha256::digest(rom)
@@ -1295,7 +1343,22 @@ fn ensure_native(
     std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     // Experimental EWRAM translations get their own cache entry so they
     // can never be loaded by (or shadow) a normal run.
-    let suffix = if std::env::var_os("RECOMP_EWRAM").is_some() { "-e" } else { "" };
+    let mut suffix = if std::env::var_os("RECOMP_EWRAM").is_some() {
+        "-e".to_string()
+    } else {
+        String::new()
+    };
+    // Real-BIOS translations bake region-0 code and different boot/SWI
+    // semantics into the dylib, so they key on the BIOS content too —
+    // swapping the installed BIOS rebuilds rather than loading stale
+    // natives, and HLE/real artifacts can never shadow each other.
+    if let Some(b) = bios {
+        let bsha = Sha256::digest(b)
+            .iter()
+            .map(|x| format!("{x:02x}"))
+            .collect::<String>();
+        suffix.push_str(&format!("-b{}", &bsha[..8]));
+    }
     let lib_path = dir.join(format!("{sha}{suffix}.dylib"));
     let lib_str = lib_path.to_str().ok_or("non-UTF8 cache path")?;
     if !lib_path.is_file() {
@@ -1303,7 +1366,7 @@ fn ensure_native(
         if status {
             status_line("building 0");
         }
-        build_dylib(rom_path, true, None, lib_str, &mut |pct| {
+        build_dylib(rom_path, true, bios, lib_str, &mut |pct| {
             if status {
                 status_line(&format!("building {pct}"));
             }

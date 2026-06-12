@@ -20,6 +20,7 @@ eframe = "0.34.3"
 gilrs = "0.11.2"
 input-config = { version = "0.1.0", path = "../input-config" }
 screen = { version = "0.1.0", path = "../screen", default-features = false }
+sha2 = "0.11.0"
 
 [target.'cfg(not(target_os = "android"))'.dependencies]
 rfd = "0.17.2"

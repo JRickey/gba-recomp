@@ -19,6 +19,12 @@ pub struct PlayScreen {
     sessions: Vec<Session>,
     /// Transient launch/exit problem, shown until the next launch.
     notice: Option<String>,
+    /// Installed BIOS image, resolved via the shared lookup. None gates
+    /// the whole Play tab behind first-time setup: the product boots the
+    /// real BIOS, so collecting it comes before the first cartridge.
+    bios: Option<PathBuf>,
+    /// Setup-panel diagnostic (bad pick, unwritable install location).
+    bios_notice: Option<String>,
 }
 
 /// What the child has told us via the `--status` protocol so far.
@@ -68,10 +74,87 @@ enum RowAction {
 
 impl PlayScreen {
     pub fn new() -> Self {
-        Self { recents: load_recents(), sessions: Vec::new(), notice: None }
+        Self {
+            recents: load_recents(),
+            sessions: Vec::new(),
+            notice: None,
+            bios: input_config::find_bios(),
+            bios_notice: None,
+        }
+    }
+
+    /// First-time setup: collect the user's BIOS dump and install it
+    /// where the whole release resolves it (next to the executable for
+    /// portable layouts, the user config dir when that's read-only).
+    /// Drawn instead of the cartridge shelf until an image is in place.
+    fn bios_setup_ui(&mut self, ui: &mut Ui) {
+        theme::glass_frame().show(ui, |ui| {
+            ui.set_min_size(Vec2::new(ui.available_width(), ui.available_height()));
+            theme::section_title(ui, "First-Time Setup");
+            ui.add_space(10.0);
+            ui.label(
+                egui::RichText::new(
+                    "This system boots your console's real BIOS and recompiles it \
+                     along with each cartridge — authentic startup, exact behavior.",
+                )
+                .size(13.0)
+                .color(theme::SILVER_HI),
+            );
+            ui.add_space(4.0);
+            ui.label(
+                egui::RichText::new(
+                    "Select your own 16 KB BIOS dump once; it stays with the \
+                     product and every cartridge after this just plays.",
+                )
+                .size(12.0)
+                .color(theme::white(150)),
+            );
+            ui.add_space(14.0);
+            ui.vertical_centered(|ui| {
+                let size = Vec2::new(260.0, 46.0);
+                if theme::glossy_button(ui, "\u{25C9}  SELECT BIOS\u{2026}", true, size).clicked() {
+                    if let Some(src) = platform::pick_bios() {
+                        self.install_bios(&src);
+                    }
+                }
+            });
+            if let Some(n) = &self.bios_notice {
+                ui.add_space(8.0);
+                ui.label(egui::RichText::new(n).size(11.0).color(theme::AMBER));
+            }
+        });
+    }
+
+    fn install_bios(&mut self, src: &Path) {
+        match input_config::install_bios(src) {
+            Ok(dest) => {
+                // Known-dump check is advisory: replacements and odd dumps
+                // are allowed, but the user should know what they picked.
+                self.bios_notice = match std::fs::read(&dest) {
+                    Ok(bytes) => {
+                        use sha2::{Digest, Sha256};
+                        let sha = Sha256::digest(&bytes)
+                            .iter()
+                            .map(|b| format!("{b:02x}"))
+                            .collect::<String>();
+                        (sha != input_config::BIOS_SHA256).then(|| {
+                            "\u{26A0} not the canonical BIOS dump — it will be tried as-is"
+                                .to_string()
+                        })
+                    }
+                    Err(e) => Some(format!("\u{2716} installed but unreadable: {e}")),
+                };
+                self.bios = Some(dest);
+            }
+            Err(e) => self.bios_notice = Some(format!("\u{2716} {e}")),
+        }
     }
 
     pub fn ui(&mut self, ui: &mut Ui) {
+        if self.bios.is_none() {
+            self.bios_setup_ui(ui);
+            return;
+        }
         // Absorb child status updates, then reap exited sessions.
         for s in &mut self.sessions {
             while let Ok(msg) = s.rx.try_recv() {
@@ -231,7 +314,7 @@ impl PlayScreen {
 
     fn launch(&mut self, path: &Path) {
         self.notice = None;
-        match platform::launch(path) {
+        match platform::launch(path, self.bios.as_deref()) {
             Ok(mut child) => {
                 let (tx, rx) = std::sync::mpsc::channel();
                 if let Some(out) = child.stdout.take() {
