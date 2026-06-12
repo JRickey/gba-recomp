@@ -112,10 +112,12 @@ frame hashes, print MATCH or MISMATCH (exit code follows)."),
 boot diagnostics (DISPCNT/PC/SWI and live disassembly at PC)."),
     ("labels", "recomp labels <show|import|export> <rom> [file]", &[
         "show              sources, entry counts, snapshot status, cache key",
-        "import FILE       union a shared label file into this image's accumulator",
-        "export [FILE]     write a shareable label file (default <rom>.labels; addresses only)",
-    ], "Inspect and exchange label files — runtime-discovered entry points that \
-feed translation coverage (see BUILDING.md and docs/labels.md)."),
+        "import FILE       union a shared label file into this image's accumulator \
+(v1 lines or v2 TOML, auto-detected)",
+        "export [FILE]     write a shareable label file (default <rom>.labels.toml; \
+a non-.toml FILE writes v1 lines)",
+    ], "Inspect and exchange label files — entry points discovered at runtime or by \
+disassembly tooling that feed translation coverage (see BUILDING.md and docs/labels.md)."),
     ("dis", "recomp dis <rom> [--addr HEX] [--count N] [--thumb]", &[
         "--addr HEX    start address (default ROM base)",
         "--count N     instructions to print (default 16)",
@@ -2557,9 +2559,10 @@ fn cmd_labels(args: &[String]) -> Result<(), String> {
             let all = labels::load_all(rom_path, &sha, rom.len());
             println!("image {sha}");
             println!(
-                "labels: {} rom, {} iwram, {} reserved (ewram)",
+                "labels: {} rom, {} iwram, {} named, {} reserved (ewram)",
                 all.rom.len(),
                 all.iwram.len(),
+                all.names.len(),
                 all.reserved.len()
             );
             match labels::Blob::load(&labels::blob_path(&sha)) {
@@ -2580,14 +2583,25 @@ fn cmd_labels(args: &[String]) -> Result<(), String> {
         "import" => {
             let file = args.get(2).ok_or("import needs a label file")?;
             let incoming = labels::Labels::load(std::path::Path::new(file), &sha, rom.len())?;
-            let path = labels::config_path(&sha);
+            // Enriched (named) sets go to the TOML accumulator — the v1
+            // file can't carry names; address-only sets keep using it.
+            let enriched = !incoming.names.is_empty() || !incoming.ends.is_empty();
+            let path = if enriched {
+                labels::config_toml_path(&sha)
+            } else {
+                labels::config_path(&sha)
+            };
             let mut all = match path.is_file() {
                 true => labels::Labels::load(&path, &sha, rom.len())?,
                 false => labels::Labels::default(),
             };
             let (r0, i0) = (all.rom.len(), all.iwram.len());
             all.merge(incoming);
-            all.save(&path, &sha)?;
+            if enriched {
+                all.save_toml(&path, &sha)?;
+            } else {
+                all.save(&path, &sha)?;
+            }
             println!(
                 "imported: +{} rom, +{} iwram ({} rom, {} iwram total) -> {}",
                 all.rom.len() - r0,
@@ -2605,18 +2619,25 @@ captures their content"
             Ok(())
         }
         "export" => {
-            let default = format!("{}.labels", rom_path.trim_end_matches(".gba"));
+            let default = format!("{}.labels.toml", rom_path.trim_end_matches(".gba"));
             let out = args.get(2).cloned().unwrap_or(default);
             let all = labels::load_all(rom_path, &sha, rom.len());
             if all.is_empty() && all.reserved.is_empty() {
                 return Err("nothing to export — record some labels first".into());
             }
-            all.save(std::path::Path::new(&out), &sha)?;
+            // The extension picks the format: .toml = v2 interchange
+            // (names/ends preserved), anything else = v1 lines.
+            if out.ends_with(".toml") {
+                all.save_toml(std::path::Path::new(&out), &sha)?;
+            } else {
+                all.save(std::path::Path::new(&out), &sha)?;
+            }
             println!(
-                "exported {} rom + {} iwram entries -> {out} (addresses only; \
-the local iwram snapshot is never exported)",
+                "exported {} rom + {} iwram entries ({} named) -> {out} (addresses and \
+names only; the local iwram snapshot is never exported)",
                 all.rom.len(),
-                all.iwram.len()
+                all.iwram.len(),
+                all.names.len()
             );
             Ok(())
         }

@@ -16,3 +16,4 @@ input-config = { version = "0.1.0", path = "../input-config" }
 screen = { version = "0.1.0", path = "../screen" }
 sha2 = "0.11.0"
 dirs = "6.0.0"
+toml = "0.8"

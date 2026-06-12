@@ -1,9 +1,30 @@
-//! Sidecar label files: code entry points discovered at runtime, fed
-//! back into the analyzer so translation coverage doesn't depend on
-//! what a single profiling boot happened to reach.
+//! Sidecar label files: code entry points discovered at runtime or by
+//! external disassembly, fed back into the analyzer so translation
+//! coverage doesn't depend on what a single profiling boot reached.
 //!
-//! Format — text, line-based, union-mergeable, content-free (addresses
-//! and hashes only; never image bytes):
+//! Two on-disk formats, detected by content (never by extension):
+//!
+//! **v2 — TOML, the interchange format.** What disassembly tooling
+//! (Ghidra exports, automated mappers) emits and what `labels export`
+//! writes. Addresses are TOML integers (hex literals encouraged) or
+//! `"0x…"` strings; `name`/`end` are optional enrichment the
+//! recompiler preserves (names feed C-source export; `end` is the
+//! exclusive function end):
+//!
+//!     format = "gba-labels"
+//!     version = 2
+//!
+//!     [image]
+//!     sha256 = "<64 hex>"
+//!
+//!     [[functions]]
+//!     name = "AgbMain"        # optional
+//!     address = 0x0800_01c8
+//!     end = 0x0800_0220       # optional, exclusive
+//!     mode = "thumb"          # "arm" | "thumb" (or "a" | "t")
+//!
+//! **v1 — line format, the runtime recorder's accumulator.** Minimal,
+//! union-mergeable, addresses only (the recorder has no names to say):
 //!
 //!     gba-labels v1
 //!     rom-sha256 <64 hex>
@@ -11,18 +32,21 @@
 //!     iwram <hexaddr> a|t ...
 //!     ewram <hexaddr> a|t ...
 //!
-//! `rom` records become analyzer seeds. They are hints, not trusted
-//! input: the translation derives from the actual ROM bytes, so a wrong
-//! label can at worst translate code that is never jumped to. `iwram`/
-//! `ewram` records are reserved for content-guarded RAM translation
-//! (recorded now so files don't need regenerating when that lands);
-//! the build counts and skips them.
+//! Both are content-free with respect to the image (addresses and
+//! hashes only; never image bytes). The memory region is derived from
+//! the address (`0x08..=0x0D` rom, `0x03` iwram, `0x02` ewram —
+//! reserved). `rom` records become analyzer seeds. They are hints, not
+//! trusted input: the translation derives from the actual ROM bytes,
+//! so a wrong label can at worst translate code that is never jumped
+//! to. `iwram` records translate when a local content snapshot backs
+//! them; `ewram` records are reserved (counted and skipped).
 //!
-//! Lookup order: `<rom>.labels` next to the image (portable, shareable),
-//! then `<config>/gba-recomp/labels/<sha256>.labels` (the recorder's
-//! accumulator). Both are loaded and unioned.
+//! Lookup order: `<rom>.labels.toml`, then `<rom>.labels` next to the
+//! image (portable, shareable), then the recorder's v1 accumulator and
+//! the import accumulator (`<config>/gba-recomp/labels/<sha256>
+//! .labels[.toml]`). All are loaded and unioned.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 #[derive(Default)]
@@ -33,10 +57,18 @@ pub struct Labels {
     /// when a local content snapshot exists (see [`Blob`]); the record
     /// itself stays portable presence data.
     pub iwram: BTreeSet<u32>,
-    /// Reserved (ewram) record lines, preserved verbatim so a rewrite
-    /// never drops forward-compatibility data.
+    /// Function names from v2 files, keyed like the entry sets.
+    /// Enrichment only: never part of the translation cache digest
+    /// (renames must not force retranslation), consumed by C-source
+    /// export and diagnostics.
+    pub names: BTreeMap<u32, String>,
+    /// Exclusive function end addresses from v2 files, same keying.
+    /// Enrichment only, like `names`.
+    pub ends: BTreeMap<u32, u32>,
+    /// Reserved (ewram) record lines in v1 form, preserved verbatim so
+    /// a rewrite never drops forward-compatibility data.
     pub reserved: Vec<String>,
-    /// Malformed or out-of-range lines encountered while loading.
+    /// Malformed or out-of-range entries encountered while loading.
     pub skipped: usize,
 }
 
@@ -97,14 +129,27 @@ const MAX_LABELS: usize = 65536;
 
 impl Labels {
     /// Parse one file, validating ROM records against the image size.
-    /// A wrong-sha file is an error (labels are per-image); malformed
-    /// lines are counted and skipped, never fatal.
+    /// The format is detected from content: a `gba-labels v1` first
+    /// line parses as v1, anything else as v2 TOML. A wrong-sha file
+    /// is an error (labels are per-image); malformed entries are
+    /// counted and skipped, never fatal.
     pub fn load(path: &std::path::Path, sha: &str, rom_len: usize) -> Result<Labels, String> {
         let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
-        let mut lines = text.lines();
-        if lines.next().map(str::trim) != Some("gba-labels v1") {
-            return Err(format!("{}: not a gba-labels v1 file", path.display()));
+        if text.lines().next().map(str::trim) == Some("gba-labels v1") {
+            Self::load_v1(&text, path, sha, rom_len)
+        } else {
+            Self::load_toml(&text, path, sha, rom_len)
         }
+    }
+
+    fn load_v1(
+        text: &str,
+        path: &std::path::Path,
+        sha: &str,
+        rom_len: usize,
+    ) -> Result<Labels, String> {
+        let mut lines = text.lines();
+        lines.next(); // the validated magic line
         match lines.next().map(str::trim).and_then(|l| l.strip_prefix("rom-sha256 ")) {
             Some(s) if s == sha => {}
             Some(s) => {
@@ -155,10 +200,110 @@ impl Labels {
         Ok(out)
     }
 
-    /// Union another set into this one.
+    fn load_toml(
+        text: &str,
+        path: &std::path::Path,
+        sha: &str,
+        rom_len: usize,
+    ) -> Result<Labels, String> {
+        let doc: toml::Value = text.parse().map_err(|e| {
+            format!("{}: not a gba-labels file (no v1 magic; TOML: {e})", path.display())
+        })?;
+        let t = doc
+            .as_table()
+            .filter(|t| t.get("format").and_then(toml::Value::as_str) == Some("gba-labels"))
+            .ok_or_else(|| format!("{}: not a gba-labels file", path.display()))?;
+        match t.get("version").and_then(toml::Value::as_integer) {
+            Some(2) => {}
+            v => {
+                return Err(format!(
+                    "{}: unsupported gba-labels version {}",
+                    path.display(),
+                    v.map_or("missing".into(), |v| v.to_string())
+                ))
+            }
+        }
+        let fsha = t
+            .get("image")
+            .and_then(|i| i.get("sha256"))
+            .and_then(toml::Value::as_str)
+            .ok_or_else(|| format!("{}: missing image.sha256", path.display()))?;
+        if !fsha.eq_ignore_ascii_case(sha) {
+            return Err(format!(
+                "{}: labels are for image {}…, not {}…",
+                path.display(),
+                &fsha[..8.min(fsha.len())],
+                &sha[..8]
+            ));
+        }
+        let mut out = Labels::default();
+        let empty = Vec::new();
+        let fns = t.get("functions").and_then(toml::Value::as_array).unwrap_or(&empty);
+        for f in fns {
+            let addr = f.get("address").and_then(addr_value);
+            let thumb = f.get("mode").and_then(toml::Value::as_str).and_then(|m| match m {
+                "arm" | "a" => Some(0u32),
+                "thumb" | "t" => Some(1),
+                _ => None,
+            });
+            let (Some(addr), Some(thumb)) = (addr, thumb) else {
+                out.skipped += 1;
+                continue;
+            };
+            let key = addr | thumb;
+            let accepted = match addr >> 24 {
+                0x08..=0x0D
+                    if ((addr & 0x01FF_FFFF) as usize) < rom_len
+                        && addr & 1 == 0
+                        && out.rom.len() < MAX_LABELS =>
+                {
+                    out.rom.insert(key);
+                    true
+                }
+                0x03 if addr & 1 == 0 && out.iwram.len() < MAX_LABELS => {
+                    out.iwram.insert(key);
+                    true
+                }
+                0x02 if addr & 1 == 0 => {
+                    // Reserved records keep their v1 spelling so the
+                    // accumulator round-trips them; enrichment fields
+                    // are dropped with the rest of ewram support.
+                    out.reserved
+                        .push(format!("ewram {addr:08x} {}", if thumb != 0 { "t" } else { "a" }));
+                    continue;
+                }
+                _ => false,
+            };
+            if !accepted {
+                out.skipped += 1;
+                continue;
+            }
+            if let Some(name) = f.get("name").and_then(toml::Value::as_str) {
+                if !name.is_empty() {
+                    out.names.insert(key, name.to_string());
+                }
+            }
+            if let Some(end) = f.get("end").and_then(addr_value) {
+                if end > addr {
+                    out.ends.insert(key, end);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Union another set into this one. Enrichment merges first-wins:
+    /// the earlier-loaded source (the file beside the image) outranks
+    /// later accumulators on name/end disagreement.
     pub fn merge(&mut self, other: Labels) {
         self.rom.extend(other.rom);
         self.iwram.extend(other.iwram);
+        for (k, v) in other.names {
+            self.names.entry(k).or_insert(v);
+        }
+        for (k, v) in other.ends {
+            self.ends.entry(k).or_insert(v);
+        }
         for l in other.reserved {
             if !self.reserved.contains(&l) {
                 self.reserved.push(l);
@@ -180,6 +325,43 @@ impl Labels {
         }
         for l in &self.reserved {
             let _ = writeln!(s, "{l}");
+        }
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        }
+        std::fs::write(path, s).map_err(|e| format!("{}: {e}", path.display()))
+    }
+
+    /// Write the v2 TOML form (the interchange format): all entries,
+    /// names and ends preserved, addresses as hex literals.
+    pub fn save_toml(&self, path: &std::path::Path, sha: &str) -> Result<(), String> {
+        use std::fmt::Write;
+        let mut s = String::with_capacity(64 + (self.rom.len() + self.iwram.len()) * 48);
+        let _ = writeln!(s, "format = \"gba-labels\"");
+        let _ = writeln!(s, "version = 2");
+        let _ = writeln!(s, "\n[image]");
+        let _ = writeln!(s, "sha256 = \"{sha}\"");
+        let emit = |s: &mut String, key: u32| {
+            let _ = writeln!(s, "\n[[functions]]");
+            if let Some(n) = self.names.get(&key) {
+                let _ = writeln!(s, "name = \"{}\"", n.replace('\\', "\\\\").replace('"', "\\\""));
+            }
+            let _ = writeln!(s, "address = 0x{:08x}", key & !1);
+            if let Some(&e) = self.ends.get(&key) {
+                let _ = writeln!(s, "end = 0x{e:08x}");
+            }
+            let _ = writeln!(s, "mode = \"{}\"", if key & 1 != 0 { "thumb" } else { "arm" });
+        };
+        for &key in self.rom.iter().chain(&self.iwram) {
+            emit(&mut s, key);
+        }
+        for l in &self.reserved {
+            let mut f = l.split_whitespace().skip(1);
+            if let (Some(addr), Some(mode)) = (f.next(), f.next()) {
+                let _ = writeln!(s, "\n[[functions]]");
+                let _ = writeln!(s, "address = 0x{addr}");
+                let _ = writeln!(s, "mode = \"{}\"", if mode == "t" { "thumb" } else { "arm" });
+            }
         }
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
@@ -212,6 +394,21 @@ impl Labels {
     }
 }
 
+/// A TOML address: an integer (hex literals encouraged) or a hex
+/// string with optional `0x` prefix — Ghidra CSV exports say
+/// `08001234`, hand-written files say `0x08001234`; accept both.
+fn addr_value(v: &toml::Value) -> Option<u32> {
+    match v {
+        toml::Value::Integer(i) => u32::try_from(*i).ok(),
+        toml::Value::String(s) => {
+            let s = s.trim();
+            let s = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")).unwrap_or(s);
+            u32::from_str_radix(&s.replace('_', ""), 16).ok()
+        }
+        _ => None,
+    }
+}
+
 /// The recorder's accumulator path for an image.
 pub fn config_path(sha: &str) -> PathBuf {
     dirs::config_dir()
@@ -221,22 +418,36 @@ pub fn config_path(sha: &str) -> PathBuf {
         .join(format!("{sha}.labels"))
 }
 
+/// The import accumulator for v2 files: imported TOML merges here so
+/// its names/ends survive (the v1 recorder accumulator can't carry
+/// them).
+pub fn config_toml_path(sha: &str) -> PathBuf {
+    config_path(sha).with_extension("labels.toml")
+}
+
 /// Load and union every label source for an image. Errors in one file
 /// (wrong sha, bad header) are reported and that file ignored.
 pub fn load_all(rom_path: &str, sha: &str, rom_len: usize) -> Labels {
     let mut out = Labels::default();
-    let beside = PathBuf::from(format!("{}.labels", rom_path.trim_end_matches(".gba")));
-    for p in [beside, config_path(sha)] {
+    let stem = rom_path.trim_end_matches(".gba");
+    let beside_toml = PathBuf::from(format!("{stem}.labels.toml"));
+    let beside = PathBuf::from(format!("{stem}.labels"));
+    for p in [beside_toml, beside, config_path(sha), config_toml_path(sha)] {
         if !p.is_file() {
             continue;
         }
         match Labels::load(&p, sha, rom_len) {
             Ok(l) => {
                 eprintln!(
-                    "labels: {} rom + {} iwram entries from {}{}",
+                    "labels: {} rom + {} iwram entries from {}{}{}",
                     l.rom.len(),
                     l.iwram.len(),
                     p.display(),
+                    if l.names.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" ({} named)", l.names.len())
+                    },
                     if l.reserved.is_empty() {
                         String::new()
                     } else {
@@ -291,6 +502,70 @@ mod tests {
         a.merge(b);
         assert_eq!(a.rom.len(), 2);
         assert_ne!(a.digest(None), d0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn toml_roundtrip_detection_and_enrichment() {
+        let sha = "ab".repeat(32);
+        let dir = std::env::temp_dir().join("gba-labels-toml-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("t.labels.toml");
+        // Hand-written input: hex-int, underscore, and string addresses,
+        // short mode spellings, names and ends, an ewram record.
+        std::fs::write(
+            &p,
+            format!(
+                r#"
+format = "gba-labels"
+version = 2
+
+[image]
+sha256 = "{sha}"
+
+[[functions]]
+name = "AgbMain"
+address = 0x0800_1234
+end = "0x08001268"
+mode = "thumb"
+
+[[functions]]
+address = "08002000"
+mode = "a"
+
+[[functions]]
+address = 0x02000420
+mode = "arm"
+
+[[functions]]
+address = 0x09FFFFFE   # beyond rom_len -> skipped
+mode = "arm"
+"#
+            ),
+        )
+        .unwrap();
+        let l = Labels::load(&p, &sha, 0x10000).unwrap();
+        assert_eq!(l.rom.len(), 2);
+        assert!(l.rom.contains(&0x0800_1235)); // thumb bit folded in
+        assert!(l.rom.contains(&0x0800_2000));
+        assert_eq!(l.names.get(&0x0800_1235).map(String::as_str), Some("AgbMain"));
+        assert_eq!(l.ends.get(&0x0800_1235), Some(&0x0800_1268));
+        assert_eq!(l.reserved, vec!["ewram 02000420 a".to_string()]);
+        assert_eq!(l.skipped, 1);
+        // Round-trip through save_toml preserves everything.
+        let p2 = dir.join("rt.labels.toml");
+        l.save_toml(&p2, &sha).unwrap();
+        let back = Labels::load(&p2, &sha, 0x10000).unwrap();
+        assert_eq!(back.rom, l.rom);
+        assert_eq!(back.names, l.names);
+        assert_eq!(back.ends, l.ends);
+        assert_eq!(back.reserved, l.reserved);
+        // Wrong sha refuses; digest ignores enrichment (rename must
+        // not retranslate).
+        assert!(Labels::load(&p, &"cd".repeat(32), 0x10000).is_err());
+        let mut stripped = Labels::default();
+        stripped.rom = l.rom.clone();
+        assert_eq!(stripped.digest(None), l.digest(None));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
