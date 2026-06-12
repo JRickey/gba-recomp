@@ -9,6 +9,7 @@ use std::process::ExitCode;
 
 mod analyze;
 mod emit;
+mod labels;
 
 use armv4t::{decode_arm, decode_thumb, Op};
 use gba_core::{is_self_loop, Machine, StepEvent};
@@ -59,18 +60,22 @@ const HELP: &[(&str, &str, &[&str], &str)] = &[
         "--ram    profile a short interpreter run first, translating the RAM-resident \
 code and computed-branch targets it discovers (recommended; play's cache builds use it)",
     ], "Translate a ROM image to a native shared library at out/<stem>.dylib. \
-Emits C11 in bounded chunks and compiles them with cc."),
-    ("play", "recomp play <rom> [--interp] [--stats] [--status]", &[
-        "--interp    force the interpreter (skip/ignore native translation)",
-        "--stats     print performance readouts (frame time, native vs fallback)",
-        "--status    emit machine-readable lifecycle lines on stdout (used by the launcher)",
+Emits C11 in bounded chunks and compiles them with cc. Label files (<rom>.labels \
+or the recorder's accumulator) contribute extra entry-point seeds automatically."),
+    ("play", "recomp play <rom> [--interp] [--stats] [--status] [--record-labels]", &[
+        "--interp           force the interpreter (skip/ignore native translation)",
+        "--stats            print performance readouts (frame time, native vs fallback)",
+        "--status           emit machine-readable lifecycle lines on stdout (used by the launcher)",
+        "--record-labels    record interpreter-fallback entry points; the next translation \
+covers them (accumulates across sessions)",
     ], "Windowed play. First launch translates the image into the per-user cache \
 (one-time, progress printed); later launches load it instantly. Reads input.cfg/av.cfg \
 from the shared config directory."),
-    ("runc", "recomp runc <rom> [--frames N] [--out img.ppm] [--input file]", &[
-        "--frames N      frames to run (default 600)",
-        "--out PATH      write the final frame as a PPM",
-        "--input FILE    replay a recorded input script (see play's RECOMP_RECORD_INPUT)",
+    ("runc", "recomp runc <rom> [--frames N] [--out img.ppm] [--input file] [--record-labels]", &[
+        "--frames N         frames to run (default 600)",
+        "--out PATH         write the final frame as a PPM",
+        "--input FILE       replay a recorded input script (see play's RECOMP_RECORD_INPUT)",
+        "--record-labels    record fallback entry points as labels (headless soak runs)",
     ], "Run the recompiled output from out/<stem>.dylib headless (build first); \
 prints frame hash and native/fallback counts."),
     ("verify", "recomp verify <rom> [--frames N] [--reuse] [--dump prefix] [--input file]", &[
@@ -764,6 +769,9 @@ fn cmd_play(args: &[String]) -> Result<(), String> {
             "--interp" => interp_only = true,
             "--status" => status = true,
             "--stats" => show_stats = true,
+            "--record-labels" => {
+                FALLBACK_COLLECT.store(true, std::sync::atomic::Ordering::Relaxed)
+            }
             other if rom_path.is_none() => rom_path = Some(other.to_string()),
             other => return Err(format!("unexpected argument {other:?}")),
         }
@@ -1206,6 +1214,9 @@ fn cmd_play(args: &[String]) -> Result<(), String> {
         eprintln!("saved {sav_path}");
     }
     print_fallback_census();
+    if FALLBACK_COLLECT.load(std::sync::atomic::Ordering::Relaxed) {
+        record_labels(m.bus.rom.len(), &rom_sha256(&m.bus.rom))?;
+    }
     Ok(())
 }
 
@@ -1238,11 +1249,7 @@ fn ensure_native(
     rom: &[u8],
     status: bool,
 ) -> Result<(libloading::Library, BlockTable), String> {
-    use sha2::{Digest, Sha256};
-    let sha = Sha256::digest(rom)
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect::<String>();
+    let sha = rom_sha256(rom);
     let base = dirs::cache_dir()
         .unwrap_or_else(std::env::temp_dir)
         .join("gba-recomp");
@@ -1265,9 +1272,33 @@ fn ensure_native(
     // Experimental EWRAM translations get their own cache entry so they
     // can never be loaded by (or shadow) a normal run.
     let suffix = if std::env::var_os("RECOMP_EWRAM").is_some() { "-e" } else { "" };
-    let lib_path = dir.join(format!("{sha}{suffix}.dylib"));
+    // The label set participates in the key: a grown set means new
+    // coverage, so the next launch retranslates automatically.
+    let lbl = labels::load_all(rom_path, &sha, rom.len());
+    let lsuffix = if lbl.rom.is_empty() {
+        String::new()
+    } else {
+        format!("-l{:08x}", lbl.digest() as u32 ^ (lbl.digest() >> 32) as u32)
+    };
+    let lib_path = dir.join(format!("{sha}{suffix}{lsuffix}.dylib"));
     let lib_str = lib_path.to_str().ok_or("non-UTF8 cache path")?;
     if !lib_path.is_file() {
+        // Superseded translations of this image (older label sets) can
+        // never be loaded again — sweep them before building anew.
+        // Same suffix family only, so normal and experimental entries
+        // never evict each other.
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            for e in entries.flatten() {
+                let name = e.file_name().to_string_lossy().into_owned();
+                let stale = name
+                    .strip_prefix(&sha)
+                    .and_then(|r| r.strip_prefix(suffix))
+                    .is_some_and(|r| r.starts_with('.') || r.starts_with("-l"));
+                if stale {
+                    let _ = std::fs::remove_file(e.path());
+                }
+            }
+        }
         eprintln!("first launch: translating image (one-time)...");
         if status {
             status_line("building 0");
@@ -1812,6 +1843,20 @@ fn build_dylib(
         (seeds.into_iter().collect::<Vec<u32>>(), m.bus.ewram.clone(), m.bus.iwram.clone())
     };
 
+    // Label-file seeds: runtime-discovered ROM entry points (recorded
+    // play/runc sessions, community files) join the profile seeds.
+    // ROM is immutable, so these need no guard and a bogus entry can at
+    // worst translate unreachable code.
+    let mut seeds = seeds;
+    let lbl = labels::load_all(rom_path, &rom_sha256(&rom), rom.len());
+    if !lbl.rom.is_empty() {
+        let before = seeds.len();
+        let mut set: std::collections::BTreeSet<u32> = seeds.iter().copied().collect();
+        set.extend(&lbl.rom);
+        seeds = set.into_iter().collect();
+        println!("labels: +{} rom seeds", seeds.len() - before);
+    }
+
     let view = analyze::View {
         rom: &rom,
         ewram: if ram && ewram_xlat { Some(&ewram) } else { None },
@@ -2072,9 +2117,63 @@ thread_local! {
         std::cell::RefCell::new(std::collections::HashMap::new());
 }
 
+/// Census collection runs under RECOMP_TRACE_FALLBACK (prints at exit)
+/// or --record-labels (persists entries as a label file).
+static FALLBACK_COLLECT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 fn trace_fallback() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("RECOMP_TRACE_FALLBACK").is_some())
+        || FALLBACK_COLLECT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Persist this run's fallback census as labels: ROM entries become
+/// analyzer seeds on the next build; IWRAM/EWRAM entries are recorded
+/// as reserved presence records (not yet translatable). Union-merges
+/// into the per-image accumulator under the config dir.
+fn record_labels(rom_len: usize, sha: &str) -> Result<(), String> {
+    let mut new = labels::Labels::default();
+    FALLBACK_ENTRIES.with(|h| {
+        for (&key, _) in h.borrow().iter() {
+            match key >> 24 {
+                0x08..=0x0D if ((key & !1 & 0x01FF_FFFF) as usize) < rom_len => {
+                    new.rom.insert(key);
+                }
+                r @ (0x02 | 0x03) => new.reserved.push(format!(
+                    "{} {:08x} {}",
+                    if r == 2 { "ewram" } else { "iwram" },
+                    key & !1,
+                    if key & 1 != 0 { "t" } else { "a" }
+                )),
+                _ => {}
+            }
+        }
+    });
+    let path = labels::config_path(sha);
+    let mut all = match path.is_file() {
+        true => labels::Labels::load(&path, sha, rom_len)?,
+        false => labels::Labels::default(),
+    };
+    let (rom0, ram0) = (all.rom.len(), all.reserved.len());
+    all.merge(new);
+    all.save(&path, sha)?;
+    eprintln!(
+        "labels: +{} rom, +{} ram entries recorded ({} rom total) -> {}",
+        all.rom.len() - rom0,
+        all.reserved.len() - ram0,
+        all.rom.len(),
+        path.display()
+    );
+    if all.rom.len() > rom0 {
+        eprintln!("labels: the next translation rebuild covers the new entries");
+    }
+    Ok(())
+}
+
+/// SHA-256 of the image, hex — the cross-tool image identity.
+fn rom_sha256(rom: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(rom).iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// Dump the fallback-entry census: per-region totals plus the hottest
@@ -2134,6 +2233,9 @@ fn cmd_runc(args: &[String]) -> Result<(), String> {
             "--out" => out = Some(it.next().ok_or("--out needs a value")?.to_string()),
             "--input" => {
                 input = Some(InputScript::load(it.next().ok_or("--input needs a value")?)?)
+            }
+            "--record-labels" => {
+                FALLBACK_COLLECT.store(true, std::sync::atomic::Ordering::Relaxed)
             }
             other if rom_path.is_none() => rom_path = Some(other.to_string()),
             other => return Err(format!("unexpected argument {other:?}")),
@@ -2298,6 +2400,9 @@ fn cmd_runc(args: &[String]) -> Result<(), String> {
         });
     }
     print_fallback_census();
+    if FALLBACK_COLLECT.load(std::sync::atomic::Ordering::Relaxed) {
+        record_labels(m.bus.rom.len(), &rom_sha256(&m.bus.rom))?;
+    }
     dump_frame(&m, out)?;
     Ok(())
 }

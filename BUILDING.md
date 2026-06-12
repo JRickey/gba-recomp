@@ -102,6 +102,28 @@ keyed by the ROM's SHA-256. Bumping `TRANSLATION_REV` (any emitter or ABI
 change) invalidates and sweeps old revisions automatically; deleting the
 directory just costs a one-time retranslation.
 
+**Labels: reducing interpreter fallback.** Static analysis plus a short
+profiling boot can't reach code that only executes deep into a game
+(computed-branch targets, handlers installed at runtime). Whenever the
+runtime falls back to the interpreter it knows exactly which entry point
+was missing — play or runc with `--record-labels` persists those as a
+*label file* and the next translation covers them:
+
+```sh
+recomp play game.gba --record-labels     # just play; labels accumulate
+# next launch rebuilds automatically (the label set is part of the
+# cache key) — fallback at the places you visited is gone
+```
+
+Label files are plain text keyed by the image's SHA-256, hold only
+addresses (never image content), and union-merge — so they accumulate
+across sessions and can be shared: a file named `<rom>.labels` next to
+the image is picked up automatically alongside the recorder's own
+accumulator in `<config_dir>/gba-recomp/labels/`. ROM entries are pure
+hints (the translation derives from the image itself, so a wrong label
+is harmless); `iwram`/`ewram` records are reserved for content-guarded
+RAM translation and currently counted but skipped.
+
 ### `gba-launcher` — the frontend
 
 ```sh
