@@ -175,6 +175,19 @@ pub struct RdrvHle {
     /// starvation watchdog must not run (a fresh engage has no cursor
     /// baseline — disengaging on it flaps at probe cadence).
     hook_seen: bool,
+    /// Stale-chunk replay: the guest's FIFO DMA cycles the two-chunk
+    /// output ring, so when the game stops calling the mixer (observed:
+    /// a 1.4 s outage right after a note-on — the DMA loops that bass
+    /// chunk as a tone) the hardware-faithful output is the LAST TWO
+    /// COMMITTED CHUNKS looping, not silence. We keep the check
+    /// stream's most recent 2×chunk guest-rate samples and loop them
+    /// whenever hooks stop; output, check copy, and verifier all see
+    /// the replay, so outages stay proven and level-matched.
+    replay: [f32; 1024],
+    replay_cap: usize,
+    replay_w: usize,
+    replay_r: usize,
+    replaying: bool,
 }
 
 impl RdrvHle {
@@ -203,6 +216,11 @@ impl RdrvHle {
             cad_sum: 0.0,
             cad_n: 0,
             hook_seen: false,
+            replay: [0.0; 1024],
+            replay_cap: 0,
+            replay_w: 0,
+            replay_r: 0,
+            replaying: false,
         }
     }
 
@@ -429,6 +447,13 @@ impl RdrvHle {
         let render_ok = (256..=4096).contains(&gap);
         self.win_len = if render_ok { gap as f64 } else { f64::MAX };
         self.win_pos = 0.0;
+        self.replay_cap = ((2.0 * chunk) as usize).min(self.replay.len());
+        // Any hook = ticking resumed: a later starvation must re-enter
+        // replay through the synth (back-to-back outages separated by
+        // one hook otherwise loop a stale ring that misses the chunk
+        // this hook just committed). The unrenderable resume window
+        // (win_len = MAX) keeps playing the ring below.
+        self.replaying = false;
         for i in 0..n {
             let prev = prev_snap[i];
             let cur = self.pending[i];
@@ -510,6 +535,51 @@ impl RdrvHle {
         }
     }
 
+    /// Synthesize one guest-rate chunk from the pending snapshot into
+    /// the replay ring — the chunk the guest committed at the last
+    /// hook that the one-tick-delayed render hasn't produced yet. The
+    /// snapshot holds the exact start state of that tick (positions,
+    /// telemetry steps, the gains canon mixed with).
+    fn synth_replay_chunk(&mut self, mem: &MemView) {
+        if self.replay_cap == 0 {
+            return;
+        }
+        let chunk = self.replay_cap / 2;
+        let mut vs: Vec<Voice> = Vec::new();
+        for v in self.pending[..self.count].iter() {
+            if !v.on {
+                continue;
+            }
+            // Per-GUEST-sample step: telemetry (grid) scaled by the
+            // grid/guest ratio, falling back to the +0x08 cache (which
+            // is already guest-rate).
+            let per_guest = if v.grid_step.is_finite() {
+                v.grid_step * self.mix_step
+            } else {
+                v.step
+            };
+            if !(per_guest.is_finite() && per_guest > 0.0) {
+                continue;
+            }
+            let mut c = *v;
+            c.pos = v.guest_pos;
+            c.grid_step = per_guest;
+            c.dead = false;
+            vs.push(c);
+        }
+        for _ in 0..chunk {
+            let mut sum = 0.0f32;
+            for c in vs.iter_mut() {
+                if !c.dead {
+                    sum += sample_voice(c, mem) * c.gain;
+                }
+            }
+            self.replay_w = (self.replay_w + 1) % self.replay_cap;
+            self.replay[self.replay_w] = sum.clamp(-1.0, 127.0 / 128.0);
+            self.replay_r = self.replay_w;
+        }
+    }
+
     /// Advance-entry hook: the guest mixer cached each rendered voice's
     /// effective 9.23 step at +0x08 (the advance pass consumes and
     /// zeroes it right after this PC). Nonzero cache ⇔ the voice was
@@ -578,43 +648,89 @@ impl RdrvHle {
     /// scale (one full-scale FIFO DAC = 0.25). `canon` is the live FIFO
     /// DAC pair — this family feeds FIFO A only.
     pub fn render(&mut self, mem: &MemView, canon: [i8; 2], audio_cursor: u64) -> (f32, f32) {
-        // Starvation watchdog: ticks stopped (song change, load
-        // screen, driver rebuild). "Layout valid" and "ticking" are
-        // separate states: stay ENGAGED so the stream stays contiguous
-        // (silence) — the old disengage flapped against the probe at
-        // sample cadence (re-engage had no cursor baseline, so the
-        // next render call disengaged again; every starvation became a
-        // long dropout with the tap dripping 1-of-16 samples). While
-        // starved, periodically re-locate the blob: a rebuild can move
-        // it, which moves the hook PCs; only a vanished blob (true
-        // shutdown) disengages back to the probe.
-        if self.hook_seen
-            && audio_cursor.saturating_sub(self.last_hook_cursor) / crate::mem::AUDIO_SAMPLE_CYCLES
-                > 3 * 1100
-        {
+        // Starvation: ticks stopped (the game stopped calling the
+        // mixer — observed 1.4 s outages; also song changes, loads,
+        // driver rebuild). "Layout valid" and "ticking" are separate
+        // states: stay ENGAGED — the old disengage flapped against the
+        // probe at sample cadence (re-engage had no cursor baseline,
+        // so the next render call disengaged again; every starvation
+        // became a long dropout with the tap dripping 1-of-16
+        // samples). The hardware-faithful output during an outage is
+        // the FIFO DMA's own behavior: it keeps cycling the two-chunk
+        // output ring, looping the last committed chunks (a fresh
+        // note-on becomes a sustained tone). Replay our check-stream
+        // history of those chunks — output, check copy, and verifier
+        // all follow it, so outages stay proven instead of striking.
+        // While starved, periodically re-locate the blob: a rebuild
+        // can move it, which moves the hook PCs; only a vanished blob
+        // (true shutdown) disengages back to the probe.
+        let since_hook =
+            audio_cursor.saturating_sub(self.last_hook_cursor) / crate::mem::AUDIO_SAMPLE_CYCLES;
+        let tick = if self.cad_n >= 8 {
+            self.cad_sum / self.cad_n as f64
+        } else {
+            1100.0
+        };
+        // 1.25 ticks ≈ the rendered window is exhausted AND the guest's
+        // DMA has moved on to the chunk committed at the last hook —
+        // which our one-tick-delayed render never produced (its ring
+        // holds chunks N-1 and N, our history N-2 and N-1; at a
+        // note-onset outage that missing chunk IS the note — observed:
+        // a 1.4 s outage right after a bass note-on). Synthesize chunk
+        // N forward from the pending snapshot (the exact start state
+        // of tick N) and start the replay on it, matching the DMA.
+        if self.hook_seen && since_hook as f64 > 1.25 * tick {
+            if !self.replaying {
+                self.synth_replay_chunk(mem);
+                if self.replay_cap > 0 {
+                    let chunk = self.replay_cap / 2;
+                    self.replay_r = (self.replay_w + self.replay_cap - chunk) % self.replay_cap;
+                }
+                self.replaying = true;
+            }
             self.count = 0;
             for v in self.voices.iter_mut() {
                 v.on = false;
             }
-            self.engage_backoff = self.engage_backoff.wrapping_add(1);
-            if self.engage_backoff % 1024 == 0 {
-                match crate::engine::find(mem.iwram, &NOTE_ON_SIG, 0)
-                    .and_then(|off| harvest(mem, 0x0300_0000 + off as u32))
-                {
-                    Some(lay) => self.lay = lay,
-                    None => {
-                        if std::env::var_os("RECOMP_RDRV_TRACE").is_some() {
-                            eprintln!(
-                                "rdrv: blob gone at cursor={} hooks={} — disengage",
-                                audio_cursor / crate::mem::AUDIO_SAMPLE_CYCLES,
-                                self.hooks
-                            );
+            if since_hook > 3 * 1100 {
+                self.engage_backoff = self.engage_backoff.wrapping_add(1);
+                if self.engage_backoff % 1024 == 0 {
+                    match crate::engine::find(mem.iwram, &NOTE_ON_SIG, 0)
+                        .and_then(|off| harvest(mem, 0x0300_0000 + off as u32))
+                    {
+                        Some(lay) => self.lay = lay,
+                        None => {
+                            if std::env::var_os("RECOMP_RDRV_TRACE").is_some() {
+                                eprintln!(
+                                    "rdrv: blob gone at cursor={} hooks={} — disengage",
+                                    audio_cursor / crate::mem::AUDIO_SAMPLE_CYCLES,
+                                    self.hooks
+                                );
+                            }
+                            self.engaged = false;
                         }
-                        self.engaged = false;
                     }
                 }
             }
-            return (0.0, 0.0);
+        }
+        // Replay also covers the unrenderable window right after a
+        // resume hook (gap out of range -> win_len MAX, no render set
+        // yet): the ring bridges the one tick until fresh data flows,
+        // instead of a 16 ms notch against canon's fresh chunk.
+        if self.replaying || (self.hook_seen && self.win_len == f64::MAX) {
+            if self.replay_cap == 0 {
+                return (0.0, 0.0);
+            }
+            self.chk_acc -= 1.0;
+            if self.chk_acc <= 0.0 {
+                self.replay_r = (self.replay_r + 1) % self.replay_cap;
+                self.chk_hold = self.replay[self.replay_r];
+                self.chk_acc += self.mix_step;
+            }
+            let canon_ab = (canon[0] as f32 / 128.0, canon[1] as f32 / 128.0);
+            let _ = self.vf.judge(canon_ab, (self.chk_hold, 0.0));
+            let m = self.chk_hold * 0.25;
+            return (m, m);
         }
         let gain = self.vf.gain();
         // Envelope ramp position within the window (both gain endpoints
@@ -644,6 +760,15 @@ impl RdrvHle {
             if self.chk_acc <= 0.0 {
                 self.chk_hold = sum.clamp(-1.0, 127.0 / 128.0);
                 self.chk_acc += self.mix_step;
+                // Replay history: the most recent 2×chunk guest-rate
+                // samples — what the guest's output ring would hold.
+                // The read cursor trails the write cursor so a replay
+                // starts at the oldest sample and loops chronologically.
+                if self.replay_cap > 0 {
+                    self.replay_w = (self.replay_w + 1) % self.replay_cap;
+                    self.replay[self.replay_w] = self.chk_hold;
+                    self.replay_r = self.replay_w;
+                }
             }
             let canon_ab = (canon[0] as f32 / 128.0, canon[1] as f32 / 128.0);
             let _ = self.vf.judge(canon_ab, (self.chk_hold, 0.0));
