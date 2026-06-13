@@ -625,6 +625,9 @@ fn cmd_frames(args: &[String]) -> Result<(), String> {
                 .map(|m| format!(" PAUSED: {m}"))
                 .unwrap_or_default()
         );
+        if std::env::var_os("RECOMP_RDRV_DISC").is_some() {
+            eprintln!("{}", r.disc_report());
+        }
     }
     if let Some(prefix) = &dump_audio {
         write_wav(

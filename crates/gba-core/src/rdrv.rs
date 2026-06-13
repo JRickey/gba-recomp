@@ -188,6 +188,17 @@ pub struct RdrvHle {
     replay_w: usize,
     replay_r: usize,
     replaying: bool,
+    /// Discontinuity attribution (RECOMP_RDRV_DISC): tally output-step
+    /// magnitude by cause — boundary (window rebuild), loop-wrap,
+    /// voice-death, interior. Off the hot path unless armed.
+    dbg_disc: bool,
+    dbg_prev_out: f32,
+    dbg_new_window: bool,
+    dbg: [(u64, f64); 4], // (count, sum|Δ|) for [boundary, wrap, death, interior]
+    dbg_err_n: u64,
+    dbg_err_sum: f64,
+    dbg_err_signed: f64,
+    dbg_snap_n: u64,
 }
 
 impl RdrvHle {
@@ -221,7 +232,40 @@ impl RdrvHle {
             replay_w: 0,
             replay_r: 0,
             replaying: false,
+            dbg_disc: std::env::var_os("RECOMP_RDRV_DISC").is_some(),
+            dbg_prev_out: 0.0,
+            dbg_new_window: false,
+            dbg: [(0, 0.0); 4],
+            dbg_err_n: 0,
+            dbg_err_sum: 0.0,
+            dbg_err_signed: 0.0,
+            dbg_snap_n: 0,
         }
+    }
+
+    /// Drain the discontinuity-attribution tallies (RECOMP_RDRV_DISC).
+    pub fn disc_report(&self) -> String {
+        let lab = ["boundary", "wrap", "death", "interior"];
+        let mut s = String::from("rdrv disc |Δ| by cause:");
+        for (i, (n, sum)) in self.dbg.iter().enumerate() {
+            let mean = if *n > 0 { sum / *n as f64 } else { 0.0 };
+            s += &format!(" {}={:.5}(n={})", lab[i], mean, n);
+        }
+        let mean_err = if self.dbg_err_n > 0 {
+            self.dbg_err_sum / self.dbg_err_n as f64
+        } else {
+            0.0
+        };
+        let bias = if self.dbg_err_n > 0 {
+            self.dbg_err_signed / self.dbg_err_n as f64
+        } else {
+            0.0
+        };
+        s += &format!(
+            "; carry mean|err|={mean_err:.3} bias={bias:+.3} (carry={} snap={})",
+            self.dbg_err_n, self.dbg_snap_n
+        );
+        s
     }
 
     #[inline(always)]
@@ -447,6 +491,7 @@ impl RdrvHle {
         let render_ok = (256..=4096).contains(&gap);
         self.win_len = if render_ok { gap as f64 } else { f64::MAX };
         self.win_pos = 0.0;
+        self.dbg_new_window = true;
         self.replay_cap = ((2.0 * chunk) as usize).min(self.replay.len());
         // Any hook = ticking resumed: a later starvation must re-enter
         // replay through the synth (back-to-back outages separated by
@@ -457,6 +502,10 @@ impl RdrvHle {
         for i in 0..n {
             let prev = prev_snap[i];
             let cur = self.pending[i];
+            // The render voice still in this slot integrated to its
+            // final position over the window that just finished — the
+            // basis for the phase-continuous carry below.
+            let fin = self.voices[i];
             let r = &mut self.voices[i];
             *r = Voice::default();
             if !render_ok || !prev.on || prev.addr != cur.addr {
@@ -474,12 +523,54 @@ impl RdrvHle {
                 continue;
             }
             *r = prev;
-            r.pos = prev.guest_pos;
             r.dead = false;
-            r.grid_step = step;
             r.gain = prev.gain;
             r.gain_target = if cur.on { cur.gain } else { 0.0 };
             r.on = true;
+            // Phase-continuous resampling. The guest is click-free
+            // because it integrates a continuous position; we get only
+            // per-hook position snapshots, and snapping pos to each one
+            // steps the output by the per-window drift — our integrated
+            // advance never lands exactly on the next snapshot (the
+            // guest's own frac-accumulator rounds ~1 sample over a
+            // chunk, and that gap is independent of how exactly we
+            // pick the rate — tested: the exact cache rate does NOT
+            // close it). That snap is a ~60 Hz click train, the
+            // dominant periodic |Δ| by attribution (3.6× interior).
+            // Instead START where the previous window's render actually
+            // integrated to, keeping the position trajectory continuous,
+            // and null the small telemetry drift across this window as a
+            // rate nudge. The cost is a bounded sub-sample phase offset
+            // vs the guest (no detune — the nudge zeroes the running
+            // error each window); the gain is no click. A genuine large
+            // jump (note restart / seek) is NOT drift — it snaps, and
+            // that click is faithful.
+            // Damp the drift correction: nulling the full error each
+            // window would put the correction at the window rate (~60 Hz
+            // — audible as roughness). Correcting a fraction per window
+            // spreads it into a slow (~5-window) phase track, moving the
+            // residual to sub-Hz where it's inaudible, at the cost of a
+            // few samples of steady (constant, unmodulated) phase offset.
+            const DAMP: f64 = 0.2;
+            let dpos = step * self.win_len;
+            let same_voice =
+                fin.on && !fin.dead && fin.addr == prev.addr && fin.instr == prev.instr;
+            let err = prev.guest_pos - fin.pos;
+            if same_voice && fin.pos.is_finite() && err.abs() < 8.0 + 0.05 * dpos {
+                r.pos = fin.pos;
+                r.grid_step = step + DAMP * err / self.win_len;
+                if self.dbg_disc {
+                    self.dbg_err_n += 1;
+                    self.dbg_err_sum += err.abs();
+                    self.dbg_err_signed += err;
+                }
+            } else {
+                r.pos = prev.guest_pos;
+                r.grid_step = step;
+                if self.dbg_disc {
+                    self.dbg_snap_n += 1;
+                }
+            }
         }
 
         // Diagnostic (RECOMP_RDRV_TRACE): per-tick mixer snapshot.
@@ -739,12 +830,35 @@ impl RdrvHle {
         let t = (self.win_pos / self.win_len).min(1.0) as f32;
         self.win_pos += 1.0;
         let mut sum = 0.0f32;
+        let mut any_wrap = false;
+        let mut any_death = false;
         for v in self.voices[..self.count].iter_mut() {
             if !v.on || v.dead {
                 continue;
             }
             let g = v.gain + (v.gain_target - v.gain) * t;
-            sum += sample_voice(v, mem) * g * gain;
+            let mut wrapped = false;
+            let was_dead = v.dead;
+            sum += sample_voice_dbg(v, mem, &mut wrapped) * g * gain;
+            any_wrap |= wrapped;
+            any_death |= v.dead && !was_dead;
+        }
+        if self.dbg_disc {
+            let out = sum * 0.25;
+            let step = (out - self.dbg_prev_out).abs() as f64;
+            self.dbg_prev_out = out;
+            let cls = if self.dbg_new_window {
+                0
+            } else if any_death {
+                2
+            } else if any_wrap {
+                1
+            } else {
+                3
+            };
+            self.dbg[cls].0 += 1;
+            self.dbg[cls].1 += step;
+            self.dbg_new_window = false;
         }
         // Canon-domain check copy: the guest mixes on its own grid and
         // saturates the SUM to s8 — one stream-level ZOH at the guest
@@ -969,6 +1083,11 @@ fn harvest(mem: &MemView, blob: u32) -> Option<Layout> {
 /// the loop length at the end address; one-shots die there. Per-chunk
 /// resync bounds any drift to one chunk.
 fn sample_voice(v: &mut Voice, mem: &MemView) -> f32 {
+    let mut ignore = false;
+    sample_voice_dbg(v, mem, &mut ignore)
+}
+
+fn sample_voice_dbg(v: &mut Voice, mem: &MemView, wrapped: &mut bool) -> f32 {
     let mut guard = 0;
     while v.pos >= v.end {
         guard += 1;
@@ -977,6 +1096,7 @@ fn sample_voice(v: &mut Voice, mem: &MemView) -> f32 {
             return 0.0;
         }
         v.pos -= v.loop_len as f64;
+        *wrapped = true;
     }
     let base = v.pos.floor();
     let frac = (v.pos - base) as f32;
