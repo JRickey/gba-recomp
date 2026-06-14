@@ -219,7 +219,7 @@ impl StickToken {
 }
 
 /// Key names are a canonical set understood by both frontends (egui on the
-/// launcher side, minifb on the play side): letters `A`..`Z`, digits
+/// launcher side, winit on the play side): letters `A`..`Z`, digits
 /// `0`..`9`, `Up` `Down` `Left` `Right`, `Enter`, `Space`, `Tab`,
 /// `Backspace`, `LeftShift`, `RightShift`. Pad names are gilrs button
 /// names (`South`, `East`, `DPadUp`, `LeftTrigger`, ...).

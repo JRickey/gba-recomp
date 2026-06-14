@@ -23,6 +23,8 @@
 //! anything. On platforms without compositor color management the sRGB
 //! assumption applies (with a manual wide-gamut override in the config).
 
+use std::sync::Arc;
+
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 
 use crate::profile::DisplayTarget;
@@ -73,10 +75,6 @@ pub struct Presenter {
     /// output so the hardware re-encode is an identity overall.
     srgb_surface: bool,
     src_size: (u32, u32),
-    /// macOS: the view's backing scale factor (physical px per logical px).
-    scale_factor: f64,
-    #[cfg(target_os = "macos")]
-    ns_view: *mut std::ffi::c_void,
 }
 
 impl Presenter {
@@ -86,24 +84,22 @@ impl Presenter {
     /// AutoVsync): presentation pacing, never emulation pacing — game
     /// speed is owned by the audio clock (see module docs).
     ///
-    /// Safety contract (checked by scope, not the type system): `window`
-    /// must outlive the returned Presenter — the caller keeps the window
-    /// alive for the whole play session and drops the presenter first.
-    pub fn new(
-        window: &(impl HasWindowHandle + HasDisplayHandle),
+    /// The surface takes an owning `Arc` clone of `window`, so the window is
+    /// guaranteed to outlive the surface — no `unsafe`, no scope contract.
+    pub fn new<W>(
+        window: Arc<W>,
         src_w: u32,
         src_h: u32,
         target: DisplayTarget,
         vsync: bool,
-    ) -> Result<Presenter, String> {
+    ) -> Result<Presenter, String>
+    where
+        W: HasWindowHandle + HasDisplayHandle + Send + Sync + 'static,
+    {
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
-        let surface = unsafe {
-            let target = wgpu::SurfaceTargetUnsafe::from_window(window)
-                .map_err(|e| format!("window handle: {e}"))?;
-            instance
-                .create_surface_unsafe(target)
-                .map_err(|e| format!("surface: {e}"))?
-        };
+        let surface = instance
+            .create_surface(window.clone())
+            .map_err(|e| format!("surface: {e}"))?;
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::LowPower,
             compatible_surface: Some(&surface),
@@ -255,7 +251,7 @@ impl Presenter {
             cache: None,
         });
 
-        let mut p = Presenter {
+        let p = Presenter {
             surface,
             device,
             queue,
@@ -266,16 +262,12 @@ impl Presenter {
             config,
             srgb_surface,
             src_size: (src_w, src_h),
-            scale_factor: 1.0,
-            #[cfg(target_os = "macos")]
-            ns_view: macos::ns_view_ptr(window),
         };
         p.surface.configure(&p.device, &p.config);
+        // Color-match the layer to the panel (macOS only); the surface +
+        // CAMetalLayer now exist on the window's view.
         #[cfg(target_os = "macos")]
-        {
-            p.scale_factor = macos::backing_scale_factor(p.ns_view).unwrap_or(1.0);
-            macos::tag_layer_colorspace(p.ns_view, target);
-        }
+        macos::tag_layer_colorspace(macos::ns_view_ptr(window.as_ref()), target);
         let _ = target; // consumed on macOS; assumption elsewhere
         Ok(p)
     }
@@ -298,15 +290,9 @@ impl Presenter {
         }
     }
 
-    /// Physical-pixel surface size for a window reporting `logical` size.
-    pub fn physical_size(&self, logical: (usize, usize)) -> (u32, u32) {
-        (
-            ((logical.0 as f64) * self.scale_factor).round() as u32,
-            ((logical.1 as f64) * self.scale_factor).round() as u32,
-        )
-    }
-
     /// Upload the frame and draw it at the window's current size.
+    /// `window_physical` is the surface size in physical pixels (winit's
+    /// `inner_size()` reports this directly and cross-platform).
     pub fn present(
         &mut self,
         rgba: &[[u8; 4]],
@@ -501,17 +487,6 @@ mod macos {
         match window.window_handle().map(|h| h.as_raw()) {
             Ok(raw_window_handle::RawWindowHandle::AppKit(h)) => h.ns_view.as_ptr(),
             _ => std::ptr::null_mut(),
-        }
-    }
-
-    pub fn backing_scale_factor(ns_view: *mut std::ffi::c_void) -> Option<f64> {
-        if ns_view.is_null() {
-            return None;
-        }
-        unsafe {
-            let view = ns_view as *mut AnyObject;
-            let win: Option<Retained<AnyObject>> = msg_send![&*view, window];
-            win.map(|w| msg_send![&*w, backingScaleFactor])
         }
     }
 
