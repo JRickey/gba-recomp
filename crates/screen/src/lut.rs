@@ -4,8 +4,8 @@
 //! lookup per source pixel. Frame hashing / verify / sweeps stay defined on
 //! the raw BGR555 frames — this table is present-time only.
 
-use crate::color::{rgb_to_rgb, srgb_oetf, Mat3};
-use crate::profile::{DisplayTarget, ScreenKind};
+use crate::color::{rgb_to_rgb, srgb_oetf, Mat3, Primaries};
+use crate::profile::ScreenKind;
 
 /// BGR555 -> RGBA8 (alpha 255). Index with the raw 15-bit framebuffer value.
 pub struct ColorLut {
@@ -18,7 +18,10 @@ pub struct ColorSettings {
     pub screen: ScreenKind,
     /// Reflective-family viewing-darkness knob, 0..1. NaN = screen default.
     pub darken: f64,
-    pub target: DisplayTarget,
+    /// Primaries to encode the output for (resolved by the caller from the
+    /// configured [`DisplayTarget`](crate::profile::DisplayTarget) plus OS
+    /// detection — sRGB, Display P3, or the measured panel gamut).
+    pub target: Primaries,
 }
 
 impl Default for ColorSettings {
@@ -29,7 +32,7 @@ impl Default for ColorSettings {
         Self {
             screen: ScreenKind::Frontlit,
             darken: f64::NAN,
-            target: DisplayTarget::Auto,
+            target: crate::color::SRGB,
         }
     }
 }
@@ -80,7 +83,7 @@ impl ColorLut {
             }
             screen => {
                 let model = screen.model(settings.darken_or_default()).unwrap();
-                let to_display: Mat3 = rgb_to_rgb(&model.primaries, settings.target.primaries());
+                let to_display: Mat3 = rgb_to_rgb(&model.primaries, &settings.target);
                 for (px, entry) in table.iter_mut().enumerate() {
                     let c = unpack555(px as u16);
                     // Panel tone response (authored intent), pure power law.

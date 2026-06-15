@@ -14,10 +14,24 @@
 
 pub mod blend;
 pub mod color;
+/// Resolve the effective display target from OS facts (panel EDID +
+/// compositor color-management state): declare sRGB when the OS manages it,
+/// else compress into the panel's primaries ourselves.
+#[cfg(feature = "gpu")]
+pub mod display;
+/// Read the connected panel's measured primaries from its EDID (Linux),
+/// for the unmanaged color-management fallback.
+#[cfg(all(feature = "gpu", target_os = "linux"))]
+mod edid;
 pub mod lut;
 #[cfg(feature = "gpu")]
 pub mod present;
 pub mod profile;
+/// Wayland color-management probe (Linux): on its own isolated connection,
+/// reads what color volume the compositor believes the output has, so
+/// `display` can tell a color-managing compositor from a passthrough one.
+#[cfg(all(feature = "gpu", target_os = "linux"))]
+mod wayland_cm;
 
 pub use blend::{ResponseMode, Temporal};
 pub use lut::{ColorLut, ColorSettings};

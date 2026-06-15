@@ -43,6 +43,14 @@ pub const DISPLAY_P3: Primaries = Primaries {
     white: D65,
 };
 
+/// Area of the primary triangle in the CIE xy plane — a cheap, monotone
+/// proxy for gamut size (sRGB ≈ 0.112, Display P3 ≈ 0.152). Used to tell a
+/// wide-gamut panel from an sRGB one without a full volume computation.
+pub fn gamut_area(p: &Primaries) -> f64 {
+    let (r, g, b) = (p.red, p.green, p.blue);
+    0.5 * ((g.x - r.x) * (b.y - r.y) - (b.x - r.x) * (g.y - r.y)).abs()
+}
+
 /// Column-major-free, plain row-major 3x3 over f64.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct Mat3(pub [[f64; 3]; 3]);

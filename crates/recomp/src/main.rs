@@ -954,7 +954,7 @@ fn apply_av_change(
     lut: &mut screen::ColorLut,
     temporal: &mut screen::Temporal,
     grid_params: &mut screen::present::GridParams,
-    display_target: screen::DisplayTarget,
+    lut_target: screen::color::Primaries,
 ) {
     match what {
         menu::Changed::Audio => {
@@ -982,7 +982,7 @@ fn apply_av_change(
                 darken: input_config::AvConfig::knob(&av.screen_darken)
                     .map(f64::from)
                     .unwrap_or(f64::NAN),
-                target: display_target,
+                target: lut_target,
             });
             *temporal = screen::Temporal::new(
                 240 * 160,

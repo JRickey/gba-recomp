@@ -196,13 +196,15 @@ impl DisplayTarget {
         Self::ALL.into_iter().find(|t| t.name() == name)
     }
 
-    /// The primaries the LUT should encode for. `Auto` = sRGB: either the
-    /// compositor is color-managed (macOS, surface tagged sRGB) or sRGB is
-    /// the platform SDR assumption.
-    pub fn primaries(self) -> &'static Primaries {
+    /// The primaries the LUT should encode for, for an explicit target.
+    /// `Auto`/`Srgb` = sRGB (the platform assumption, or a compositor that
+    /// color-manages our untagged-sRGB output). The auto-detected wide-gamut
+    /// fallback does not go through here — see [`crate::display::resolve`],
+    /// which returns measured panel primaries directly.
+    pub fn primaries(self) -> Primaries {
         match self {
-            DisplayTarget::Auto | DisplayTarget::Srgb => &crate::color::SRGB,
-            DisplayTarget::DisplayP3 => &crate::color::DISPLAY_P3,
+            DisplayTarget::Auto | DisplayTarget::Srgb => crate::color::SRGB,
+            DisplayTarget::DisplayP3 => crate::color::DISPLAY_P3,
         }
     }
 }

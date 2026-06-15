@@ -268,7 +268,10 @@ impl Presenter {
         // CAMetalLayer now exist on the window's view.
         #[cfg(target_os = "macos")]
         macos::tag_layer_colorspace(macos::ns_view_ptr(window.as_ref()), target);
-        let _ = target; // consumed on macOS; assumption elsewhere
+        // macOS consumes `target` above. Elsewhere the LUT was already encoded
+        // for the resolved primaries (see `display::resolve`) and we declare
+        // nothing to the compositor — Wayland treats untagged surfaces as sRGB.
+        let _ = target;
         Ok(p)
     }
 

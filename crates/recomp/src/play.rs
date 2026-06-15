@@ -150,7 +150,11 @@ struct PlayApp {
     // Screen simulation (rebuilt live by the menu).
     av: input_config::AvConfig,
     screen_kind: screen::ScreenKind,
+    /// Configured gamut (auto/srgb/display-p3), used for the macOS layer tag.
     display_target: screen::DisplayTarget,
+    /// Primaries the LUT actually encodes for, resolved once from
+    /// `display_target` + OS detection (may be the measured panel gamut).
+    lut_primaries: screen::color::Primaries,
     lut: screen::ColorLut,
     response: screen::ResponseMode,
     temporal: screen::Temporal,
@@ -782,7 +786,7 @@ impl ApplicationHandler for PlayApp {
                                 &mut self.lut,
                                 &mut self.temporal,
                                 &mut self.grid_params,
-                                self.display_target,
+                                self.lut_primaries,
                             );
                             if let Err(e) = self.av.save() {
                                 eprintln!("menu: could not save av.cfg ({e})");
@@ -1157,12 +1161,17 @@ Place your own dump as gba_bios.bin next to the executable:\n  {}",
         );
         screen::DisplayTarget::Auto
     });
+    // Resolve the LUT's target primaries from the configured gamut plus OS
+    // detection (a wide-gamut panel the compositor isn't managing resolves to
+    // the panel's own primaries — see screen::display). EDID is sysfs and the
+    // probe opens its own Wayland connection, so this needs no window.
+    let lut_primaries = screen::display::resolve(display_target);
     let lut = screen::ColorLut::build(&screen::ColorSettings {
         screen: screen_kind,
         darken: input_config::AvConfig::knob(&av.screen_darken)
             .map(f64::from)
             .unwrap_or(f64::NAN),
-        target: display_target,
+        target: lut_primaries,
     });
     let response = screen::ResponseMode::by_name(&av.response).unwrap_or_else(|| {
         eprintln!(
@@ -1203,6 +1212,7 @@ Place your own dump as gba_bios.bin next to the executable:\n  {}",
         av,
         screen_kind,
         display_target,
+        lut_primaries,
         lut,
         response,
         temporal,
