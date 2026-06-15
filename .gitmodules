@@ -1,3 +1,0 @@
-[submodule "gba-mapper"]
-	path = gba-mapper
-	url = git@github.com:JRickey/gab-mapper.git
