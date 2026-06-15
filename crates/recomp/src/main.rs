@@ -2072,8 +2072,15 @@ run play/runc --record-labels to capture one"
         // cc works: poll the child and ease through this unit's span
         // against a size-based time estimate (measured ~0.7 MB of C
         // per second), never claiming the unit done early.
+        // -fPIC is required: we link these objects into a shared library
+        // (`cc -shared` below) and dlopen it. Without it, gcc's small code
+        // model addresses .rodata (jump tables, constant pools in some
+        // translated blocks) with 32-bit absolute relocations (R_X86_64_32S),
+        // which the linker rejects for a shared object — translation then
+        // falls back to the interpreter. RIP-relative (PIC) addressing is the
+        // fix and is nearly free on x86-64.
         let mut child = std::process::Command::new("cc")
-            .args(["-O1", "-c", "-o", &o_path, &c_path])
+            .args(["-O1", "-fPIC", "-c", "-o", &o_path, &c_path])
             .spawn()
             .map_err(|e| format!("cc: {e}"))?;
         let est_secs = (c.len() as f64 / 700_000.0).max(1.0);
