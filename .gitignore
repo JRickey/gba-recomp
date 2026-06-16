@@ -16,6 +16,10 @@
 # Recompiler output
 /out
 
+# Release packaging (scripts/package-release.sh)
+/dist
+/stage
+
 # Editor/OS noise
 .DS_Store
 *.swp
