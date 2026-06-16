@@ -1,0 +1,11 @@
+[package]
+name = "gamedb"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Reader for the shipped gamedb.sqlite: GBA function boundaries by ROM sha256"
+
+[dependencies]
+recomp-core = { path = "../recomp-core" }
+# Bundled sqlite (public domain) so the launcher ships with no system dep.
+rusqlite = { version = "0.32", features = ["bundled"] }

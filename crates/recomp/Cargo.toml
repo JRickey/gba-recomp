@@ -9,6 +9,7 @@ description = "Static recompiler CLI"
 armv4t = { path = "../armv4t" }
 gba-core = { path = "../gba-core" }
 recomp-core = { path = "../recomp-core" }
+gamedb = { path = "../gamedb" }
 winit = "0.30"
 softbuffer = "0.4"
 libloading = "0.8"

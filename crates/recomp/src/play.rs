@@ -938,6 +938,7 @@ pub fn cmd_play(args: &[String]) -> Result<(), String> {
     let mut show_stats = cfg!(debug_assertions) || std::env::var_os("GBA_RECOMP_STATS").is_some();
     let mut bios_arg: Option<String> = None;
     let mut no_bios = false;
+    let mut gamedb_arg: Option<String> = None;
     let mut it = args.iter();
     while let Some(arg) = it.next() {
         match arg.as_str() {
@@ -947,10 +948,18 @@ pub fn cmd_play(args: &[String]) -> Result<(), String> {
             "--record-labels" => FALLBACK_COLLECT.store(true, Ordering::Relaxed),
             "--bios" => bios_arg = Some(it.next().ok_or("--bios needs a value")?.to_string()),
             "--no-bios" => no_bios = true,
+            "--gamedb" => gamedb_arg = Some(it.next().ok_or("--gamedb needs a value")?.to_string()),
             other if rom_path.is_none() => rom_path = Some(other.to_string()),
             other => return Err(format!("unexpected argument {other:?}")),
         }
     }
+    // The function-boundary source for a first-launch build: open it once
+    // here so on-demand translation seeds exhaustively from the map (and
+    // --ram profiling captures RAM-resident code the map can't carry).
+    let gamedb = gamedb_arg
+        .as_deref()
+        .map(|p| gamedb::GameDb::open(std::path::Path::new(p)))
+        .transpose()?;
     // Packaged mode: a manifest beside the executable pins this binary to one
     // title. The ROM is resolved by content hash (the package ships none), the
     // BIOS pin is enforced, and the translation loads from the package.
@@ -1062,7 +1071,7 @@ Place your own dump as gba_bios.bin next to the executable:\n  {}",
     } else if interp_only {
         None
     } else {
-        match ensure_native(&rom_path, &rom, status, bios.as_deref()) {
+        match ensure_native(&rom_path, &rom, status, bios.as_deref(), gamedb.as_ref()) {
             Ok(v) => Some(v),
             Err(e) => {
                 eprintln!("DEGRADED: native translation unavailable ({e}); interpreter only");

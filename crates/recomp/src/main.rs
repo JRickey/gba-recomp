@@ -80,7 +80,7 @@ fn main() -> ExitCode {
 /// `(name, synopsis, flag lines, description)` per command — the single
 /// source for both the overview listing and per-command help.
 const HELP: &[(&str, &str, &[&str], &str)] = &[
-    ("build", "recomp build <rom> [--ram] [--bios file] [--labels file]", &[
+    ("build", "recomp build <rom> [--ram] [--bios file] [--labels file] [--gamedb file]", &[
         "--ram    profile a short interpreter run first, translating the RAM-resident \
 code and computed-branch targets it discovers (recommended; play's cache builds use it)",
         "--bios FILE    experimental: recompile a real 16 KB BIOS image too (region 0) \
@@ -88,6 +88,8 @@ and disable all BIOS HLE; output goes to out/<stem>-bios.<dylib|so|dll>",
         "--labels FILE    union an explicit label map (instead of relying on the \
 beside-the-image file); used by packaging so a symlinked or renamed image still finds \
 its map",
+        "--gamedb FILE    seed from the shipped gamedb.sqlite (function boundaries for the \
+image's sha256) instead of label files; mutually exclusive with --labels",
     ], "Translate a ROM image to a native shared library at out/<stem>.<dylib|so|dll> (host platform). \
 Emits C11 in bounded chunks and compiles them with cc. Label files (<rom>.labels \
 or the recorder's accumulator) contribute extra entry-point seeds automatically."),
@@ -1027,6 +1029,7 @@ fn ensure_native(
     rom: &[u8],
     status: bool,
     bios: Option<&[u8]>,
+    gamedb: Option<&gamedb::GameDb>,
 ) -> Result<(libloading::Library, BlockTable), String> {
     let sha = rom_sha256(rom);
     let base = dirs::cache_dir()
@@ -1063,15 +1066,24 @@ fn ensure_native(
         let bsha = rom_sha256(b);
         suffix.push_str(&format!("-b{}", &bsha[..8]));
     }
-    // The label set (and the IWRAM snapshot backing it) participates
-    // in the key: grown coverage retranslates on the next launch.
-    let lbl = labels::load_all(rom_path, &sha, rom.len());
+    // The boundary source — the gamedb when it carries this image
+    // (mapper-grade, full coverage), else label files beside it — drives
+    // BOTH the build and the cache key, so a gamedb build and a file build
+    // never shadow each other and grown coverage retranslates.
+    let from_gamedb = gamedb.filter(|db| db.function_count(&sha).map(|n| n > 0).unwrap_or(false));
+    let lbl = match from_gamedb {
+        Some(db) => db.labels(&sha, rom.len())?,
+        None => labels::load_all(rom_path, &sha, rom.len()),
+    };
     let lsuffix = if lbl.is_empty() {
         String::new()
     } else {
         let blob = labels::Blob::load(&labels::blob_path(&sha));
         let d = lbl.digest(blob.as_ref());
-        format!("-l{:08x}", d as u32 ^ (d >> 32) as u32)
+        // 'g' = gamedb-sourced (exhaustive), 'l' = label files — distinct
+        // key families so switching source always retranslates.
+        let tag = if from_gamedb.is_some() { 'g' } else { 'l' };
+        format!("-{tag}{:08x}", d as u32 ^ (d >> 32) as u32)
     };
     let lib_path = dir.join(format!("{sha}{suffix}{lsuffix}.{LIB_EXT}"));
     let lib_str = lib_path.to_str().ok_or("non-UTF8 cache path")?;
@@ -1086,7 +1098,9 @@ fn ensure_native(
                 let stale = name
                     .strip_prefix(&sha)
                     .and_then(|r| r.strip_prefix(suffix.as_str()))
-                    .is_some_and(|r| r.starts_with('.') || r.starts_with("-l"));
+                    .is_some_and(|r| {
+                        r.starts_with('.') || r.starts_with("-l") || r.starts_with("-g")
+                    });
                 if stale {
                     let _ = std::fs::remove_file(e.path());
                 }
@@ -1096,15 +1110,32 @@ fn ensure_native(
         if status {
             status_line("building 0");
         }
-        let label_source = FileLabels {
-            rom_path,
-            explicit: None,
+        // The gamedb path is the full map-driven recompile: exhaustive
+        // in-function seeding (every decode point in every mapped function)
+        // so the launcher gets complete native coverage, like a package.
+        let file_source;
+        let label_source: &dyn LabelSource = match from_gamedb {
+            Some(db) => {
+                eprintln!(
+                    "seeding from gamedb: {} entries (exhaustive)",
+                    lbl.rom.len()
+                );
+                db
+            }
+            None => {
+                file_source = FileLabels {
+                    rom_path,
+                    explicit: None,
+                };
+                &file_source
+            }
         };
         build_dylib(
             rom_path,
             true,
             bios,
-            &label_source,
+            label_source,
+            from_gamedb.is_some(),
             lib_str,
             &mut |pct, msg| {
                 if status {
@@ -1733,6 +1764,7 @@ fn cmd_build(args: &[String]) -> Result<(), String> {
     let mut ram = false;
     let mut bios: Option<Vec<u8>> = None;
     let mut explicit_labels: Option<String> = None;
+    let mut gamedb_path: Option<String> = None;
     let mut it = args.iter();
     while let Some(arg) = it.next() {
         match arg.as_str() {
@@ -1741,9 +1773,15 @@ fn cmd_build(args: &[String]) -> Result<(), String> {
             "--labels" => {
                 explicit_labels = Some(it.next().ok_or("--labels needs a value")?.to_string())
             }
+            "--gamedb" => {
+                gamedb_path = Some(it.next().ok_or("--gamedb needs a value")?.to_string())
+            }
             other if rom_path.is_none() => rom_path = Some(other.to_string()),
             other => return Err(format!("unexpected argument {other:?}")),
         }
+    }
+    if gamedb_path.is_some() && explicit_labels.is_some() {
+        return Err("--gamedb and --labels are mutually exclusive".into());
     }
     let rom_path = &rom_path.ok_or("missing ROM path")?;
     std::fs::create_dir_all("out").map_err(|e| e.to_string())?;
@@ -1755,15 +1793,30 @@ fn cmd_build(args: &[String]) -> Result<(), String> {
     // Real-BIOS builds get their own artifact: the translation bakes in
     // different boot/SWI semantics, so it must never shadow an HLE build.
     let suffix = if bios.is_some() { "-bios" } else { "" };
-    let label_source = FileLabels {
-        rom_path,
-        explicit: explicit_labels.as_deref(),
+    // Either source produces a `Labels`; bind both so the chosen one
+    // outlives the `&dyn LabelSource` handed to the build.
+    let file_source;
+    let db_source;
+    let label_source: &dyn LabelSource = match &gamedb_path {
+        Some(p) => {
+            db_source = gamedb::GameDb::open(Path::new(p))?;
+            &db_source
+        }
+        None => {
+            file_source = FileLabels {
+                rom_path,
+                explicit: explicit_labels.as_deref(),
+            };
+            &file_source
+        }
     };
+    let exhaustive = std::env::var_os("RECOMP_EXHAUSTIVE").is_some();
     let r = build_dylib(
         rom_path,
         ram,
         bios.as_deref(),
-        &label_source,
+        label_source,
+        exhaustive,
         &format!("out/{stem}{suffix}.{LIB_EXT}"),
         &mut term_progress,
     );
@@ -1782,6 +1835,7 @@ fn build_dylib(
     ram: bool,
     bios: Option<&[u8]>,
     label_source: &dyn LabelSource,
+    exhaustive: bool,
     lib_path: &str,
     progress: &mut dyn FnMut(u8, &str),
 ) -> Result<(), String> {
@@ -1962,7 +2016,7 @@ fn build_dylib(
         // seed, so any computed target the game can ever take has a
         // native block. Pool words inside ranges translate to junk
         // blocks nothing dispatches to — size, not correctness.
-        if std::env::var_os("RECOMP_EXHAUSTIVE").is_some() {
+        if exhaustive {
             let mut dense = 0usize;
             for (&key, &end) in &lbl.ends {
                 if !(0x08..=0x0D).contains(&(key >> 24)) {

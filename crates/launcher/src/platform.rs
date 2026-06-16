@@ -88,6 +88,63 @@ fn recomp_bin() -> Result<PathBuf, String> {
     Ok(PathBuf::from("recomp")) // resolved via PATH at spawn time
 }
 
+/// Locate the `gamedb.sqlite` (function boundaries by ROM sha256):
+/// $GBA_RECOMP_GAMEDB, then next to this executable (the shipped layout —
+/// it sits in the release archive beside the binaries), then, for local
+/// `cargo` builds, the repo root's `gamedb.sqlite`. `None` = none found, in
+/// which case the runtime builds from label files instead.
+#[cfg(not(target_os = "android"))]
+fn gamedb_path() -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("GBA_RECOMP_GAMEDB") {
+        let p = PathBuf::from(p);
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    let exe = std::env::current_exe().ok()?;
+    let beside = exe.with_file_name("gamedb.sqlite");
+    if beside.is_file() {
+        return Some(beside);
+    }
+    // Local dev: <workspace>/gamedb.sqlite.
+    dev_gamedb_candidate(&exe).filter(|p| p.is_file())
+}
+
+/// The dev gamedb candidate for an executable built under a cargo `target/`
+/// directory: `<workspace>/gamedb.sqlite`. `None` if `exe` is not under a
+/// `target/` (e.g. a shipped binary), so this never fires in production.
+#[cfg(not(target_os = "android"))]
+fn dev_gamedb_candidate(exe: &Path) -> Option<PathBuf> {
+    exe.ancestors()
+        .find(|a| a.file_name().is_some_and(|n| n == "target"))
+        .and_then(Path::parent)
+        .map(|root| root.join("gamedb.sqlite"))
+}
+
+#[cfg(all(test, not(target_os = "android")))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dev_gamedb_candidate_resolves_workspace_root() {
+        let want = Some(PathBuf::from("/home/u/gba-recomp/gamedb.sqlite"));
+        // Both debug and release layouts resolve to the same workspace root.
+        assert_eq!(
+            dev_gamedb_candidate(Path::new("/home/u/gba-recomp/target/release/gba-launcher")),
+            want
+        );
+        assert_eq!(
+            dev_gamedb_candidate(Path::new("/home/u/gba-recomp/target/debug/gba-launcher")),
+            want
+        );
+        // A shipped binary (no `target/` component) yields no dev candidate.
+        assert_eq!(
+            dev_gamedb_candidate(Path::new("/opt/frogger-temple/gba-launcher")),
+            None
+        );
+    }
+}
+
 /// Launch a cartridge in the play runtime. The caller owns the child:
 /// the launcher tracks it and tears it down when the launcher exits.
 /// stdout carries the `--status` lifecycle protocol (building/playing)
@@ -98,6 +155,13 @@ pub fn launch(rom: &Path, bios: Option<&Path>) -> Result<std::process::Child, St
     let bin = recomp_bin()?;
     let mut cmd = std::process::Command::new(&bin);
     cmd.arg("play").arg("--status");
+    // Hand the runtime the gamedb so a first-launch build seeds from its
+    // mapper-grade boundaries (then --ram profiling captures RAM-resident
+    // code) — the 0-interpreter path. Absent, the runtime falls back to
+    // label files beside the image.
+    if let Some(db) = gamedb_path() {
+        cmd.arg("--gamedb").arg(db);
+    }
     // Pass the resolved BIOS explicitly: play would find it again via the
     // same shared lookup, but the launcher validated *this* file — the
     // session must boot what the user was told it would boot.
