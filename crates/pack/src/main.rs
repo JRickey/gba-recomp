@@ -27,7 +27,7 @@ const LIB_EXT: &str = if cfg!(windows) {
 
 const USAGE: &str = "usage: gba-pack <pack.toml> [--rom FILE] [--bios FILE]
        gba-pack build <pack.toml> --rom FILE --bios FILE [--out DIR]
-                      [--recomp PATH] [--soak FRAMES]
+                      [--recomp PATH] [--soak FRAMES] [--no-soak]
 
 Plan mode validates the package description and (with --rom/--bios) the
 inputs, then prints the build plan.
@@ -38,7 +38,12 @@ and assembles <out>/<name>/ — the runtime binary, the translation, and
 the recomp.pack.toml manifest pinning ROM and BIOS by SHA-256. With
 [runtime] interpreter = false the build refuses to ship unless the soak
 ran ZERO interpreter-fallback steps (recording and rebuilding once to
-close coverage gaps automatically).";
+close coverage gaps automatically).
+
+--no-soak skips the soak gate (the long fallback-traced validation run)
+when you trust the map's coverage. --ram profiling still runs — it is the
+only way to capture RAM-resident (IWRAM) code, which a static ROM map
+cannot address.";
 
 fn sha256_file(path: &str) -> Result<String, String> {
     let data = std::fs::read(path).map_err(|e| format!("{path}: {e}"))?;
@@ -127,6 +132,13 @@ fn cmd_build(args: &[String]) -> Result<(), String> {
     // code slip through. 7200 frames (~2 min of play) exercises menus
     // and the first real gameplay; --soak raises it further.
     let mut soak = 7200u64;
+    // --no-soak skips the soak *gate* (the long fallback-traced validation
+    // run), trusting the map's coverage. It still runs --ram profiling:
+    // that pass discovers RAM-resident (IWRAM) code — copied from ROM at
+    // boot and executed at 0x03xxxxxx — which a static ROM map cannot
+    // address, so it is NOT optional. Skipping it leaves a full recomp that
+    // halts the moment the game enters its IWRAM code.
+    let mut no_soak = false;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -134,6 +146,7 @@ fn cmd_build(args: &[String]) -> Result<(), String> {
             "--bios" => bios = Some(it.next().ok_or("--bios needs a value")?.clone()),
             "--out" => out_dir = it.next().ok_or("--out needs a value")?.into(),
             "--recomp" => recomp_flag = Some(it.next().ok_or("--recomp needs a value")?.clone()),
+            "--no-soak" => no_soak = true,
             "--soak" => {
                 soak = it
                     .next()
@@ -234,13 +247,15 @@ recomp needs the function map's boundaries for exhaustive coverage"
             None
         }
     };
+    // --ram is always on: it profiles an interpreter run to translate
+    // RAM-resident code the static map can't address (see --no-soak above).
     let mut build_args: Vec<&str> = vec!["build", rom_str, "--ram", "--bios", bios_str];
     if let Some(l) = &labels_abs {
         build_args.push("--labels");
         build_args.push(l);
     }
 
-    println!("[1/3] translating (recomp build --ram --bios; labels auto-load beside the image)...");
+    println!("[1/3] translating (recomp build --ram --bios; exhaustive seeding from the map)...");
     if !build_envs.is_empty() {
         println!(
             "      build env: {}",
@@ -259,46 +274,50 @@ recomp needs the function map's boundaries for exhaustive coverage"
         ));
     }
 
-    println!("[2/3] soak: {soak} frames with fallback tracing...");
-    let frames = soak.to_string();
-    let soak_args = ["runc", rom_str, "--frames", &frames, "--bios", bios_str];
-    let mut steps = fallback_steps(&recomp_run(
-        &recomp,
-        &work,
-        &soak_args,
-        &[("RECOMP_TRACE_FALLBACK", "1")],
-    )?)?;
-    println!("      fallback_steps: {steps}");
-    if !cfg.runtime.interpreter && steps > 0 {
-        println!("      full recomp requires zero — recording the gaps and rebuilding once...");
-        recomp_run(
-            &recomp,
-            &work,
-            &[
-                "runc",
-                rom_str,
-                "--frames",
-                &frames,
-                "--bios",
-                bios_str,
-                "--record-labels",
-            ],
-            &[],
-        )?;
-        recomp_run(&recomp, &work, &build_args, keep_c)?;
-        steps = fallback_steps(&recomp_run(
+    if no_soak {
+        println!("[2/3] soak skipped (--no-soak): trusting the map's exhaustive coverage");
+    } else {
+        println!("[2/3] soak: {soak} frames with fallback tracing...");
+        let frames = soak.to_string();
+        let soak_args = ["runc", rom_str, "--frames", &frames, "--bios", bios_str];
+        let mut steps = fallback_steps(&recomp_run(
             &recomp,
             &work,
             &soak_args,
             &[("RECOMP_TRACE_FALLBACK", "1")],
         )?)?;
-        println!("      fallback_steps after rebuild: {steps}");
-        if steps > 0 {
-            return Err(format!(
-                "full recomp gate failed: {steps} interpreter steps remain after a \
+        println!("      fallback_steps: {steps}");
+        if !cfg.runtime.interpreter && steps > 0 {
+            println!("      full recomp requires zero — recording the gaps and rebuilding once...");
+            recomp_run(
+                &recomp,
+                &work,
+                &[
+                    "runc",
+                    rom_str,
+                    "--frames",
+                    &frames,
+                    "--bios",
+                    bios_str,
+                    "--record-labels",
+                ],
+                &[],
+            )?;
+            recomp_run(&recomp, &work, &build_args, keep_c)?;
+            steps = fallback_steps(&recomp_run(
+                &recomp,
+                &work,
+                &soak_args,
+                &[("RECOMP_TRACE_FALLBACK", "1")],
+            )?)?;
+            println!("      fallback_steps after rebuild: {steps}");
+            if steps > 0 {
+                return Err(format!(
+                    "full recomp gate failed: {steps} interpreter steps remain after a \
 record-and-rebuild pass. Extend coverage (longer/recorded soak input, more labels) \
 or set [runtime] interpreter = true.",
-            ));
+                ));
+            }
         }
     }
 
