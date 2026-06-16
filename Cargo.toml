@@ -18,7 +18,14 @@ version = "0.2.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 
+# Testing profile
 [profile.release]
 debug = true
 lto = "fat"
 codegen-units = 1
+
+# Distribution profile
+[profile.dist]
+inherits = "release"
+debug = false
+strip = true

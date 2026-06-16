@@ -71,13 +71,13 @@ jobs:
         if: matrix.name == 'macos-universal'
         shell: bash
         run: |
-          cargo build --release --target x86_64-apple-darwin
-          cargo build --release --target aarch64-apple-darwin
+          cargo build --profile dist --target x86_64-apple-darwin
+          cargo build --profile dist --target aarch64-apple-darwin
           mkdir -p dist/bin
           for b in recomp gba-pack gba-launcher; do
             lipo -create -output "dist/bin/$b" \
-              "target/x86_64-apple-darwin/release/$b" \
-              "target/aarch64-apple-darwin/release/$b"
+              "target/x86_64-apple-darwin/dist/$b" \
+              "target/aarch64-apple-darwin/dist/$b"
             # Ad-hoc sign — Apple Silicon kills unsigned binaries on launch.
             codesign --force --sign - --timestamp=none "dist/bin/$b"
             codesign --verify --verbose "dist/bin/$b"
@@ -87,12 +87,12 @@ jobs:
         if: matrix.name != 'macos-universal'
         shell: bash
         run: |
-          cargo build --release --target ${{ matrix.target }}
+          cargo build --profile dist --target ${{ matrix.target }}
           mkdir -p dist/bin
           EXE=""
           [ "${{ runner.os }}" = "Windows" ] && EXE=".exe"
           for b in recomp gba-pack gba-launcher; do
-            cp "target/${{ matrix.target }}/release/${b}${EXE}" "dist/bin/"
+            cp "target/${{ matrix.target }}/dist/${b}${EXE}" "dist/bin/"
           done
 
       - name: Stage and archive bundles
