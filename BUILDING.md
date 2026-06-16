@@ -1,12 +1,15 @@
 # Building from source
 
-The workspace builds two user-facing binaries:
+The workspace builds three user-facing binaries:
 
 - **`recomp`** — the recompiler CLI and play runtime (`crates/recomp`)
 - **`gba-launcher`** — the graphical frontend (`crates/launcher`)
+- **`gba-pack`** — package one mapped game into a standalone, distributable
+  executable (`crates/pack`; see `docs/packaging.md`)
 
-plus the library crates they share (`armv4t`, `gba-core`, `input-config`,
-`screen`).
+over the shared library crates: **`recomp-core`** (the recompiler engine —
+analyze, emit C, compile/link), **`gamedb`** (reader for the function-boundary
+database), `armv4t`, `gba-core`, `input-config`, `screen`, and `menu`.
 
 ## Prerequisites
 
@@ -31,7 +34,7 @@ plus the library crates they share (`armv4t`, `gba-core`, `input-config`,
 
 ```sh
 git clone <this repository>
-cd gba-lib
+cd gba-recomp
 cargo build --release
 ```
 
@@ -63,18 +66,26 @@ cargo build --release -p recomp   # skip the GUI stack when you only need the CL
 cargo run -p recomp --release -- play rom.gba   # build + run in one step
 ```
 
-Note `-j` does not parallelize the fat-LTO link or the emitted-C compile
-during translation; those are inherently serial per title.
+Note `cargo`'s `-j` (rustc parallelism) is separate from the fat-LTO link
+(single-threaded by design) and from the emitted-C compile during
+translation, which parallelizes on its own — see below.
 
-### Translating many titles at once
+### Translation compiles in parallel
 
-Each `recomp build` emits chunked ~16 MB C translation units and compiles
-them one `cc` at a time, but a single 4 MB image can still expand to
-hundreds of MB of C. If you script builds across a set of images
-(sweeps), **keep it at ≤ 4 concurrent jobs** on a 16 GB machine —
-parallel `cc` invocations on large images will exhaust memory. Emitted C
-is compiled `-O1`; `-O2` was measured at ~2% runtime gain for 3× the
-compile time and rejected.
+A single `recomp build` (and the first-launch `play`/launcher build) emits
+chunked ~16 MB C translation units and compiles them **in parallel, one `cc`
+per core**. A full-coverage 4 MB image can expand to ~150 MB of C across ~10
+units, and one `cc` per core is RAM-hungry, so on memory-tight machines cap
+the pool:
+
+```sh
+RECOMP_JOBS=4 recomp build game.gba --ram   # at most 4 concurrent cc
+```
+
+Because one build already saturates the machine, run sweeps across many
+images **sequentially** (or a couple at a time), not many at once. Emitted C
+is compiled `-O1`; `-O2` was measured at ~2% runtime gain for 3× the compile
+time and rejected.
 
 ## Running the crates
 
@@ -82,8 +93,8 @@ compile time and rejected.
 
 | Command | Purpose |
 |---|---|
-| `recomp build <rom> [--ram] [--bios file]` | Translate to a native shared library in `out/`. `--ram` adds a short profiling run that discovers RAM-resident code and computed-branch targets, then bakes them in (recommended; this is what `play` uses). `--bios` also recompiles a real 16 KB BIOS image (region 0, no BIOS HLE) into `out/<stem>-bios.<dylib|so|dll>`. |
-| `recomp play <rom> [--interp] [--stats] [--status] [--bios file] [--no-bios]` | Windowed play. Boots the real BIOS when an image is installed (see below), BIOS HLE otherwise. First launch auto-translates into the cache (one-time, progress printed); `--interp` forces the interpreter; `--stats` prints perf readouts; `--status` emits machine-readable lifecycle lines (used by the launcher). |
+| `recomp build <rom> [--ram] [--bios file] [--labels file] [--gamedb file]` | Translate to a native shared library in `out/`. `--ram` adds a short profiling run that discovers RAM-resident code and computed-branch targets, then bakes them in (recommended; this is what `play` uses). `--bios` also recompiles a real 16 KB BIOS image (region 0, no BIOS HLE) into `out/<stem>-bios.<dylib\|so\|dll>`. `--gamedb` seeds from the shipped `gamedb.sqlite` (function boundaries by ROM SHA-256); `--labels` unions an explicit label map — the two are mutually exclusive. |
+| `recomp play <rom> [--interp] [--stats] [--status] [--bios file] [--no-bios] [--gamedb file]` | Windowed play. Boots the real BIOS when an image is installed (see below), BIOS HLE otherwise. First launch auto-translates into the cache (one-time, progress printed); with `--gamedb` that build seeds exhaustively from the database. `--interp` forces the interpreter; `--stats` prints perf readouts; `--status` emits machine-readable lifecycle lines (used by the launcher). |
 | `recomp runc <rom> [--frames N] [--out img.ppm] [--bios file]` | Headless run of the recompiled output from `out/`. |
 | `recomp verify <rom> [--frames N] [--reuse] [--dump prefix] [--bios file]` | Differential check: interpreter vs recompiled frame hash; prints `MATCH`/`MISMATCH`. `--reuse` skips the rebuild, `--dump` writes both final frames, `--bios` verifies under a real recompiled BIOS on both sides. |
 | `recomp run <rom> [--max-steps N] [--trace] [--hist] [--bios file]` | Headless interpreter run; `--hist` prints a hot-PC histogram. |
@@ -102,12 +113,15 @@ keyed by the ROM's SHA-256. Bumping `TRANSLATION_REV` (any emitter or ABI
 change) invalidates and sweeps old revisions automatically; deleting the
 directory just costs a one-time retranslation.
 
-**Labels: reducing interpreter fallback.** Static analysis plus a short
-profiling boot can't reach code that only executes deep into a game
-(computed-branch targets, handlers installed at runtime). Whenever the
-runtime falls back to the interpreter it knows exactly which entry point
-was missing — play or runc with `--record-labels` persists those as a
-*label file* and the next translation covers them:
+**Labels: reducing interpreter fallback.** The mapper-grade source of
+function boundaries is the shipped `gamedb.sqlite` (`--gamedb`), which the
+launcher uses by default; the mechanism below is the per-image supplement
+when a game isn't in the database. Static analysis plus a short profiling
+boot can't reach code that only executes deep into a game (computed-branch
+targets, handlers installed at runtime). Whenever the runtime falls back to
+the interpreter it knows exactly which entry point was missing — play or runc
+with `--record-labels` persists those as a *label file* and the next
+translation covers them:
 
 ```sh
 recomp play game.gba --record-labels     # just play; labels accumulate
@@ -150,9 +164,13 @@ cargo run -p gba-launcher --release
 The launcher spawns `recomp play` for the selected cartridge. It resolves
 the `recomp` binary from `$GBA_RECOMP_BIN`, then next to the launcher
 executable, then `$PATH` — set `GBA_RECOMP_BIN=target/release/recomp`
-when running both from the source tree. Input bindings and A/V settings
-are shared with `play` via `<config_dir>/gba-recomp/` (`input.cfg`,
-`av.cfg`). See `docs/launcher.md`.
+when running both from the source tree. It likewise resolves the
+function-boundary database — `$GBA_RECOMP_GAMEDB`, then `gamedb.sqlite` beside
+the executable (the shipped layout), then the repo-root `gamedb.sqlite` for
+`cargo` builds — and passes it as `--gamedb`, so the first-launch build seeds
+exhaustively from the database. Input bindings and A/V settings are shared
+with `play` via `<config_dir>/gba-recomp/` (`input.cfg`, `av.cfg`). See
+`docs/launcher.md`.
 
 ## Tests
 
@@ -189,7 +207,7 @@ sudo apt install build-essential pkg-config libasound2-dev \
 ```
 
 - `libasound2-dev` — ALSA, for audio output (cpal)
-- X11/xkbcommon headers — for the play window (minifb) and launcher (eframe/winit)
+- X11/xkbcommon headers — for the play window and launcher (winit/eframe)
 - GPU presentation (wgpu) uses Vulkan at runtime: install your distro's
   Vulkan drivers (e.g. `mesa-vulkan-drivers`); without them the screen
   simulation falls back gracefully
@@ -227,6 +245,11 @@ opt in explicitly:
 - `recomp play --stats` — frame-time / native-vs-fallback readouts
 - `RECOMP_KEEP_C=1 recomp build ...` — keep the emitted C next to the
   output for inspection
+- `RECOMP_JOBS=N recomp build ...` — cap concurrent `cc` jobs during the
+  parallel compile (default: one per core)
+- `RECOMP_EXHAUSTIVE=1 recomp build --gamedb db ...` — seed every decode
+  point inside every mapped function (full native coverage; the launcher's
+  gamedb path does this automatically, the `build` CLI gates it on this env)
 - `recomp play --interp` — force the interpreter (e.g. to isolate a
   translation bug; a correct title behaves identically, just slower)
 

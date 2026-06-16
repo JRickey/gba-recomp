@@ -44,7 +44,7 @@ bios-sha256 = "<64 hex>"    # required — the gate
 [labels]
 file = "game.labels.toml"
 
-[runtime]                    # which gba-lib modules ship in the binary
+[runtime]                    # which gba-recomp modules ship in the binary
 menu = true                  # press-Escape in-game menu (see below)
 enhanced-audio = true        # per-channel sinc + soft-clip + engine-HLE shadow
 screen-sim = true            # panel simulation (crates/screen)
@@ -68,7 +68,7 @@ author takes the modules they want and nothing else. The three
 planned reference implementations will exercise exactly this surface,
 and they live in **their own repositories**: nothing produced by the
 packager — binaries, translated code, C trees — is ever bundled or
-distributed in this repository. gba-lib ships the toolkit only.
+distributed in this repository. gba-recomp ships the toolkit only.
 
 ## The in-game menu
 
