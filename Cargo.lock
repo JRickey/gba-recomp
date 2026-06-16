@@ -3173,11 +3173,22 @@ dependencies = [
  "input-config",
  "libloading",
  "menu",
+ "recomp-core",
  "screen",
  "sha2",
  "softbuffer",
  "toml",
  "winit",
+]
+
+[[package]]
+name = "recomp-core"
+version = "0.2.0"
+dependencies = [
+ "armv4t",
+ "dirs",
+ "gba-core",
+ "toml",
 ]
 
 [[package]]

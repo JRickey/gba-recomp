@@ -11,26 +11,30 @@
 //! recompiler preserves (names feed C-source export; `end` is the
 //! exclusive function end):
 //!
-//!     format = "gba-labels"
-//!     version = 2
+//! ```toml
+//! format = "gba-labels"
+//! version = 2
 //!
-//!     [image]
-//!     sha256 = "<64 hex>"
+//! [image]
+//! sha256 = "<64 hex>"
 //!
-//!     [[functions]]
-//!     name = "AgbMain"        # optional
-//!     address = 0x0800_01c8
-//!     end = 0x0800_0220       # optional, exclusive
-//!     mode = "thumb"          # "arm" | "thumb" (or "a" | "t")
+//! [[functions]]
+//! name = "AgbMain"        # optional
+//! address = 0x0800_01c8
+//! end = 0x0800_0220       # optional, exclusive
+//! mode = "thumb"          # "arm" | "thumb" (or "a" | "t")
+//! ```
 //!
 //! **v1 — line format, the runtime recorder's accumulator.** Minimal,
 //! union-mergeable, addresses only (the recorder has no names to say):
 //!
-//!     gba-labels v1
-//!     rom-sha256 <64 hex>
-//!     rom <hexaddr> a|t
-//!     iwram <hexaddr> a|t ...
-//!     ewram <hexaddr> a|t ...
+//! ```text
+//! gba-labels v1
+//! rom-sha256 <64 hex>
+//! rom <hexaddr> a|t
+//! iwram <hexaddr> a|t ...
+//! ewram <hexaddr> a|t ...
+//! ```
 //!
 //! Both are content-free with respect to the image (addresses and
 //! hashes only; never image bytes). The memory region is derived from
@@ -269,48 +273,70 @@ impl Labels {
                 out.skipped += 1;
                 continue;
             };
-            let key = addr | thumb;
-            let accepted = match addr >> 24 {
-                0x08..=0x0D
-                    if ((addr & 0x01FF_FFFF) as usize) < rom_len
-                        && addr & 1 == 0
-                        && out.rom.len() < MAX_LABELS =>
-                {
-                    out.rom.insert(key);
-                    true
-                }
-                0x03 if addr & 1 == 0 && out.iwram.len() < MAX_LABELS => {
-                    out.iwram.insert(key);
-                    true
-                }
-                0x02 if addr & 1 == 0 => {
-                    // Reserved records keep their v1 spelling so the
-                    // accumulator round-trips them; enrichment fields
-                    // are dropped with the rest of ewram support.
-                    out.reserved.push(format!(
-                        "ewram {addr:08x} {}",
-                        if thumb != 0 { "t" } else { "a" }
-                    ));
-                    continue;
-                }
-                _ => false,
-            };
-            if !accepted {
+            let end = f.get("end").and_then(addr_value);
+            let name = f.get("name").and_then(toml::Value::as_str);
+            if !out.push_function(addr, thumb, end, name, rom_len) {
                 out.skipped += 1;
-                continue;
-            }
-            if let Some(name) = f.get("name").and_then(toml::Value::as_str) {
-                if !name.is_empty() {
-                    out.names.insert(key, name.to_string());
-                }
-            }
-            if let Some(end) = f.get("end").and_then(addr_value) {
-                if end > addr {
-                    out.ends.insert(key, end);
-                }
             }
         }
         Ok(out)
+    }
+
+    /// Apply one v2 function record — address + `thumb` bit (0/1), plus an
+    /// optional exclusive `end` and `name` — the unit both a TOML map and a
+    /// gamedb row carry. Region, range, even-address and cap rules are
+    /// identical across sources, so DB-driven and file-driven seeds match
+    /// exactly. Returns false when the record is out of range or in an
+    /// unmapped region (the caller counts it as skipped); ewram records are
+    /// preserved as `reserved` and return true.
+    pub fn push_function(
+        &mut self,
+        addr: u32,
+        thumb: u32,
+        end: Option<u32>,
+        name: Option<&str>,
+        rom_len: usize,
+    ) -> bool {
+        let key = addr | thumb;
+        let accepted = match addr >> 24 {
+            0x08..=0x0D
+                if ((addr & 0x01FF_FFFF) as usize) < rom_len
+                    && addr & 1 == 0
+                    && self.rom.len() < MAX_LABELS =>
+            {
+                self.rom.insert(key);
+                true
+            }
+            0x03 if addr & 1 == 0 && self.iwram.len() < MAX_LABELS => {
+                self.iwram.insert(key);
+                true
+            }
+            0x02 if addr & 1 == 0 => {
+                // Reserved records keep their v1 spelling so the
+                // accumulator round-trips them; enrichment fields
+                // are dropped with the rest of ewram support.
+                self.reserved.push(format!(
+                    "ewram {addr:08x} {}",
+                    if thumb != 0 { "t" } else { "a" }
+                ));
+                return true;
+            }
+            _ => false,
+        };
+        if !accepted {
+            return false;
+        }
+        if let Some(name) = name {
+            if !name.is_empty() {
+                self.names.insert(key, name.to_string());
+            }
+        }
+        if let Some(end) = end {
+            if end > addr {
+                self.ends.insert(key, end);
+            }
+        }
+        true
     }
 
     /// Union another set into this one. Enrichment merges first-wins:
@@ -522,6 +548,30 @@ pub fn load_all_with(rom_path: &str, sha: &str, rom_len: usize, explicit: Option
         }
     }
     out
+}
+
+/// Where a build's entry-point labels come from, keyed by ROM sha256.
+/// Callers fold the returned [`Labels`] into analyzer seeds; whether they
+/// originate from files beside the image, the shipped gamedb, or a
+/// recorder is the source's concern. This is the seam that lets the
+/// launcher's gamedb-driven build and the CLI's file-driven build share
+/// one engine.
+pub trait LabelSource {
+    fn labels(&self, sha: &str, rom_len: usize) -> Result<Labels, String>;
+}
+
+/// The file-backed source: today's behavior — the union of
+/// `<rom>.labels.toml`/`.labels` beside the image, the config-dir
+/// accumulators, and an optional explicit map (see [`load_all_with`]).
+pub struct FileLabels<'a> {
+    pub rom_path: &'a str,
+    pub explicit: Option<&'a str>,
+}
+
+impl LabelSource for FileLabels<'_> {
+    fn labels(&self, sha: &str, rom_len: usize) -> Result<Labels, String> {
+        Ok(load_all_with(self.rom_path, sha, rom_len, self.explicit))
+    }
 }
 
 #[cfg(test)]

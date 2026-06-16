@@ -1,0 +1,15 @@
+[package]
+name = "recomp-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Static recompiler engine: analyze GBA code, emit C, compile to a native library"
+
+[lib]
+name = "recomp_core"
+
+[dependencies]
+armv4t = { path = "../armv4t" }
+gba-core = { path = "../gba-core" }
+toml = "0.8"
+dirs = "6.0.0"

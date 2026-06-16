@@ -7,9 +7,8 @@
 use std::path::Path;
 use std::process::ExitCode;
 
-mod analyze;
-mod emit;
-mod labels;
+use recomp_core::{analyze, build_library, labels, Compiler, FileLabels, LabelSource};
+
 mod packfile;
 mod play;
 
@@ -1097,13 +1096,24 @@ fn ensure_native(
         if status {
             status_line("building 0");
         }
-        build_dylib(rom_path, true, bios, None, lib_str, &mut |pct, msg| {
-            if status {
-                status_line(&format!("building {pct} {msg}"));
-            } else {
-                term_progress(pct, msg);
-            }
-        })?;
+        let label_source = FileLabels {
+            rom_path,
+            explicit: None,
+        };
+        build_dylib(
+            rom_path,
+            true,
+            bios,
+            &label_source,
+            lib_str,
+            &mut |pct, msg| {
+                if status {
+                    status_line(&format!("building {pct} {msg}"));
+                } else {
+                    term_progress(pct, msg);
+                }
+            },
+        )?;
         if !status {
             eprintln!();
         }
@@ -1745,11 +1755,15 @@ fn cmd_build(args: &[String]) -> Result<(), String> {
     // Real-BIOS builds get their own artifact: the translation bakes in
     // different boot/SWI semantics, so it must never shadow an HLE build.
     let suffix = if bios.is_some() { "-bios" } else { "" };
+    let label_source = FileLabels {
+        rom_path,
+        explicit: explicit_labels.as_deref(),
+    };
     let r = build_dylib(
         rom_path,
         ram,
         bios.as_deref(),
-        explicit_labels.as_deref(),
+        &label_source,
         &format!("out/{stem}{suffix}.{LIB_EXT}"),
         &mut term_progress,
     );
@@ -1767,7 +1781,7 @@ fn build_dylib(
     rom_path: &str,
     ram: bool,
     bios: Option<&[u8]>,
-    explicit_labels: Option<&str>,
+    label_source: &dyn LabelSource,
     lib_path: &str,
     progress: &mut dyn FnMut(u8, &str),
 ) -> Result<(), String> {
@@ -1935,7 +1949,7 @@ fn build_dylib(
     let sha = rom_sha256(&rom);
     let mut seeds = seeds;
     let mut iwram = iwram;
-    let lbl = labels::load_all_with(rom_path, &sha, rom.len(), explicit_labels);
+    let lbl = label_source.labels(&sha, rom.len())?;
     if !lbl.is_empty() {
         let mut set: std::collections::BTreeSet<u32> = seeds.iter().copied().collect();
         let before = set.len();
@@ -2032,112 +2046,18 @@ run play/runc --record-labels to capture one"
         },
         bios,
     };
-    progress(prof_end + 1, "charting every reachable code path\u{2026}");
-    let analysis = analyze::analyze(&view, &seeds);
-    let n_instrs: usize = analysis.blocks.iter().map(|b| b.instrs.len()).sum();
-    println!("blocks: {} instructions: {n_instrs}", analysis.blocks.len());
-    progress(
-        prof_end + 2,
-        &format!(
-            "map drawn: {} code blocks to translate",
-            analysis.blocks.len()
-        ),
-    );
-
-    let dot_ext = format!(".{LIB_EXT}");
-    let prefix = lib_path.strip_suffix(dot_ext.as_str()).unwrap_or(lib_path);
-
-    // Bounded translation units, compiled one at a time: full-image
-    // translations can exceed the source image a hundredfold, and a single
-    // huge unit makes cc balloon to many GB (parallel sweeps then exhaust
-    // the machine). 16 MB of C keeps each cc invocation modest.
-    const MAX_UNIT: usize = 16 << 20;
-    let total_blocks = analysis.blocks.len().max(1);
-    // Unit-count estimate up front (measured ~150 bytes of C per
-    // instruction), so the compile labels can say "part 2 of ~9".
-    let est_units = (n_instrs as u64 * 150 / MAX_UNIT as u64 + 1).max(1);
-    let span_start = prof_end + 2;
-    let span = 96 - span_start as u64;
-    let mut objs: Vec<String> = Vec::new();
-    let mut prev_done = 0usize;
-    let chunks = emit::emit_c_chunked(&analysis, &view, MAX_UNIT, |c, blocks_done| {
-        let i = objs.len();
-        let p0 = span_start + (prev_done as u64 * span / total_blocks as u64) as u8;
-        let p1 = span_start + (blocks_done as u64 * span / total_blocks as u64) as u8;
-        prev_done = blocks_done;
-        let c_path = format!("{prefix}.{i}.c");
-        let o_path = format!("{prefix}.{i}.o");
-        std::fs::write(&c_path, c).map_err(|e| e.to_string())?;
-        // Compiling dominates the build, so the bar keeps moving while
-        // cc works: poll the child and ease through this unit's span
-        // against a size-based time estimate (measured ~0.7 MB of C
-        // per second), never claiming the unit done early.
-        // -fPIC is required: we link these objects into a shared library
-        // (`cc -shared` below) and dlopen it. Without it, gcc's small code
-        // model addresses .rodata (jump tables, constant pools in some
-        // translated blocks) with 32-bit absolute relocations (R_X86_64_32S),
-        // which the linker rejects for a shared object — translation then
-        // falls back to the interpreter. RIP-relative (PIC) addressing is the
-        // fix and is nearly free on x86-64.
-        let mut child = std::process::Command::new("cc")
-            .args(["-O1", "-fPIC", "-c", "-o", &o_path, &c_path])
-            .spawn()
-            .map_err(|e| format!("cc: {e}"))?;
-        let est_secs = (c.len() as f64 / 700_000.0).max(1.0);
-        let t0 = std::time::Instant::now();
-        let mut spin = 0usize;
-        let status = loop {
-            match child.try_wait().map_err(|e| format!("cc: {e}"))? {
-                Some(st) => break st,
-                None => {
-                    let frac = (t0.elapsed().as_secs_f64() / est_secs).min(0.95);
-                    let pct = p0 + ((p1.saturating_sub(p0)) as f64 * frac) as u8;
-                    let dots =
-                        ["\u{2026}", "\u{2026}\u{2026}", "\u{2026}\u{2026}\u{2026}"][spin % 3];
-                    spin += 1;
-                    progress(
-                        pct,
-                        &format!(
-                            "forging native code \u{2014} part {} of ~{}{dots}",
-                            i + 1,
-                            est_units.max(i as u64 + 1)
-                        ),
-                    );
-                    std::thread::sleep(std::time::Duration::from_millis(250));
-                }
-            }
-        };
-        // Triage: keep the emitted C around for inspection.
-        if std::env::var_os("RECOMP_KEEP_C").is_none() {
-            let _ = std::fs::remove_file(&c_path);
-        }
-        if !status.success() {
-            return Err(format!("cc failed on {c_path}"));
-        }
-        objs.push(o_path);
-        progress(
-            p1,
-            &format!("{blocks_done} of {total_blocks} blocks translated"),
-        );
-        Ok(())
-    })?;
-
-    progress(97, "linking it all together\u{2026}");
-    let status = std::process::Command::new("cc")
-        .arg("-shared")
-        .arg("-o")
-        .arg(&lib_path)
-        .args(&objs)
-        .status()
-        .map_err(|e| format!("cc: {e}"))?;
-    for o in &objs {
-        let _ = std::fs::remove_file(o);
-    }
-    if !status.success() {
-        return Err("link failed".into());
-    }
-    progress(100, "ready to play");
-    println!("wrote {lib_path} ({chunks} units)");
+    // Hand the assembled view + seeds to the engine: analyze → emit C →
+    // compile each unit → link. It emits the `blocks:`/`wrote` report lines
+    // on stdout (the packager's contract) at the same points the inline
+    // pipeline did.
+    build_library(
+        &view,
+        &seeds,
+        &Compiler::host(),
+        Path::new(lib_path),
+        prof_end,
+        progress,
+    )?;
     Ok(())
 }
 
@@ -2958,15 +2878,6 @@ fn write_sav(path: &str, data: &[u8]) -> std::io::Result<()> {
     let tmp = format!("{path}.tmp");
     std::fs::write(&tmp, data)?;
     std::fs::rename(&tmp, path)
-}
-
-fn fnv64(bytes: &[u8]) -> u64 {
-    let mut h = 0xcbf2_9ce4_8422_2325u64;
-    for &b in bytes {
-        h ^= b as u64;
-        h = h.wrapping_mul(0x1_0000_01b3);
-    }
-    h
 }
 
 fn fb_hash(m: &Machine) -> u64 {

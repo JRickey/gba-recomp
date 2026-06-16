@@ -8,6 +8,7 @@ members = [
     "crates/menu",
     "crates/pack",
     "crates/recomp",
+    "crates/recomp-core",
     "crates/screen",
 ]
 

@@ -29,8 +29,10 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Fullscreen, Window, WindowId};
 
+use recomp_core::fnv64;
+
 use crate::{
-    apply_av_change, arm_audio_hle, build_gilrs, ensure_native, fnv64, load_bios_file, load_native,
+    apply_av_change, arm_audio_hle, build_gilrs, ensure_native, load_bios_file, load_native,
     make_machine, pad_pressed, print_fallback_census, record_labels, rom_sha256, run_frame_native,
     start_audio, status_line, validate_rom, write_sav, AudioStreams, BlockTable, FALLBACK_COLLECT,
     NO_INTERP, RING_TARGET,
