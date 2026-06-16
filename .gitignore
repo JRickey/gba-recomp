@@ -1,4 +1,5 @@
-# Test data — local symlinks/clones, never committed
+# Test data — local ROM corpus, maps, and work dirs, never committed.
+# (The shipped gamedb.sqlite lives at the repo root, not here.)
 /data
 
 # Local working notes — never committed

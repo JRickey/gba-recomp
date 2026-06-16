@@ -1,0 +1,7 @@
+SPDX-FileCopyrightText: JRickey
+SPDX-License-Identifier: CC0-1.0
+
+This database contains derived metadata only — function addresses, lengths,
+and names mapped from GBA cartridge images, keyed by SHA-256. It contains no
+ROM or BIOS bytes. It is dedicated to the public domain under CC0 1.0; see
+LICENSE-CC0.

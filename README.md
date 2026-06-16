@@ -1,31 +1,53 @@
 # GBA-Recomp
 
-A rust based, static recompiling toolkit and runtime for the GBA. Translates cartridge ROM images ahead of time into native executables. The runtime library provides the hardware model (PPU, APU, DMA/timers/IRQ, saves, input, RTC).
+A rust based, static recompiling toolkit and runtime for the GBA. Translates cartridge ROM images ahead of time into native executables. The runtime library provides the hardware model (PPU, APU, DMA/timers/IRQ, saves, input, RTC). The launcher lets you pick a BIOS and game, and play.
 
 ## Author's Notes
 
 The GBA was my childhood system. It was the first gaming console I ever owned. Because the DS came after and had backwards compatibility, I kept playing some GBA games for a long time. The nature of the console, it being designed as a portable SNES, also sparked my love for retro gaming. I played many SNES classics for the first time on their GBA versions.
 
-This project is a love letter to the system and to the community. The goal is to provide the most faithful, accurate, performant experience for the GBA, then to take it beyond the stock experience, in ways only a static recompilation could. I cannot ensure 0% interpreter fallback for all titles. This project aims to be a solid out of the box experience, with rich libraries and functionality for those who wish to make title specific static recompilations from this toolkit.
+This is a new kind of recomp project, built to be the absolute best way to play GBA on modern platforms. Everything is provided out of the box: video, audio, full controller support, cross-platform support, a full user-friendly launcher and optional CLI to package games into full native executables. I have taken a lot of care to give the absolute best GBA experience and have provided a few enhancements, detailed in [Audio](#Audio) and [Video](#Video). The final state of this project is that it will work with every game ever released, 0 interpreter.
 
-This project is in early development. The interpreter tier is complete, the static recompiler pipeline works end to end, each match bit for bit across the test corpus. Full testing has not been completed.
+How is that possible? Surely it falls back to the interpreter sometimes? You can't resolve all code branches at load? The game will work for about 5 minutes then crash? 
+
+Well, I am currently disassembling and mapping every game. Yes, every game, full disassembly. Every function, its bounds, its callers and callees. Importantly, this is just a map, not a decompilation or even interpretation. Functions retain their address offset names. But this lets the recompilation engine have a 100% clear view, every function that needs recompilation, every function that loads into IWRAM. This enables 0 interpreter. Once the map is complete, I'll be even removing the interpreter from this repository. 
+
+I'm using a combination of Ghidra, Qwen 3.6 Coder running locally on my machine, Codex running hourly supervision checks, and a bunch of custom harnesses and tools to fully automate the process, running 24/7. Each rom image's map is verified against reassembling the image for 100% accuracy in a task of this magnitude. Everything will be double and triple checked, there will not be a single function missing. After all, I'm only paying for electricity for my GPU.
+
+As of now, I have 169,778 functions out of an estimated 4.1 million mapped in 4 days of 24/7 runtime. This lives in `gamedb.sqlite`. It currently has one game fully mapped in it, another project of mine, can you guess which? This file is currently licensed CC0, public domain and will continue to be licensed public domain until and beyond completion. I hope that people use it not just for recompiling their favorite games in this repository, but as a basis for matching decompilation as well.
 
 This project is an AI-assisted project. I believe that software should be open source, free, and abundant. If something does not exist, I take that as a challenge to make it exist, and I will use any tools available to do that. Copyright, licenses, and attribution must be respected as a legal requirement and as principle for sustainable open source development. For details on AI-assisted development regarding copyright, licensing, and clean-rooms, see [Legal](#legal).
 
 ## Design at a glance
 
+- **Boundaries, not guesswork.** Each game's complete function map — every
+  function's address, length, and ARM/Thumb mode, keyed by ROM SHA-256 —
+  ships as `gamedb.sqlite` (Work in progress) (CC0). The recompiler seeds from those boundaries,
+  so with a full map every reachable block is translated up front: a 100%
+  native binary, zero interpreter.
+- **`recomp-core` is the engine.** Analyze → emit C11 → compile → link, as a
+  standalone library shared by the developer CLI, the packager, and the
+  launcher. The emitted C calls the Rust hardware model through a C ABI,
+  builds with any C compiler (no just-in-time compilation), and its bounded
+  translation units compile in parallel across cores.
 - **Translate everything; resolve the indirect branches at runtime** via a
-  guest-address → native-function table (ARM/Thumb mode-aware).
-- **Rust tool + Rust runtime (C ABI) + emitted C11** — generated code compiles
-  with any C compiler; no just-in-time compilation.
-- **Fallback interpreter** for RAM-resident/self-modifying code; doubles as the
-  differential-testing oracle. Kept for stability, not as intended runtime
-  behavior. Interpreter fallback is meant to be kept to a minimum within
-  reasonable development limits.
+  guest-address → native-function table (mode-aware).
+- **RAM-resident code is captured, not interpreted.** Games copy hot code
+  (IRQ handlers, sound mixers) into IWRAM at boot; a short interpreter
+  profile at build time observes and translates it from the runtime snapshot.
+  The interpreter then remains only as a stability net for self-modifying
+  code and as the differential-testing oracle — never the intended runtime
+  path.
+- **Two surfaces, one engine.** End users play from the launcher: pick a
+  cartridge, it hashes your image, looks the boundaries up in the database,
+  runs the profile, and recompiles a full native library into your install
+  dir — cached by content, instant on later launches. Developers use the
+  `recomp` CLI and `gba-pack` to package one game into a standalone, portable
+  executable, optionally emitting the recompiled C for modding.
 - **Cycle-count accuracy**: per-block cycle sums computed at recompile time,
   event scheduler checked at block edges, MMIO accesses as catch-up sync points.
 - **Netplay**: all instances simulated on every peer, only controller inputs
-  cross the network (rollback/lockstep).
+  cross the network (rollback/lockstep) (Work in progress)
 
 ## Enhanced Features
 
@@ -71,11 +93,15 @@ everything below is covered once, in [Legal](#legal).
   30 Hz — effects a perfect, instantaneous modern display would otherwise break.
 - **Pixel grid.** An analytic, scale-aware subpixel grid (BGR stripes) rendered on
   the GPU (wgpu).
-- **Correct on modern displays.** The output is colorspace-tagged so simulated
-  colors land accurately on wide-gamut and HDR panels instead of being stretched
-  into oversaturation. All of this is present-time only: frame hashing, `verify`,
-  and the differential sweeps stay defined on the raw frames and cannot be
-  affected by it.
+- **Correct on every display, out of the box.** Simulated colors carry their
+  colorspace, so a color-managing compositor lands them accurately on the actual
+  panel — ordinary sRGB, wide-gamut, or HDR — instead of stretching them into
+  oversaturation. Where a platform doesn't color-manage by default (notably some
+  Wayland setups driving wide-gamut panels), a gated fallback detects the panel
+  and corrects the output itself, while leaving ordinary sRGB panels untouched —
+  so neither case needs any configuration. All of this is present-time only:
+  frame hashing, `verify`, and the differential sweeps stay defined on the raw
+  frames and cannot be affected by it.
 
 ## Workspace
 
@@ -83,7 +109,10 @@ everything below is covered once, in [Legal](#legal).
 |---|---|
 | `crates/armv4t` | ARMv4T/Thumb instruction model + decoder (shared by analyzer, translator, interpreter) |
 | `crates/gba-core` | GBA machine model: ARM7TDMI interpreter, memory map, hardware |
-| `crates/recomp` | Recompiler CLI: `build` (emit + cc), `runc`/`verify` (recompiled execution, differential checks), `play` (windowed play), `frames`/`run`/`dis` (headless tools) |
+| `crates/recomp-core` | Static recompiler engine: analyze, emit C, parallel compile/link, pluggable label sourcing — the library behind the CLI, packager, and launcher |
+| `crates/gamedb` | Reader for `gamedb.sqlite`: function boundaries by ROM SHA-256, seeding a full recompile |
+| `crates/recomp` | Recompiler CLI + play runtime over `recomp-core`: `build` (emit + cc), `runc`/`verify` (recompiled execution, differential checks), `play` (windowed play), `frames`/`run`/`dis` (headless tools) |
+| `crates/pack` | `gba-pack`: package one mapped game into a standalone, distributable executable (pins ROM/BIOS by hash; ships no game data) |
 | `crates/input-config` | Shared input bindings: device choice + button maps, written by the launcher, read by `play` |
 | `crates/screen` | Screen simulation: per-revision panel color, temporal response, GPU pixel-grid present path |
 | `crates/launcher` | `gba-launcher` frontend: cartridge selection/launch, input rebinding, A/V settings — procedural theme, no bundled assets |
@@ -109,11 +138,9 @@ code, BIOS, ROM data, or assets from the console's manufacturer or any game
 publisher. You supply your own legally obtained ROM image and BIOS; nothing in
 this toolkit obtains them for you.
 
-**Recompiled output is not ours to distribute, nor yours to redistribute.** A
-statically recompiled executable is a derivative work of the input ROM image.
-This repository never contains or distributes recompiled output — you build it
-locally from your own image. Distributing that output is legally akin to
-distributing the original ROM image.
+**No distribution of recompiled output** This repository does not contain any 
+recompiled output. Users build recompiled output themselves from their own legally
+obtained ROM Image and BIOS.
 
 **Clean-room throughout.** No code is copied or ported from any other project.
 Where another implementation is consulted, it is read for *facts* only —

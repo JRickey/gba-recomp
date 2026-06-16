@@ -67,14 +67,21 @@ EOF
 
 # --- Player runtime --------------------------------------------------
 rt="$(stage_bundle gba-recomp-runtime gba-launcher recomp)"
+# The function-boundary database the launcher queries (by ROM sha256) to
+# produce a 0-interpreter recompile. Derived metadata only, CC0 — carry its
+# license text and REUSE sidecar alongside it. Sits beside the binaries so
+# the launcher resolves it next to its own executable.
+cp gamedb.sqlite gamedb.sqlite.license LICENSE-CC0 "$rt"/
 cat > "$rt/README-RUNTIME.txt" <<EOF
 gba-recomp player runtime ${VERSION} (${TARGET})
 
   gba-launcher   the player UI (cartridge select, input, A/V). It spawns
                  'recomp' (kept beside it) to play.
   recomp         the play runtime.
+  gamedb.sqlite  function-boundary database (CC0; LICENSE-CC0) — queried by
+                 ROM sha256 to build a full native recompile.
 
-Run gba-launcher${EXE}. Keep the two files together.
+Run gba-launcher${EXE}. Keep the files together.
 
 macOS: the binaries are ad-hoc signed (required for Apple Silicon) but
 not notarized, so a download is quarantined. If macOS refuses to open
@@ -82,9 +89,10 @@ them, clear the quarantine flag once:
 
     xattr -dr com.apple.quarantine .
 
-Licensed MIT OR Apache-2.0 (LICENSE-MIT / LICENSE-APACHE). Third-party
-components (including the bundled controller database) are listed in
-THIRD-PARTY.md. No game or BIOS data is included.
+The programs are licensed MIT OR Apache-2.0 (LICENSE-MIT / LICENSE-APACHE);
+gamedb.sqlite is dedicated to the public domain under CC0 (LICENSE-CC0).
+Third-party components (including the bundled controller database) are
+listed in THIRD-PARTY.md. No game or BIOS data is included.
 EOF
 
 echo "staged:"
