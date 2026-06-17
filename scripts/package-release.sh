@@ -303,7 +303,7 @@ finish-args:
   - --socket=fallback-x11
   - --socket=pulseaudio
   - --device=dri
-  - --device=input
+  - --device=all
   - --filesystem=xdg-config/gba-recomp:create
   - --filesystem=xdg-cache/gba-recomp:create
 modules:
