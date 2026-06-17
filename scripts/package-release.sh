@@ -292,6 +292,7 @@ write_flatpak_manifest() {
   local manifest="$1" srcdir="$2"
   cat > "$manifest" <<EOF
 app-id: ${APP_ID}
+branch: stable
 runtime: org.freedesktop.Platform
 runtime-version: '${FLATPAK_RUNTIME_VERSION}'
 sdk: org.freedesktop.Sdk
