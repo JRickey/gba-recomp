@@ -96,6 +96,18 @@ StartupNotify=true
 EOF
 }
 
+write_png_icon() {
+  local out="$1" size="$2"
+  if command -v cargo >/dev/null && [ -f crates/launcher/src/bin/gba-icon.rs ]; then
+    cargo run --quiet --profile dist -p gba-launcher --bin gba-icon -- "$out" "$size" >/dev/null
+  elif command -v sips >/dev/null; then
+    sips -z "$size" "$size" assets/icon/app-icon.png --out "$out" >/dev/null
+  else
+    echo "cannot render ${size}x${size} launcher icon: cargo or sips is required" >&2
+    return 1
+  fi
+}
+
 write_macos_info_plist() {
   local path="$1"
   cat > "$path" <<EOF
@@ -226,7 +238,7 @@ stage_linux_appdir() {
   mv "$appdir/usr/bin/LICENSE-CC0" "$appdir/usr/share/doc/gba-recomp/"
   mv "$appdir/usr/bin/THIRD-PARTY.md" "$appdir/usr/share/doc/gba-recomp/"
   mv "$appdir/usr/bin/gamedb.sqlite.license" "$appdir/usr/share/doc/gba-recomp/"
-  cp assets/icon/app-icon.png "$appdir/usr/share/icons/hicolor/512x512/apps/${APP_ID}.png"
+  write_png_icon "$appdir/usr/share/icons/hicolor/512x512/apps/${APP_ID}.png" 512
   write_launcher_desktop "$appdir/usr/share/applications/${APP_ID}.desktop" "gba-launcher"
 }
 
@@ -325,7 +337,7 @@ package_flatpak_launcher() {
   rm -rf "$root"
   mkdir -p "$src"
   stage_launcher_payload "$src"
-  cp assets/icon/app-icon.png "$src/${APP_ID}.png"
+  write_png_icon "$src/${APP_ID}.png" 512
   write_launcher_desktop "$src/${APP_ID}.desktop" "gba-launcher"
   write_flatpak_metainfo "$src/${APP_ID}.metainfo.xml"
   write_flatpak_manifest "$manifest" "$src"
