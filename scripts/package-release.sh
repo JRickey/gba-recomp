@@ -328,7 +328,7 @@ EOF
 }
 
 package_flatpak_launcher() {
-  local root src build repo manifest
+  local root src src_abs build repo manifest
   root="stage/${LAUNCHER_BASE}-flatpak"
   src="$root/src"
   build="$root/build"
@@ -340,7 +340,8 @@ package_flatpak_launcher() {
   write_png_icon "$src/${APP_ID}.png" 512
   write_launcher_desktop "$src/${APP_ID}.desktop" "gba-launcher"
   write_flatpak_metainfo "$src/${APP_ID}.metainfo.xml"
-  write_flatpak_manifest "$manifest" "$src"
+  src_abs="$(cd "$src" && pwd -P)"
+  write_flatpak_manifest "$manifest" "$src_abs"
   flatpak-builder --force-clean --user --install-deps-from=flathub --repo="$repo" "$build" "$manifest"
   flatpak build-bundle "$repo" "${OUTDIR}/${LAUNCHER_BASE}.flatpak" "$APP_ID" stable \
     --runtime-repo=https://flathub.org/repo/flathub.flatpakrepo
