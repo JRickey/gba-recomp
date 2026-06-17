@@ -7,8 +7,9 @@ pub mod analyze;
 pub mod build;
 pub mod emit;
 pub mod labels;
+pub mod tcc;
 
-pub use build::{build_library, BuildReport, Compiler, Profile};
+pub use build::{build_library, Backend, BuildReport, Compiler, Profile};
 pub use labels::{FileLabels, LabelSource};
 
 /// FNV-1a 64-bit hash. Content-addresses emitted constant pools (see

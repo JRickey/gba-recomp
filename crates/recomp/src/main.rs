@@ -2104,14 +2104,9 @@ run play/runc --record-labels to capture one"
     // compile each unit → link. It emits the `blocks:`/`wrote` report lines
     // on stdout (the packager's contract) at the same points the inline
     // pipeline did.
-    build_library(
-        &view,
-        &seeds,
-        &Compiler::host(),
-        Path::new(lib_path),
-        prof_end,
-        progress,
-    )?;
+    let cc = Compiler::detect();
+    eprintln!("compiler: {}", cc.describe());
+    build_library(&view, &seeds, &cc, Path::new(lib_path), prof_end, progress)?;
     Ok(())
 }
 

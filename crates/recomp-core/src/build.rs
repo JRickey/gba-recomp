@@ -22,10 +22,21 @@ pub enum Profile {
     Ship,
 }
 
-/// Where the C compiler comes from. Today the host `cc` resolved on PATH;
-/// the launcher will later point `program` at a bundled `zig cc`.
+/// How the emitted C gets compiled.
+pub enum Backend {
+    /// Spawn an external compiler binary (`cc`/`clang`/`gcc`/`zig cc`) that
+    /// accepts our gcc/clang-style flags (`-O1 -fPIC -c`, `-shared`).
+    External(PathBuf),
+    /// Compile in-process with the bundled TinyCC in this directory (the
+    /// fallback when no system compiler is found). See [`crate::tcc`].
+    LibTcc(PathBuf),
+}
+
+/// Where the C compiler comes from. Resolve one with [`Compiler::detect`]
+/// (system compiler if present, else bundled TinyCC) or pin an explicit
+/// external program with [`Compiler::external`].
 pub struct Compiler {
-    pub program: PathBuf,
+    pub backend: Backend,
     /// Cross-compile target triple (`zig cc -target …`).
     // waiting to implement: gba-pack packs host-only today; this drives
     // cross-target emission when that lands.
@@ -38,15 +49,84 @@ pub struct Compiler {
 }
 
 impl Compiler {
-    /// The host C compiler (`cc`, resolved on PATH at spawn time),
-    /// shipping profile, host target.
-    pub fn host() -> Self {
+    /// Pin a specific external compiler binary (resolved on PATH at spawn
+    /// time if not absolute), shipping profile, host target.
+    pub fn external<P: Into<PathBuf>>(program: P) -> Self {
         Compiler {
-            program: PathBuf::from("cc"),
+            backend: Backend::External(program.into()),
             target: None,
             profile: Profile::Ship,
         }
     }
+
+    /// Resolve a compiler the way the launcher's "build to play" path and the
+    /// CLI both should: an explicit override, then a system compiler on PATH,
+    /// then the bundled TinyCC so a build never requires the user to install
+    /// a toolchain.
+    ///
+    /// Windows note: we probe `clang`/`gcc`/`cc` (which accept our flags and
+    /// work standalone) but deliberately NOT MSVC `cl.exe` — it needs a
+    /// vcvars environment (INCLUDE/LIB) and uses `/`-style flags, so wiring it
+    /// means a flag-translation layer. On a typical Windows box none of
+    /// clang/gcc/cc is on PATH, so the bundled TinyCC is what makes "just
+    /// build it" work with zero setup. Point `$GBA_RECOMP_CC` at a specific
+    /// compiler (e.g. an installed `clang`) to override.
+    pub fn detect() -> Self {
+        if let Some(p) = std::env::var_os("GBA_RECOMP_CC") {
+            return Compiler::external(PathBuf::from(p));
+        }
+        let force_tcc = std::env::var_os("GBA_RECOMP_FORCE_TCC").is_some();
+        if !force_tcc {
+            let candidates: &[&str] = if cfg!(windows) {
+                &["clang", "gcc", "cc"]
+            } else {
+                &["cc", "clang", "gcc"]
+            };
+            for name in candidates {
+                if let Some(p) = which(name) {
+                    return Compiler::external(p);
+                }
+            }
+        }
+        if let Some(dir) = crate::tcc::lib_dir() {
+            return Compiler {
+                backend: Backend::LibTcc(dir),
+                target: None,
+                profile: Profile::Fast,
+            };
+        }
+        // Nothing found: keep `cc` so the build surfaces the existing clear
+        // "cc: not found" error rather than failing silently.
+        Compiler::external("cc")
+    }
+
+    /// Human-readable backend name, for status/diagnostic output.
+    pub fn describe(&self) -> String {
+        match &self.backend {
+            Backend::External(p) => format!("system compiler ({})", p.display()),
+            Backend::LibTcc(d) => format!("bundled TinyCC ({})", d.display()),
+        }
+    }
+}
+
+/// Minimal `which`: first match for `name` (with platform exe suffixes) in a
+/// `PATH` directory. Avoids a dependency for a five-line search.
+fn which(name: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    let exts: &[&str] = if cfg!(windows) {
+        &["", ".exe", ".bat", ".cmd"]
+    } else {
+        &[""]
+    };
+    for dir in std::env::split_paths(&path) {
+        for ext in exts {
+            let cand = dir.join(format!("{name}{ext}"));
+            if cand.is_file() {
+                return Some(cand);
+            }
+        }
+    }
+    None
 }
 
 /// What a completed build translated. Returned for in-process callers
@@ -120,12 +200,39 @@ pub fn build_library(
         Ok(())
     })?;
     let unit_count = units.len();
+    let keep_c = std::env::var_os("RECOMP_KEEP_C").is_some();
 
-    // Phase 2 — compile the units in parallel. Each 16 MB unit's cc stays
-    // modest, so one job per core keeps every core busy without blowing
-    // memory; RECOMP_JOBS overrides (e.g. on a RAM-tight machine). Workers
-    // pull units from a shared counter; the main thread drives the bar from
-    // the completion count.
+    // Phase 2 — compile. Two backends: an external compiler spawned per unit
+    // (parallel, then a `-shared` link), or the bundled libtcc which compiles
+    // every unit straight to the shared library in-process.
+    let prog = match &cc.backend {
+        Backend::LibTcc(dir) => {
+            progress(
+                span_start + 1,
+                "forging native code with bundled TinyCC\u{2026}",
+            );
+            let c_paths: Vec<String> = units.iter().map(|(c, _)| c.clone()).collect();
+            crate::tcc::compile_to_dll(dir, &c_paths, out)?;
+            if !keep_c {
+                for (c, _) in &units {
+                    let _ = std::fs::remove_file(c);
+                }
+            }
+            progress(100, "ready to play");
+            println!("wrote {} ({unit_count} units, tinycc)", out.display());
+            return Ok(BuildReport {
+                blocks: analysis.blocks.len(),
+                instrs: n_instrs,
+                units: unit_count,
+            });
+        }
+        Backend::External(prog) => prog,
+    };
+
+    // External-compiler path: one job per core keeps every core busy without
+    // blowing memory (each 16 MB unit's cc stays modest); RECOMP_JOBS
+    // overrides. Workers pull units from a shared counter; the main thread
+    // drives the bar from the completion count.
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed};
     let jobs = std::env::var("RECOMP_JOBS")
         .ok()
@@ -141,8 +248,6 @@ pub fn build_library(
     let done = AtomicUsize::new(0);
     let abort = AtomicBool::new(false);
     let err: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
-    let keep_c = std::env::var_os("RECOMP_KEEP_C").is_some();
-    let cc_prog = &cc.program;
     let units = &units;
 
     std::thread::scope(|s| {
@@ -154,7 +259,7 @@ pub fn build_library(
                         break;
                     }
                     let (c_path, o_path) = &units[i];
-                    match std::process::Command::new(cc_prog)
+                    match std::process::Command::new(prog)
                         .args(["-O1", "-fPIC", "-c", "-o", o_path, c_path])
                         .status()
                     {
@@ -196,7 +301,7 @@ pub fn build_library(
     }
 
     progress(97, "linking it all together\u{2026}");
-    let status = std::process::Command::new(&cc.program)
+    let status = std::process::Command::new(prog)
         .arg("-shared")
         .arg("-o")
         .arg(out)

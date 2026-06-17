@@ -13,3 +13,4 @@ armv4t = { path = "../armv4t" }
 gba-core = { path = "../gba-core" }
 toml = "0.8"
 dirs = "6.0.0"
+libloading = "0.8"

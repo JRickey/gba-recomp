@@ -3238,6 +3238,7 @@ dependencies = [
  "armv4t",
  "dirs",
  "gba-core",
+ "libloading",
  "toml",
 ]
 
