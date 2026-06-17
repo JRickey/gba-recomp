@@ -1,9 +1,8 @@
 name: release
 
 # Tag a version to cut a release:  git tag v0.2.0 && git push origin v0.2.0
-# Builds the CLI toolkit and the player runtime as separate, portable
-# archives for macOS (universal), Linux, and Windows, then attaches them
-# to a GitHub Release.
+# Builds the CLI toolkit as portable archives and the launcher as the native
+# desktop artifact for each platform, then attaches them to a GitHub Release.
 on:
   push:
     tags: ["v*"]
@@ -56,8 +55,12 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
-      # Build deps for the audio (ALSA), input (udev), window (X11) and
-      # launcher (GTK file dialogs) stacks. Built on the oldest supported
+      - name: macOS packaging dependencies
+        if: matrix.name == 'macos-universal'
+        run: brew install create-dmg
+
+      # Build deps for the audio (ALSA), input (udev), window (X11/Wayland)
+      # stacks, plus Linux desktop packaging. Built on the oldest supported
       # Ubuntu image so the glibc baseline stays portable.
       - name: Linux build dependencies
         if: matrix.name == 'linux-x86_64'
@@ -65,7 +68,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             libasound2-dev libudev-dev libx11-dev libxkbcommon-dev \
-            libwayland-dev libgtk-3-dev pkg-config
+            libwayland-dev libgtk-3-dev pkg-config \
+            appstream desktop-file-utils flatpak flatpak-builder libfuse2
 
       - name: Build (universal macOS)
         if: matrix.name == 'macos-universal'
@@ -95,6 +99,21 @@ jobs:
             cp "target/${{ matrix.target }}/dist/${b}${EXE}" "dist/bin/"
           done
 
+      - name: Prepare Linux desktop packagers
+        if: matrix.name == 'linux-x86_64'
+        shell: bash
+        run: |
+          mkdir -p dist/tools
+          curl -L \
+            -o dist/tools/linuxdeploy-x86_64.AppImage \
+            https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-x86_64.AppImage
+          curl -L \
+            -o dist/tools/linuxdeploy-plugin-appimage-x86_64.AppImage \
+            https://github.com/linuxdeploy/linuxdeploy-plugin-appimage/releases/download/continuous/linuxdeploy-plugin-appimage-x86_64.AppImage
+          chmod +x dist/tools/linuxdeploy-x86_64.AppImage dist/tools/linuxdeploy-plugin-appimage-x86_64.AppImage
+          flatpak remote-add --user --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo
+          flatpak install --user -y flathub org.freedesktop.Sdk//25.08
+
       - name: Stage and archive bundles
         shell: bash
         env:
@@ -103,6 +122,8 @@ jobs:
           BINDIR: dist/bin
           OUTDIR: dist/out
           RUNNER_OS: ${{ runner.os }}
+          LINUXDEPLOY: ${{ github.workspace }}/dist/tools/linuxdeploy-x86_64.AppImage
+          FLATPAK_RUNTIME_VERSION: "25.08"
         run: |
           [ "${{ runner.os }}" = "Windows" ] && export EXE=".exe"
           bash scripts/package-release.sh

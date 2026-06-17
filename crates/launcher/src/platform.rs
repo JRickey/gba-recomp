@@ -89,10 +89,10 @@ fn recomp_bin() -> Result<PathBuf, String> {
 }
 
 /// Locate the `gamedb.sqlite` (function boundaries by ROM sha256):
-/// $GBA_RECOMP_GAMEDB, then next to this executable (the shipped layout —
-/// it sits in the release archive beside the binaries), then, for local
-/// `cargo` builds, the repo root's `gamedb.sqlite`. `None` = none found, in
-/// which case the runtime builds from label files instead.
+/// $GBA_RECOMP_GAMEDB, then next to this executable (the portable release
+/// layout), then the macOS app bundle Resources dir, then, for local `cargo`
+/// builds, the repo root's `gamedb.sqlite`. `None` = none found, in which
+/// case the runtime builds from label files instead.
 #[cfg(not(target_os = "android"))]
 fn gamedb_path() -> Option<PathBuf> {
     if let Ok(p) = std::env::var("GBA_RECOMP_GAMEDB") {
@@ -106,8 +106,27 @@ fn gamedb_path() -> Option<PathBuf> {
     if beside.is_file() {
         return Some(beside);
     }
+    if let Some(resources) = bundle_resource_gamedb_candidate(&exe).filter(|p| p.is_file()) {
+        return Some(resources);
+    }
     // Local dev: <workspace>/gamedb.sqlite.
     dev_gamedb_candidate(&exe).filter(|p| p.is_file())
+}
+
+/// macOS app bundle layout:
+/// `<app>.app/Contents/MacOS/gba-launcher` loads metadata from
+/// `<app>.app/Contents/Resources/gamedb.sqlite`.
+#[cfg(not(target_os = "android"))]
+fn bundle_resource_gamedb_candidate(exe: &Path) -> Option<PathBuf> {
+    let macos = exe.parent()?;
+    if macos.file_name()? != "MacOS" {
+        return None;
+    }
+    let contents = macos.parent()?;
+    if contents.file_name()? != "Contents" {
+        return None;
+    }
+    Some(contents.join("Resources").join("gamedb.sqlite"))
 }
 
 /// The dev gamedb candidate for an executable built under a cargo `target/`
@@ -140,6 +159,22 @@ mod tests {
         // A shipped binary (no `target/` component) yields no dev candidate.
         assert_eq!(
             dev_gamedb_candidate(Path::new("/opt/frogger-temple/gba-launcher")),
+            None
+        );
+    }
+
+    #[test]
+    fn bundle_resource_gamedb_candidate_resolves_macos_app() {
+        assert_eq!(
+            bundle_resource_gamedb_candidate(Path::new(
+                "/Applications/gba-recomp.app/Contents/MacOS/gba-launcher"
+            )),
+            Some(PathBuf::from(
+                "/Applications/gba-recomp.app/Contents/Resources/gamedb.sqlite"
+            ))
+        );
+        assert_eq!(
+            bundle_resource_gamedb_candidate(Path::new("/opt/gba-recomp/gba-launcher")),
             None
         );
     }

@@ -17,6 +17,10 @@ crate-type = ["lib", "cdylib"]
 name = "gba-icon"
 path = "src/bin/gba-icon.rs"
 
+[[bin]]
+name = "gba-dmg-bg"
+path = "src/bin/gba-dmg-bg.rs"
+
 [features]
 # Android build (cdylib through the NativeActivity glue):
 #   cargo build --target aarch64-linux-android --features android-native-activity

@@ -137,6 +137,156 @@ pub fn app_icon() -> egui::IconData {
     }
 }
 
+/// Render the launcher's procedural runtime backdrop into a DMG-friendly
+/// banner. This mirrors `theme::paint_background`: indigo gradient, tech
+/// grid, aurora glows, swoosh arcs, and drifting chrome orbs.
+pub fn render_dmg_background_rgba(width: usize, height: usize) -> Vec<u8> {
+    const LOGICAL_W: f32 = 600.0;
+    const LOGICAL_H: f32 = 375.0;
+    const INK: [u8; 3] = [0x36, 0x7f, 0xd7];
+    const DEEP: [u8; 3] = [0x9a, 0xe7, 0xff];
+    const VIOLET: [u8; 3] = [0x66, 0xb8, 0xff];
+    const CYAN: [u8; 3] = [0xd6, 0xfb, 0xff];
+    const SILVER: [u8; 3] = [0xee, 0xf6, 0xff];
+
+    fn mix(a: u8, b: u8, t: f32) -> u8 {
+        (a as f32 + (b as f32 - a as f32) * t).clamp(0.0, 255.0) as u8
+    }
+    fn over(px: &mut [f32; 3], c: [u8; 3], alpha: f32) {
+        let a = alpha.clamp(0.0, 1.0);
+        for i in 0..3 {
+            px[i] += (c[i] as f32 - px[i]) * a;
+        }
+    }
+    fn glow(px: &mut [f32; 3], x: f32, y: f32, cx: f32, cy: f32, r: f32, c: [u8; 3], a: f32) {
+        let d = ((x - cx).powi(2) + (y - cy).powi(2)).sqrt();
+        if d < r {
+            let f = (1.0 - d / r).powf(1.8) * a;
+            over(px, c, f);
+        }
+    }
+    fn stroke_circle(
+        px: &mut [f32; 3],
+        x: f32,
+        y: f32,
+        cx: f32,
+        cy: f32,
+        r: f32,
+        width: f32,
+        c: [u8; 3],
+        a: f32,
+    ) {
+        let d = ((x - cx).powi(2) + (y - cy).powi(2)).sqrt();
+        let edge = (1.0 - ((d - r).abs() / width)).clamp(0.0, 1.0);
+        if edge > 0.0 {
+            over(px, c, edge * a);
+        }
+    }
+    fn orb(px: &mut [f32; 3], x: f32, y: f32, cx: f32, cy: f32, r: f32) {
+        let d = ((x - cx).powi(2) + (y - cy).powi(2)).sqrt();
+        if d > r {
+            return;
+        }
+        let f = 1.0 - d / r;
+        over(px, [0, 0, 0], 0.18 * (1.0 - f));
+        over(px, [SILVER[0], SILVER[1], SILVER[2]], 0.48);
+        over(px, [255, 255, 255], 0.28 * f);
+        let h = ((x - (cx - r * 0.35)).powi(2) + (y - (cy - r * 0.40)).powi(2)).sqrt();
+        if h < r * 0.30 {
+            over(px, [255, 255, 255], 0.55 * (1.0 - h / (r * 0.30)));
+        }
+    }
+
+    let mut rgba = vec![0u8; width * height * 4];
+    for py in 0..height {
+        let y = (py as f32 + 0.5) * LOGICAL_H / height as f32;
+        let ty = y / LOGICAL_H;
+        for pxn in 0..width {
+            let x = (pxn as f32 + 0.5) * LOGICAL_W / width as f32;
+            let mut px = [
+                mix(DEEP[0], INK[0], ty) as f32,
+                mix(DEEP[1], INK[1], ty) as f32,
+                mix(DEEP[2], INK[2], ty) as f32,
+            ];
+
+            let gx = x.rem_euclid(26.0).min(26.0 - x.rem_euclid(26.0));
+            let gy = y.rem_euclid(26.0).min(26.0 - y.rem_euclid(26.0));
+            if gx < 0.55 {
+                over(&mut px, [255, 255, 255], 0.045 * (1.0 - gx / 0.55));
+            }
+            if gy < 0.55 {
+                over(&mut px, [255, 255, 255], 0.050 * (1.0 - gy / 0.55));
+            }
+
+            glow(
+                &mut px,
+                x,
+                y,
+                LOGICAL_W * 0.82,
+                LOGICAL_H * 0.12,
+                LOGICAL_W * 0.30,
+                CYAN,
+                0.34,
+            );
+            glow(
+                &mut px,
+                x,
+                y,
+                LOGICAL_W * 0.10,
+                LOGICAL_H * 0.92,
+                LOGICAL_W * 0.22,
+                VIOLET,
+                0.22,
+            );
+
+            stroke_circle(
+                &mut px,
+                x,
+                y,
+                LOGICAL_W * -0.05,
+                LOGICAL_H * 1.90,
+                LOGICAL_W * 1.05,
+                1.8,
+                [255, 255, 255],
+                0.12,
+            );
+            stroke_circle(
+                &mut px,
+                x,
+                y,
+                LOGICAL_W * -0.05,
+                LOGICAL_H * 1.90,
+                LOGICAL_W * 1.12,
+                1.1,
+                [255, 255, 255],
+                0.08,
+            );
+            stroke_circle(
+                &mut px,
+                x,
+                y,
+                LOGICAL_W * 1.20,
+                LOGICAL_H * -0.75,
+                LOGICAL_W * 0.95,
+                1.8,
+                CYAN,
+                0.16,
+            );
+
+            orb(&mut px, x, y, LOGICAL_W * 0.16, LOGICAL_H * 0.22, 7.0);
+            orb(&mut px, x, y, LOGICAL_W * 0.84, LOGICAL_H * 0.62, 5.0);
+            orb(&mut px, x, y, LOGICAL_W * 0.32, LOGICAL_H * 0.82, 4.0);
+
+            let i = (py * width + pxn) * 4;
+            rgba[i] = px[0].clamp(0.0, 255.0) as u8;
+            rgba[i + 1] = px[1].clamp(0.0, 255.0) as u8;
+            rgba[i + 2] = px[2].clamp(0.0, 255.0) as u8;
+            rgba[i + 3] = 255;
+        }
+    }
+    rgba
+}
+
 /// Encode an 8-bit RGBA buffer as a PNG (truecolor + alpha). Used by the
 /// `gba-icon` generator to write the committed master; small enough to keep
 /// here rather than pull a full image stack into the tool.
