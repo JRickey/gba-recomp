@@ -12,6 +12,9 @@
 #
 # Usage:  scripts/build-tcc.sh <out-dir>      # creates <out-dir>/tcc/
 # Pin the source with TCC_REF (commit/tag); default tracks a known-good rev.
+# Cross-slice macOS builds can set TCC_CPU, TCC_CC, TCC_EXTRA_CFLAGS,
+# TCC_EXTRA_LDFLAGS, TCC_SYSINCLUDEPATHS, TCC_LIBPATHS, and TCC_CRTPREFIX;
+# these are passed to TinyCC's configure as separate args.
 # Unix only (macOS, Linux). Windows builds libtcc.dll via TinyCC's own win32
 # build — see the note at the bottom; package-release.sh stages a prebuilt
 # tcc/ via $TCC_DIR on every platform, so this script is the Unix producer.
@@ -38,7 +41,17 @@ git -C "$WORK/src" checkout -q "$TCC_REF"
 
 echo "build-tcc: configure --disable-static && make"
 ( cd "$WORK/src"
-  ./configure --prefix="$WORK/stage" --disable-static >/dev/null
+  args=(--prefix="$WORK/stage" --disable-static)
+  [ -n "${TCC_CPU:-}" ] && args+=(--cpu="$TCC_CPU")
+  [ -n "${TCC_CC:-}" ] && args+=(--cc="$TCC_CC")
+  [ -n "${TCC_EXTRA_CFLAGS:-}" ] && args+=(--extra-cflags="$TCC_EXTRA_CFLAGS")
+  [ -n "${TCC_EXTRA_LDFLAGS:-}" ] && args+=(--extra-ldflags="$TCC_EXTRA_LDFLAGS")
+  if [ -n "${TCC_SYSINCLUDEPATHS:-}" ]; then
+    args+=(--sysincludepaths="$WORK/src/include:$TCC_SYSINCLUDEPATHS")
+  fi
+  [ -n "${TCC_LIBPATHS:-}" ] && args+=(--libpaths="$TCC_LIBPATHS")
+  [ -n "${TCC_CRTPREFIX:-}" ] && args+=(--crtprefix="$TCC_CRTPREFIX")
+  ./configure "${args[@]}" >/dev/null
   make -j"$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)" >/dev/null
   make install >/dev/null )
 

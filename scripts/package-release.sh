@@ -326,6 +326,9 @@ finish-args:
 modules:
   - name: gba-recomp-launcher
     buildsystem: simple
+    build-options:
+      no-debuginfo: true
+      strip: false
     sources:
       - type: dir
         path: ${srcdir}

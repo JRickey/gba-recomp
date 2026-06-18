@@ -48,6 +48,7 @@ fn shared_name() -> &'static str {
 /// stderr via its default error handler).
 pub fn compile_to_dll(lib_dir: &Path, c_files: &[String], out: &Path) -> Result<(), String> {
     let so = lib_dir.join(shared_name());
+    let runtime_lib_dir = runtime_lib_dir(lib_dir);
     let cpath = |p: &Path| -> Result<CString, String> {
         CString::new(p.to_string_lossy().as_bytes()).map_err(|_| "NUL byte in path".to_string())
     };
@@ -89,7 +90,7 @@ pub fn compile_to_dll(lib_dir: &Path, c_files: &[String], out: &Path) -> Result<
         }
         // Compile inside a closure so a single `tcc_delete` runs on every exit.
         let run = || -> Result<(), String> {
-            tcc_set_lib_path(s, cpath(lib_dir)?.as_ptr()); // finds libtcc1.a
+            tcc_set_lib_path(s, cpath(&runtime_lib_dir)?.as_ptr()); // finds libtcc1.a
             let inc = lib_dir.join("include");
             if inc.is_dir() {
                 tcc_add_sysinclude_path(s, cpath(&inc)?.as_ptr()); // our stdint.h shim
@@ -112,4 +113,24 @@ pub fn compile_to_dll(lib_dir: &Path, c_files: &[String], out: &Path) -> Result<
         tcc_delete(s);
         r
     }
+}
+
+fn runtime_lib_dir(lib_dir: &Path) -> PathBuf {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    let arch = Some("arm64");
+    #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+    let arch = Some("x86_64");
+    #[cfg(not(all(
+        target_os = "macos",
+        any(target_arch = "aarch64", target_arch = "x86_64")
+    )))]
+    let arch: Option<&str> = None;
+
+    if let Some(arch) = arch {
+        let dir = lib_dir.join(arch);
+        if dir.join("libtcc1.a").is_file() {
+            return dir;
+        }
+    }
+    lib_dir.to_path_buf()
 }

@@ -128,27 +128,42 @@ jobs:
 
       # The launcher bundle is universal, so the fallback compiler must be too:
       # libloading rejects a single-arch libtcc.dylib when the app is running
-      # under the other slice. Build both TinyCC slices and lipo the dylib plus
-      # libtcc1.a, which TinyCC links into generated translations.
+      # under the other slice. Build both TinyCC slices, lipo the dylib, and
+      # stage the per-arch libtcc1.a archives separately; TinyCC's archive
+      # format is not reliably lipo-readable on macOS, and recomp chooses the
+      # matching archive directory at runtime.
       - name: Build bundled TinyCC fallback (universal macOS)
         if: matrix.name == 'macos-universal'
         shell: bash
         run: |
-          CC="clang -arch arm64" scripts/build-tcc.sh "$GITHUB_WORKSPACE/tcc-arm64"
-          CC="clang -arch x86_64" scripts/build-tcc.sh "$GITHUB_WORKSPACE/tcc-x86_64"
+          SDKROOT="$(xcrun --sdk macosx --show-sdk-path)"
+          TCC_CPU=arm64 TCC_CC=clang \
+            TCC_EXTRA_CFLAGS="-arch arm64 -isysroot $SDKROOT" \
+            TCC_EXTRA_LDFLAGS="-arch arm64 -isysroot $SDKROOT" \
+            TCC_SYSINCLUDEPATHS="$SDKROOT/usr/include" \
+            TCC_LIBPATHS="$SDKROOT/usr/lib" \
+            TCC_CRTPREFIX="$SDKROOT/usr/lib" \
+            scripts/build-tcc.sh "$GITHUB_WORKSPACE/tcc-arm64"
+          TCC_CPU=x86_64 TCC_CC=clang \
+            TCC_EXTRA_CFLAGS="-arch x86_64 -isysroot $SDKROOT" \
+            TCC_EXTRA_LDFLAGS="-arch x86_64 -isysroot $SDKROOT" \
+            TCC_SYSINCLUDEPATHS="$SDKROOT/usr/include" \
+            TCC_LIBPATHS="$SDKROOT/usr/lib" \
+            TCC_CRTPREFIX="$SDKROOT/usr/lib" \
+            scripts/build-tcc.sh "$GITHUB_WORKSPACE/tcc-x86_64"
           mkdir -p "$GITHUB_WORKSPACE/tccstage/tcc"
+          mkdir -p "$GITHUB_WORKSPACE/tccstage/tcc/arm64" "$GITHUB_WORKSPACE/tccstage/tcc/x86_64"
           cp -R "$GITHUB_WORKSPACE/tcc-arm64/tcc/include" "$GITHUB_WORKSPACE/tccstage/tcc/"
           cp "$GITHUB_WORKSPACE/tcc-arm64/tcc/COPYING" "$GITHUB_WORKSPACE/tccstage/tcc/"
+          cp "$GITHUB_WORKSPACE/tcc-arm64/tcc/libtcc1.a" "$GITHUB_WORKSPACE/tccstage/tcc/arm64/libtcc1.a"
+          cp "$GITHUB_WORKSPACE/tcc-x86_64/tcc/libtcc1.a" "$GITHUB_WORKSPACE/tccstage/tcc/x86_64/libtcc1.a"
           lipo -create \
             "$GITHUB_WORKSPACE/tcc-arm64/tcc/libtcc.dylib" \
             "$GITHUB_WORKSPACE/tcc-x86_64/tcc/libtcc.dylib" \
             -output "$GITHUB_WORKSPACE/tccstage/tcc/libtcc.dylib"
-          lipo -create \
-            "$GITHUB_WORKSPACE/tcc-arm64/tcc/libtcc1.a" \
-            "$GITHUB_WORKSPACE/tcc-x86_64/tcc/libtcc1.a" \
-            -output "$GITHUB_WORKSPACE/tccstage/tcc/libtcc1.a"
-          lipo -verify_arch arm64 x86_64 "$GITHUB_WORKSPACE/tccstage/tcc/libtcc.dylib"
-          lipo -verify_arch arm64 x86_64 "$GITHUB_WORKSPACE/tccstage/tcc/libtcc1.a"
+          lipo "$GITHUB_WORKSPACE/tccstage/tcc/libtcc.dylib" -verify_arch arm64 x86_64
+          test -f "$GITHUB_WORKSPACE/tccstage/tcc/arm64/libtcc1.a"
+          test -f "$GITHUB_WORKSPACE/tccstage/tcc/x86_64/libtcc1.a"
           echo "TCC_DIR=$GITHUB_WORKSPACE/tccstage/tcc" >> "$GITHUB_ENV"
 
       - name: Set up MSYS2 mingw toolchain (Windows TinyCC)
