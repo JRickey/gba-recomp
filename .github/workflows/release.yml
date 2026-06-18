@@ -114,6 +114,21 @@ jobs:
           flatpak remote-add --user --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo
           flatpak install --user -y flathub org.freedesktop.Platform//25.08 org.freedesktop.Sdk//25.08
 
+      # Build the bundled TinyCC fallback compiler so a local "build to play"
+      # works on machines with no system C compiler. macOS/Linux use the
+      # tested scripts/build-tcc.sh; TCC_DIR is read by package-release.sh.
+      # TODO(windows): build libtcc.dll via TinyCC's win32 build and set
+      # TCC_DIR; until then the Windows bundle ships without the fallback
+      # (package-release.sh warns) and a local build needs a system compiler.
+      # TODO(macos-universal): build-tcc.sh produces a native (arm64) libtcc
+      # on the arm64 runner; lipo an x86_64 slice for a universal fallback.
+      - name: Build bundled TinyCC fallback
+        if: matrix.name != 'windows-x86_64'
+        shell: bash
+        run: |
+          scripts/build-tcc.sh "$GITHUB_WORKSPACE/tccstage"
+          echo "TCC_DIR=$GITHUB_WORKSPACE/tccstage/tcc" >> "$GITHUB_ENV"
+
       - name: Stage and archive bundles
         shell: bash
         env:
