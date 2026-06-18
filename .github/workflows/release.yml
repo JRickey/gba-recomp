@@ -116,18 +116,39 @@ jobs:
 
       # Build the bundled TinyCC fallback compiler so a local "build to play"
       # works on machines with no system C compiler. macOS/Linux use the
-      # tested scripts/build-tcc.sh; TCC_DIR is read by package-release.sh.
-      # TODO(windows): build libtcc.dll via TinyCC's win32 build and set
-      # TCC_DIR; until then the Windows bundle ships without the fallback
-      # (package-release.sh warns) and a local build needs a system compiler.
+      # tested scripts/build-tcc.sh; Windows uses scripts/build-tcc-windows.sh
+      # under MSYS2/mingw (TinyCC's Windows install layout differs — see that
+      # script's header). TCC_DIR is read by package-release.sh on every
+      # platform; the emitted C marks the table symbols __declspec(dllexport)
+      # so the Windows DLL exports what the play runtime resolves.
       # TODO(macos-universal): build-tcc.sh produces a native (arm64) libtcc
       # on the arm64 runner; lipo an x86_64 slice for a universal fallback.
-      - name: Build bundled TinyCC fallback
+      - name: Build bundled TinyCC fallback (macOS/Linux)
         if: matrix.name != 'windows-x86_64'
         shell: bash
         run: |
           scripts/build-tcc.sh "$GITHUB_WORKSPACE/tccstage"
           echo "TCC_DIR=$GITHUB_WORKSPACE/tccstage/tcc" >> "$GITHUB_ENV"
+
+      - name: Set up MSYS2 mingw toolchain (Windows TinyCC)
+        if: matrix.name == 'windows-x86_64'
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: false
+          install: >-
+            mingw-w64-x86_64-gcc
+            make
+            git
+
+      # cygpath -m hands the later git-bash packaging step a forward-slash
+      # drive path (D:/…) both shells accept — no backslash pathing surprises.
+      - name: Build bundled TinyCC fallback (Windows)
+        if: matrix.name == 'windows-x86_64'
+        shell: msys2 {0}
+        run: |
+          scripts/build-tcc-windows.sh "$PWD/tccstage"
+          echo "TCC_DIR=$(cygpath -m "$PWD/tccstage/tcc")" >> "$GITHUB_ENV"
 
       - name: Stage and archive bundles
         shell: bash

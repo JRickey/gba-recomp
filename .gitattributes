@@ -1,0 +1,5 @@
+# Shell scripts must stay LF on every platform. They run under bash on
+# Linux/macOS and under MSYS2/git-bash on the Windows CI runner, where the
+# runner's default core.autocrlf=true would otherwise check them out with
+# CRLF — and a `\r` in the shebang or in `set -euo pipefail` breaks bash.
+*.sh text eol=lf
