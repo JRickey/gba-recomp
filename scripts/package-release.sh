@@ -332,6 +332,7 @@ modules:
     build-commands:
       - install -Dm755 gba-launcher /app/bin/gba-launcher
       - install -Dm755 recomp /app/bin/recomp
+      - if [ -d tcc ]; then mkdir -p /app/bin/tcc && cp -R tcc/. /app/bin/tcc/; fi
       - install -Dm644 gamedb.sqlite /app/bin/gamedb.sqlite
       - install -Dm644 ${APP_ID}.desktop /app/share/applications/${APP_ID}.desktop
       - install -Dm644 ${APP_ID}.metainfo.xml /app/share/metainfo/${APP_ID}.metainfo.xml

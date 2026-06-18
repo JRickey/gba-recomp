@@ -33,7 +33,7 @@ jobs:
             runs-on: windows-latest
             target: x86_64-pc-windows-msvc
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Resolve version
         id: ver
@@ -47,11 +47,11 @@ jobs:
           fi
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
           targets: ${{ matrix.name == 'macos-universal' && 'x86_64-apple-darwin,aarch64-apple-darwin' || matrix.target }}
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@42dc69e1aa15d09112580998cf2ef0119e2e91ae # v2
         with:
           key: ${{ matrix.target }}
 
@@ -115,24 +115,45 @@ jobs:
           flatpak install --user -y flathub org.freedesktop.Platform//25.08 org.freedesktop.Sdk//25.08
 
       # Build the bundled TinyCC fallback compiler so a local "build to play"
-      # works on machines with no system C compiler. macOS/Linux use the
-      # tested scripts/build-tcc.sh; Windows uses scripts/build-tcc-windows.sh
-      # under MSYS2/mingw (TinyCC's Windows install layout differs — see that
-      # script's header). TCC_DIR is read by package-release.sh on every
-      # platform; the emitted C marks the table symbols __declspec(dllexport)
-      # so the Windows DLL exports what the play runtime resolves.
-      # TODO(macos-universal): build-tcc.sh produces a native (arm64) libtcc
-      # on the arm64 runner; lipo an x86_64 slice for a universal fallback.
-      - name: Build bundled TinyCC fallback (macOS/Linux)
-        if: matrix.name != 'windows-x86_64'
+      # works on machines with no system C compiler. TCC_DIR is read by
+      # package-release.sh on every platform; the emitted C marks the table
+      # symbols __declspec(dllexport) so Windows DLLs export what the play
+      # runtime resolves.
+      - name: Build bundled TinyCC fallback (Linux)
+        if: matrix.name == 'linux-x86_64'
         shell: bash
         run: |
           scripts/build-tcc.sh "$GITHUB_WORKSPACE/tccstage"
           echo "TCC_DIR=$GITHUB_WORKSPACE/tccstage/tcc" >> "$GITHUB_ENV"
 
+      # The launcher bundle is universal, so the fallback compiler must be too:
+      # libloading rejects a single-arch libtcc.dylib when the app is running
+      # under the other slice. Build both TinyCC slices and lipo the dylib plus
+      # libtcc1.a, which TinyCC links into generated translations.
+      - name: Build bundled TinyCC fallback (universal macOS)
+        if: matrix.name == 'macos-universal'
+        shell: bash
+        run: |
+          CC="clang -arch arm64" scripts/build-tcc.sh "$GITHUB_WORKSPACE/tcc-arm64"
+          CC="clang -arch x86_64" scripts/build-tcc.sh "$GITHUB_WORKSPACE/tcc-x86_64"
+          mkdir -p "$GITHUB_WORKSPACE/tccstage/tcc"
+          cp -R "$GITHUB_WORKSPACE/tcc-arm64/tcc/include" "$GITHUB_WORKSPACE/tccstage/tcc/"
+          cp "$GITHUB_WORKSPACE/tcc-arm64/tcc/COPYING" "$GITHUB_WORKSPACE/tccstage/tcc/"
+          lipo -create \
+            "$GITHUB_WORKSPACE/tcc-arm64/tcc/libtcc.dylib" \
+            "$GITHUB_WORKSPACE/tcc-x86_64/tcc/libtcc.dylib" \
+            -output "$GITHUB_WORKSPACE/tccstage/tcc/libtcc.dylib"
+          lipo -create \
+            "$GITHUB_WORKSPACE/tcc-arm64/tcc/libtcc1.a" \
+            "$GITHUB_WORKSPACE/tcc-x86_64/tcc/libtcc1.a" \
+            -output "$GITHUB_WORKSPACE/tccstage/tcc/libtcc1.a"
+          lipo -verify_arch arm64 x86_64 "$GITHUB_WORKSPACE/tccstage/tcc/libtcc.dylib"
+          lipo -verify_arch arm64 x86_64 "$GITHUB_WORKSPACE/tccstage/tcc/libtcc1.a"
+          echo "TCC_DIR=$GITHUB_WORKSPACE/tccstage/tcc" >> "$GITHUB_ENV"
+
       - name: Set up MSYS2 mingw toolchain (Windows TinyCC)
         if: matrix.name == 'windows-x86_64'
-        uses: msys2/setup-msys2@v2
+        uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884 # v2
         with:
           msystem: MINGW64
           update: false
@@ -164,7 +185,7 @@ jobs:
           [ "${{ runner.os }}" = "Windows" ] && export EXE=".exe"
           bash scripts/package-release.sh
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: bundles-${{ matrix.target }}
           path: dist/out/*
@@ -176,12 +197,12 @@ jobs:
     if: github.ref_type == 'tag'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: artifacts
           merge-multiple: true
       - name: Publish
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           files: artifacts/*
           generate_release_notes: true
