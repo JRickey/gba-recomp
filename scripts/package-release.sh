@@ -31,12 +31,27 @@ mkdir -p "$OUTDIR" stage
 
 carry_licenses() { cp LICENSE-MIT LICENSE-APACHE THIRD-PARTY.md "$1"/; }
 
+# Stage the bundled TinyCC fallback compiler beside the binaries, so a local
+# "build to play" works on a machine with no system C compiler. $TCC_DIR is a
+# prebuilt `tcc/` (scripts/build-tcc.sh on Unix, the win32 build on Windows).
+# Without it the bundle still works wherever a system compiler exists; warn so
+# a missing fallback is never silent.
+stage_tcc() {
+  local dir="$1"
+  if [ -n "${TCC_DIR:-}" ] && [ -d "$TCC_DIR" ]; then
+    rm -rf "$dir/tcc"; cp -R "$TCC_DIR" "$dir/tcc"
+  else
+    echo "package-release: WARNING: \$TCC_DIR unset/missing — '$dir' ships without the TinyCC fallback; local builds there need a system C compiler" >&2
+  fi
+}
+
 # $1 = bundle short name, rest = binaries to include. Echoes the staged dir.
 stage_bundle() {
   local short="$1"; shift
   local dir="stage/${short}-${VERSION}-${TARGET}"
   rm -rf "$dir"; mkdir -p "$dir"
   for b in "$@"; do cp "$BINDIR/${b}${EXE}" "$dir"/; done
+  stage_tcc "$dir"
   carry_licenses "$dir"
   printf '%s' "$dir"
 }
@@ -77,6 +92,7 @@ stage_launcher_payload() {
   cp "$BINDIR/gba-launcher${EXE}" "$dir"/
   cp "$BINDIR/recomp${EXE}" "$dir"/
   cp gamedb.sqlite gamedb.sqlite.license LICENSE-CC0 "$dir"/
+  stage_tcc "$dir"
   carry_licenses "$dir"
   launcher_readme > "$dir/README-LAUNCHER.txt"
 }

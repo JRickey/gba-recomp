@@ -54,6 +54,13 @@ interpreter = true           # false = FULL RECOMP: no interpreter ships; a
                              # refuses to package unless a soak run executed
                              # zero interpreter-fallback steps
 
+[build]                      # build-time only — nothing here ships
+compiler = "clang"           # optional: pin the C compiler used to translate.
+                             # Default: a system cc/clang/gcc if present, else
+                             # the bundled TinyCC. Pin a real optimizing
+                             # compiler here for a shipped package. Any
+                             # cc-style program/path; works on all platforms.
+
 [output]
 binary = true
 c-source = false             # also emit the recompiled C tree with the

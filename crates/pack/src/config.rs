@@ -16,7 +16,23 @@ pub struct PackConfig {
     #[serde(default)]
     pub runtime: Runtime,
     #[serde(default)]
+    pub build: Build,
+    #[serde(default)]
     pub output: Output,
+}
+
+/// Build-time toolchain settings — how the translation is compiled on the
+/// *packager's* machine. Nothing here is shipped in the package.
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+pub struct Build {
+    /// C compiler to translate with, overriding the recompiler's default
+    /// (a system `cc`/`clang`/`gcc` if present, else the bundled TinyCC).
+    /// Any `cc`-style program name or absolute path — `clang`, `gcc`, a
+    /// wrapper script. Set this to compile a shipped package with a real
+    /// optimizing compiler instead of the TinyCC fallback. Forwarded to
+    /// `recomp` as `$GBA_RECOMP_CC`; works on all platforms.
+    pub compiler: Option<String>,
 }
 
 #[derive(Deserialize)]

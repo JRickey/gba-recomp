@@ -221,6 +221,13 @@ fn cmd_build(args: &[String]) -> Result<(), String> {
     if !cfg.runtime.interpreter {
         build_envs.push(("RECOMP_EXHAUSTIVE", "1"));
     }
+    // A packager can pin a real compiler (e.g. clang) instead of the
+    // recompiler's default cc->TinyCC fallback; recomp honors $GBA_RECOMP_CC
+    // first in its detection order.
+    if let Some(c) = cfg.build.compiler.as_deref() {
+        build_envs.push(("GBA_RECOMP_CC", c));
+        println!("      compiler: {c} (pinned via [build] compiler)");
+    }
     let keep_c: &[(&str, &str)] = &build_envs;
     // Pass the label map EXPLICITLY rather than relying on the
     // recompiler's beside-the-image discovery: the build runs against

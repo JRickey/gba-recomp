@@ -62,3 +62,24 @@ freely, subject to the following restrictions:
    misrepresented as being the original software.
 3. This notice may not be removed or altered from any source distribution.
 ```
+
+## `tcc/` — bundled TinyCC (libtcc)
+
+- **What:** A small C compiler shipped as the `tcc/` directory beside the
+  `recomp` binary (`tcc/libtcc.{dylib,so,dll}`, `tcc/libtcc1.a`,
+  `tcc/include/`). It is the **fallback compiler** for the recompiler's
+  local "build to play" path: when no system C compiler (`cc`/`clang`/`gcc`)
+  is found on the end user's machine, `recomp` loads `libtcc` at runtime and
+  uses it to compile the generated C into the native translation library, so
+  a build never requires the user to install a toolchain. Built and staged by
+  `scripts/build-tcc.sh`. Not used when a system compiler is present.
+- **Source:** TinyCC — <https://github.com/TinyCC/tinycc> (`bellard.org/tcc`).
+- **Version pin:** 0.9.28rc, commit `a338258d309c888bde96b2d1f206299231a54ddf`.
+- **License:** **GNU LGPL-2.1** (some components are more permissive; the
+  whole is conveyed under LGPL-2.1). LGPL-compatible with this project's
+  MIT-OR-Apache-2.0 licensing because `libtcc` is **dynamically loaded at
+  runtime, never statically linked** — it is a separate, replaceable shared
+  object, so no relink/source obligation attaches to this project's own
+  binaries. The compiler's *output* (the translated library) is not a
+  derivative work of the compiler. The full LGPL-2.1 text travels with the
+  shared library as `tcc/COPYING`, as the license requires.
