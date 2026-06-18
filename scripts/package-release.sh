@@ -180,13 +180,16 @@ package_macos_launcher() {
   mv "$app/Contents/MacOS/THIRD-PARTY.md" "$app/Contents/Resources/"
   mv "$app/Contents/MacOS/gamedb.sqlite" "$app/Contents/Resources/"
   mv "$app/Contents/MacOS/gamedb.sqlite.license" "$app/Contents/Resources/"
+  mv "$app/Contents/MacOS/tcc" "$app/Contents/Resources/"
   write_macos_info_plist "$app/Contents/Info.plist"
   write_macos_icns "stage/gba-launcher" "$app/Contents/Resources/gba-launcher.icns"
 
+  codesign --force --sign - --timestamp=none "$app/Contents/Resources/tcc/libtcc.dylib"
   codesign --force --sign - --timestamp=none "$app/Contents/MacOS/recomp"
   codesign --force --sign - --timestamp=none "$app/Contents/MacOS/gba-launcher"
   codesign --force --sign - --timestamp=none "$app"
   codesign --verify --verbose "$app"
+  codesign --verify --verbose "$app/Contents/Resources/tcc/libtcc.dylib"
   codesign --verify --verbose "$app/Contents/MacOS/recomp"
   codesign --verify --verbose "$app/Contents/MacOS/gba-launcher"
 

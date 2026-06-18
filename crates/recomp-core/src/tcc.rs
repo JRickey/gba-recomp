@@ -29,7 +29,28 @@ pub fn lib_dir() -> Option<PathBuf> {
     }
     let exe = std::env::current_exe().ok()?;
     let cand = exe.parent()?.join("tcc");
-    cand.is_dir().then_some(cand)
+    if cand.is_dir() {
+        return Some(cand);
+    }
+    macos_bundle_resource_tcc(&exe).filter(|p| p.is_dir())
+}
+
+#[cfg(target_os = "macos")]
+fn macos_bundle_resource_tcc(exe: &Path) -> Option<PathBuf> {
+    let macos = exe.parent()?;
+    if macos.file_name()? != "MacOS" {
+        return None;
+    }
+    let contents = macos.parent()?;
+    if contents.file_name()? != "Contents" {
+        return None;
+    }
+    Some(contents.join("Resources").join("tcc"))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn macos_bundle_resource_tcc(_exe: &Path) -> Option<PathBuf> {
+    None
 }
 
 fn shared_name() -> &'static str {
