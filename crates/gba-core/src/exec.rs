@@ -9,7 +9,7 @@ use armv4t::{
 };
 
 use crate::bus::Bus;
-use crate::cpu::{Cpu, Exception, FLAG_C, FLAG_N, FLAG_T, FLAG_V, FLAG_Z};
+use crate::cpu::{Cpu, Exception, FLAG_C, FLAG_N, FLAG_V, FLAG_Z};
 
 /// Fetch, decode, and execute one instruction. Returns the decoded
 /// instruction (callers use it for tracing and loop detection).
@@ -708,9 +708,12 @@ fn exec_msr(cpu: &mut Cpu, spsr: bool, fields: u8, value: u32) {
         if cpu.mode() == crate::cpu::Mode::User {
             mask &= 0xFF00_0000; // user mode cannot touch control bits
         }
-        // The T bit cannot be changed by MSR on ARM7TDMI (unpredictable);
-        // preserve it so a buggy game write doesn't desync the decoder.
-        let mask = mask & !FLAG_T;
+        // MSR writes the T bit like any other control bit, and the CPU
+        // switches state: the next fetch is regs[15] in the new state (as
+        // mGBA models it). Games rely on this: Pokémon Pinball Ruby &
+        // Sapphire's code unpacker ends with `msr cpsr_fc` (T set) and a
+        // Thumb `bx r0` into the unpacked code; masking T kept it in ARM
+        // state and the game stayed on a black screen.
         let new = (cpu.cpsr & !mask) | (value & mask);
         cpu.set_cpsr(new);
     }
@@ -904,6 +907,14 @@ mod tests {
             0xE129_F000,
         ]);
         assert_eq!(cpu.regs[13], 0x8000); // back to system sp
+        assert_eq!(cpu.mode(), crate::cpu::Mode::Sys);
+    }
+
+    #[test]
+    fn msr_t_bit_switches_to_thumb() {
+        // mov r0, #0x3F (System|T); msr cpsr_c, r0
+        let (cpu, _) = run_arm(&[0xE3A0_003F, 0xE121_F000]);
+        assert!(cpu.thumb());
         assert_eq!(cpu.mode(), crate::cpu::Mode::Sys);
     }
 }
