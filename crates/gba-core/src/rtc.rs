@@ -83,7 +83,6 @@ pub struct Rtc {
     /// Data bytes being shifted out (read) or in (write).
     buffer: [u8; 7],
     reg: u8,
-    lsb_first: bool,
 
     /// Status/control register (bit6 = 24-hour mode, bit7 = power-lost).
     control: u8,
@@ -113,7 +112,6 @@ impl Rtc {
             buflen: 0,
             buffer: [0; 7],
             reg: 0,
-            lsb_first: false,
             // Power OK (bit7=0): trust the host clock immediately, no
             // "set the time" prompt. 24-hour mode left for the game to set.
             control: 0,
@@ -222,14 +220,13 @@ impl Rtc {
         }
     }
 
-    /// Bit position within the current data byte for this clock, honouring
-    /// the auto-detected transfer order.
+    /// Bit position within the current data byte for this clock. The S-3511
+    /// moves data bytes LSB first whatever order the command byte came in
+    /// (as mGBA models it). Following the command's order made games that
+    /// send MSB-first commands (Pokémon Ruby/Sapphire/Emerald) read
+    /// bit-reversed dates and report "the internal battery has run dry".
     fn bit_pos(&self) -> u8 {
-        if self.lsb_first {
-            self.nbits
-        } else {
-            7 - self.nbits
-        }
+        self.nbits
     }
 
     fn advance_byte(&mut self, committing: bool) {
@@ -252,7 +249,6 @@ impl Rtc {
         } else {
             (self.cmd_acc.reverse_bits(), true)
         };
-        self.lsb_first = lsb;
         self.reg = (cmd >> 1) & 0x07;
         let read = cmd & 1 != 0;
         self.nbits = 0;
@@ -286,7 +282,7 @@ impl Rtc {
                 self.reg,
                 if read { "read" } else { "write" },
                 self.buflen,
-                if lsb { "lsb" } else { "msb" }
+                if lsb { "cmd lsb" } else { "cmd msb" }
             );
         }
     }
@@ -498,11 +494,11 @@ mod tests {
         let mut bytes = [0u8; 7];
         for byte in bytes.iter_mut() {
             let mut v = 0u8;
-            for _ in 0..8 {
+            for i in 0..8 {
                 rtc.write(0xC4, CS); // SCK low
                 rtc.write(0xC4, CS | SCK); // SCK high -> chip presents bit
                 let sio = (rtc.read(0xC4) >> 1) & 1;
-                v = (v << 1) | sio; // MSB-first
+                v |= sio << i; // data bytes come LSB first
             }
             *byte = v;
         }
@@ -526,19 +522,21 @@ mod tests {
         rtc.write(0xC6, 0b0111);
         rtc.write(0xC4, CS);
 
-        let send_byte = |rtc: &mut Rtc, val: u8| {
-            for i in (0..8).rev() {
+        let send_byte = |rtc: &mut Rtc, val: u8, msb_first: bool| {
+            for k in 0..8 {
+                let i = if msb_first { 7 - k } else { k };
                 let s = if (val >> i) & 1 != 0 { SIO } else { 0 };
                 rtc.write(0xC4, CS | s);
                 rtc.write(0xC4, CS | s | SCK);
             }
         };
-        // Command 0x64 = datetime write, then 7 BCD bytes for 2030-12-25
+        // Command 0x64 = datetime write (MSB first, as Pokémon RSE sends it),
+        // then 7 BCD bytes (LSB first, as the chip takes data) for 2030-12-25
         // 08:09:10, Wednesday(3), 24-hour mode already implied by hour byte.
-        send_byte(&mut rtc, 0x64);
+        send_byte(&mut rtc, 0x64, true);
         let want = [bcd(30), bcd(12), bcd(25), 3, bcd(8), bcd(9), bcd(10)];
         for b in want {
-            send_byte(&mut rtc, b);
+            send_byte(&mut rtc, b, false);
         }
         rtc.write(0xC4, 0);
 
