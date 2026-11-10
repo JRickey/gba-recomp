@@ -666,9 +666,10 @@ fn exec_block<B: Bus>(
             let value = if r == PC {
                 instr.pc_value().wrapping_add(4) // STM stores PC+12
             } else if r == rn {
-                // Storing the base: old value if rn is the first register
-                // in the list, written-back value otherwise.
-                if r == lowest {
+                // Storing the base: without writeback rn never changes, so
+                // the old value. With writeback, old value if rn is the
+                // first register in the list, written-back value otherwise.
+                if r == lowest || !writeback {
                     base
                 } else {
                     wb_val
@@ -834,6 +835,39 @@ mod tests {
         let (cpu, mut bus) = run_arm(&[0xE3A0_0C01, 0xE8A0_0003]);
         assert_eq!(bus.read32(0x100), 0x100); // old base stored
         assert_eq!(cpu.regs[0], 0x108); // writeback applied
+    }
+
+    #[test]
+    fn stm_without_writeback_stores_unchanged_base() {
+        // mov r1, #0x100; stm<mode> r1, {r0, r1}: rn is in the list but not
+        // the lowest register, and W = 0, so its slot gets the base itself.
+        for (stm, slot) in [
+            (0xE881_0003, 0x104), // stmia
+            (0xE981_0003, 0x108), // stmib
+            (0xE801_0003, 0x100), // stmda
+            (0xE901_0003, 0xFC),  // stmdb
+        ] {
+            let (cpu, mut bus) = run_arm(&[0xE3A0_1C01, stm]);
+            assert_eq!(bus.read32(slot), 0x100, "{stm:08x}");
+            assert_eq!(cpu.regs[1], 0x100, "{stm:08x}"); // no writeback
+        }
+        // mov r0, #0x100; stmia r0, {r0, r1}: rn lowest, also the base.
+        let (cpu, mut bus) = run_arm(&[0xE3A0_0C01, 0xE880_0003]);
+        assert_eq!(bus.read32(0x100), 0x100);
+        assert_eq!(cpu.regs[0], 0x100);
+    }
+
+    #[test]
+    fn stm_writeback_stores_new_base_when_not_first_in_list() {
+        // mov r1, #0x100; stmia r1!, {r0, r1} / stmdb r1!, {r0, r1}. The ARM
+        // ARM leaves this form UNPREDICTABLE; NanoBoyAdvance stores the
+        // written-back value, which is what this keeps.
+        let (cpu, mut bus) = run_arm(&[0xE3A0_1C01, 0xE8A1_0003]);
+        assert_eq!(bus.read32(0x104), 0x108);
+        assert_eq!(cpu.regs[1], 0x108);
+        let (cpu, mut bus) = run_arm(&[0xE3A0_1C01, 0xE921_0003]);
+        assert_eq!(bus.read32(0xFC), 0xF8);
+        assert_eq!(cpu.regs[1], 0xF8);
     }
 
     #[test]

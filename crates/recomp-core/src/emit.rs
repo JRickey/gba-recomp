@@ -440,7 +440,8 @@ fn inline_body(cx: &Ctx, instr: &Instr) -> Option<String> {
                     let val = if *r == PC {
                         format!("0x{:08x}u", instr.pc_value().wrapping_add(4))
                     } else if *r == rn {
-                        if *r == lowest {
+                        // Without writeback rn never changes: store the base.
+                        if *r == lowest || !writeback {
                             "base".to_string()
                         } else {
                             wb_val.clone()
@@ -893,4 +894,59 @@ pub fn emit_c_chunked(
     );
     sink(&out, analysis.blocks.len())?;
     Ok(count + 1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The inlined C body of one ARM instruction.
+    fn arm_body(word: u32) -> String {
+        let mut out = String::new();
+        let cx = Ctx {
+            out: &mut out,
+            thumb: false,
+            cycles: 0,
+        };
+        inline_body(&cx, &armv4t::decode_arm(word, 0x0800_0000)).expect("inlined")
+    }
+
+    /// The value expression of each `write32` in a body, in order.
+    fn stored(body: &str) -> Vec<&str> {
+        body.lines()
+            .filter_map(|l| l.split("a->write32(m, addr & ~3u, ").nth(1))
+            .map(|rest| rest.split(");").next().unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn stm_without_writeback_stores_unchanged_base() {
+        // stm<mode> r1, {r0, r1}: rn not the lowest register, W = 0.
+        for word in [0xE881_0003, 0xE981_0003, 0xE801_0003, 0xE901_0003] {
+            let body = arm_body(word);
+            assert_eq!(stored(&body), ["c[0]", "base"], "{body}");
+            assert!(!body.contains("c[1] ="), "{body}");
+        }
+        // stmia r0, {r0, r1}: rn lowest, W = 0.
+        let body = arm_body(0xE880_0003);
+        assert_eq!(stored(&body), ["base", "c[1]"], "{body}");
+        assert!(!body.contains("c[0] ="), "{body}");
+    }
+
+    #[test]
+    fn stm_writeback_base_slot() {
+        // stmia r0!, {r0, r1}: rn lowest stores the old base.
+        let body = arm_body(0xE8A0_0003);
+        assert_eq!(stored(&body), ["base", "c[1]"], "{body}");
+        assert!(body.contains("c[0] = base + 8u;"), "{body}");
+        // stmia r1!, {r0, r1} / stmdb r1!, {r0, r1}: rn not lowest stores
+        // the written-back value (UNPREDICTABLE in the ARM ARM; matches the
+        // interpreter).
+        let body = arm_body(0xE8A1_0003);
+        assert_eq!(stored(&body), ["c[0]", "base + 8u"], "{body}");
+        assert!(body.contains("c[1] = base + 8u;"), "{body}");
+        let body = arm_body(0xE921_0003);
+        assert_eq!(stored(&body), ["c[0]", "base - 8u"], "{body}");
+        assert!(body.contains("c[1] = base - 8u;"), "{body}");
+    }
 }
